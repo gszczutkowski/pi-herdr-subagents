@@ -1,6 +1,23 @@
 import { execFile, execSync, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import { getEnvironmentConfig } from "./config.ts";
+import { findHcExecutable, HcClient } from "./hc.ts";
+
+let hcClient: HcClient | undefined;
+
+export function usesHcBackend(): boolean {
+  return Boolean(process.env.HC_TERMINAL_ID && process.env.HC_TERMINAL_SOCKET) ||
+    (process.env.HERDR_ENV !== "1" && getEnvironmentConfig().allowOutsideHerdr &&
+      !hasCommand("herdr") && Boolean(findHcExecutable()));
+}
+
+function hc(): HcClient {
+  if (hcClient) return hcClient;
+  const executable = findHcExecutable();
+  if (!executable) throw new Error("herdr-core CLI (hc) is not available");
+  hcClient = new HcClient(executable);
+  return hcClient;
+}
 
 const execFileAsync = promisify(execFile);
 
@@ -45,6 +62,9 @@ function herdrServerReachable(): boolean {
 }
 
 export function isHerdrAvailable(): boolean {
+  if (usesHcBackend()) {
+    try { return hc().available(process.env.HC_TERMINAL_ID); } catch { return false; }
+  }
   if (!hasCommand("herdr")) return false;
   if (process.env.HERDR_ENV === "1") return true;
   if (!getEnvironmentConfig().allowOutsideHerdr) return false;
@@ -133,6 +153,7 @@ function listHerdrWorkspaces(): string | null {
 }
 
 export function getHerdrParentPaneId(): string | null {
+  if (usesHcBackend()) return process.env.HC_TERMINAL_ID || null;
   return process.env.HERDR_PANE_ID || readCurrentPane().pane_id || null;
 }
 
@@ -160,6 +181,7 @@ function buildTabCreateArgs(name: string, cwd: string, workspaceId: string): str
 }
 
 export function createHerdrSurface(name: string): string {
+  if (usesHcBackend()) return hc().create(name, process.cwd(), process.env.HC_TERMINAL_ID);
   const workspaceId = resolveHerdrWorkspaceId();
   const output = herdrExec(buildTabCreateArgs(name, process.cwd(), workspaceId));
   const paneId = extractHerdrRootPaneId(output, "tab create");
@@ -193,6 +215,8 @@ export function createHerdrSurfaceSplit(
   direction: "right" | "down",
   parentPaneId: string,
 ): string {
+  // hc exposes terminals, not the app's tab/split layout API.
+  if (usesHcBackend()) return hc().create(name, process.cwd(), parentPaneId);
   const output = herdrExec(buildPaneSplitArgs(parentPaneId, direction, process.cwd()));
   const paneId = extractHerdrPaneId(output, "pane split");
   try {
@@ -204,12 +228,14 @@ export function createHerdrSurfaceSplit(
 }
 
 export function readHerdrScreen(surface: string, lines = 50): string {
+  if (usesHcBackend()) return hc().read(surface, lines);
   // `visible` is reliable for freshly created panes where herdr's `recent`
   // scrollback may not be populated yet.
   return herdrExec(["pane", "read", surface, "--source", "visible", "--lines", String(lines)]);
 }
 
 export async function readHerdrScreenAsync(surface: string, lines = 50): Promise<string> {
+  if (usesHcBackend()) return hc().readAsync(surface, lines);
   return herdrExecAsync(["pane", "read", surface, "--source", "visible", "--lines", String(lines)]);
 }
 
@@ -272,6 +298,7 @@ function parsePaneGetError(error: any): PaneInspectionResult {
  * - unavailable: server command failed; caller should keep polling
  */
 export async function inspectHerdrPane(surface: string): Promise<PaneInspectionResult> {
+  if (usesHcBackend()) return hc().inspect(surface);
   try {
     return parsePaneGetOutput(await herdrExecAsync(["pane", "get", surface]), surface);
   } catch (error: any) {
@@ -280,12 +307,14 @@ export async function inspectHerdrPane(surface: string): Promise<PaneInspectionR
 }
 
 export function sendHerdrCommand(surface: string, command: string): void {
+  if (usesHcBackend()) return hc().send(surface, command);
   // pane run sends the text and Enter in a single socket request, avoiding
   // a race where Enter could arrive before the text is fully processed.
   herdrExec(["pane", "run", surface, command]);
 }
 
 export function sendHerdrEscape(surface: string): void {
+  if (usesHcBackend()) return hc().escape(surface);
   herdrExec(["pane", "send-keys", surface, "Escape"]);
 }
 
@@ -294,6 +323,7 @@ function isPaneMissingError(error: any): boolean {
 }
 
 export function closeHerdrSurface(surface: string): void {
+  if (usesHcBackend()) return hc().close(surface);
   try {
     herdrExec(["pane", "close", surface]);
   } catch (error: any) {
@@ -305,12 +335,17 @@ export function closeHerdrSurface(surface: string): void {
 }
 
 export function renameHerdrTab(title: string): void {
+  if (usesHcBackend()) {
+    if (process.env.HC_TERMINAL_ID) hc().label(process.env.HC_TERMINAL_ID, "pi.name", title);
+    return;
+  }
   const tabId = process.env.HERDR_TAB_ID || readCurrentPane().tab_id;
   if (!tabId) throw new Error("Cannot rename herdr tab: no current tab is available.");
   herdrExec(["tab", "rename", tabId, title]);
 }
 
 export function renameHerdrWorkspace(title: string): void {
+  if (usesHcBackend()) throw new Error("hc does not expose workspace renaming");
   const workspaceId = resolveHerdrWorkspaceId();
   herdrExec(["workspace", "rename", workspaceId, title]);
 }
@@ -340,7 +375,8 @@ export function reportHerdrPaneTask(
   const normalizedTask = task.replace(/[\r\n\t]+/g, " ").trim();
   if (!normalizedTask) return;
   try {
-    herdrExec(buildPaneReportTaskArgs(paneId, normalizedTask, source));
+    if (usesHcBackend()) hc().label(paneId, `${source}.task`, normalizedTask);
+    else herdrExec(buildPaneReportTaskArgs(paneId, normalizedTask, source));
   } catch {
     // Non-fatal: cosmetic metadata report failure should not abort subagent launch.
   }

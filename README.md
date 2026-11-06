@@ -59,7 +59,23 @@ herdr
 pi
 ```
 
-The extension normally requires `HERDR_ENV=1`, which means pi runs inside a herdr pane. To orchestrate from a plain terminal while herdr runs in the background, set `environment.allowOutsideHerdr` to `true` in `config.json`. The `herdr` CLI and a reachable server are still required. See [Configuration](#configuration).
+The extension supports two terminal backends:
+
+- **Legacy herdr:** the `herdr` CLI with its `pane`/`tab` API and `HERDR_ENV=1`.
+- **herdr-core (`hc`, verified with 0.1.18):** `HC_TERMINAL_ID` and `HC_TERMINAL_SOCKET` identify the parent terminal. The adapter resolves `hc` from PATH, or the standard per-user Windows installation at `%LOCALAPPDATA%/Programs/herdr-core/hc.exe`. No alias or fabricated `HERDR_ENV` is needed.
+
+The hc backend creates explicitly targeted Bash terminals with native parent notifications disabled (the extension delivers results itself). Bash must be on the orchestrator's PATH or in a standard Git for Windows installation (`ProgramFiles/Git`, `ProgramFiles(x86)/Git`, or `LOCALAPPDATA/Programs/Git`). Pi's Bash tool can add Git to its child PATH even when extension callbacks cannot see it; the adapter therefore resolves Bash separately and adds Git's shell utilities to the launch-script PATH. Scripts also preserve the orchestrator's tool PATH, including Pi and Node. This does not install Bash or any other dependency. hc does not expose the legacy app layout API: tab/split requests create separate terminals instead, tab renaming sets a `pi.name` label, and workspace renaming is unsupported. Visual placement is managed by the herdr app, not guaranteed by this adapter.
+
+To orchestrate from a plain terminal while herdr runs in the background, set `environment.allowOutsideHerdr` to `true` in `config.json`. A compatible CLI and reachable server are still required. See [Configuration](#configuration). After modifying an already loaded extension, use `/reload` in Pi.
+
+A synthetic live adapter check (creates and removes one terminal, no model calls) is available alongside the unit tests:
+
+```bash
+node --test test/hc.test.ts
+PI_TEST_HC_LIVE=1 node --test test/hc-live.test.ts
+```
+
+In PowerShell, set `$env:PI_TEST_HC_LIVE = '1'` before the second command. This check covers launch-script execution, Pi/Node PATH resolution, inspection, sync/async reads, Escape delivery, and terminal cleanup. It does not establish AI-provider authentication or a complete subagent round trip.
 
 If your shell startup is slow and subagent commands sometimes get dropped before the prompt is ready, set `PI_SUBAGENT_SHELL_READY_DELAY_MS` to a higher value (defaults to `500`):
 
@@ -229,7 +245,7 @@ The copyable example is model-neutral, so it works without requiring credentials
 
 `models.default` sets the model for subagents that do not specify a model. `models.agents` sets per-agent defaults, keyed by the agent name passed to `subagent({ agent: ... })`. Explicit `model` tool arguments take precedence, followed by agent frontmatter, per-agent config, the global default, and finally the parent model. Model values must be exact authenticated `provider/model-id` references.
 
-`environment.allowOutsideHerdr` lifts the inside-herdr requirement. When `true`, the extension accepts a session running in any terminal as long as the `herdr` CLI exists and `herdr workspace list` responds. Subagent tabs are created in the first workspace when the current pane cannot be resolved. Split layouts need a parent pane, so they fall back to a new tab when running outside herdr. Defaults to `false`, which keeps the fail-fast setup hint for new users.
+`environment.allowOutsideHerdr` lifts the inside-herdr requirement. When `true`, the extension accepts a session running in any terminal as long as a compatible CLI exists and its server responds (`herdr workspace list`, or `hc server status` when the legacy CLI is absent). With legacy herdr, subagent tabs are created in the first workspace when the current pane cannot be resolved. Split layouts need a parent pane, so they fall back to a new tab when running outside herdr. With hc, launches always create separate terminals; app workspace/split placement is not controlled. Defaults to `false`, which keeps the fail-fast setup hint for new users.
 
 `behavior.closeOnDone` sets the default for what happens to a subagent's pane after its result is delivered. `true` closes the pane as before. `false` leaves the pane and its pi session open so you can continue the conversation in place. A subagent can override the default per call with `subagent_done({ close: false })` or `subagent_done({ close: true })`. The parent is told the pane stayed open so it can send a follow-up there instead of calling `subagent_resume`.
 

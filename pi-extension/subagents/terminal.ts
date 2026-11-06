@@ -1,11 +1,13 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { bashPath, findBashExecutable } from "./hc.ts";
 import { dirname, join } from "node:path";
 import {
   closeHerdrSurface,
   createHerdrSurface,
   createHerdrSurfaceSplit,
   isHerdrAvailable,
+  usesHcBackend,
   getHerdrParentPaneId,
   readHerdrScreen,
   readHerdrScreenAsync,
@@ -28,7 +30,7 @@ export type SplitDirection = "right" | "down";
  */
 export type SubagentLayout = "tab" | SplitDirection;
 
-const SETUP_HINT = "Start pi inside herdr (`herdr`, then run `pi`).";
+const SETUP_HINT = "Run pi inside herdr. Legacy herdr requires its CLI and HERDR_ENV=1; herdr-core requires hc and HC_TERMINAL_ID/HC_TERMINAL_SOCKET. Reload Pi after updating this extension.";
 
 /**
  * Parse the `PI_SUBAGENT_LAYOUT` env var into a {@link SubagentLayout}.
@@ -114,11 +116,23 @@ export function runScriptInPane(
   mkdirSync(dirname(scriptPath), { recursive: true });
 
   const scriptLines = ["#!/bin/bash"];
+  const hcBackend = usesHcBackend();
+  const bash = hcBackend ? findBashExecutable() : "bash";
+  if (!bash) throw new Error("Cannot resolve Bash for the hc launch script");
+  if (hcBackend) {
+    // npm's Pi shell launcher also needs dirname, sed and uname from Git's
+    // usr/bin, even when the parent Node PATH contains only Git/cmd.
+    const gitTools = join(dirname(bash), "..", "usr", "bin");
+    const tools = process.platform === "win32" && existsSync(gitTools) ? gitTools : dirname(bash);
+    scriptLines.push(`export PATH=${shellQuote(bashPath(tools))}:${shellQuote(bashPath(process.env.PATH ?? ""))}:"$PATH"`);
+  }
   if (options?.scriptPreamble) scriptLines.push(options.scriptPreamble.trimEnd());
   scriptLines.push(command);
   writeFileSync(scriptPath, `${scriptLines.join("\n")}\n`, { mode: 0o755 });
 
-  runInPane(paneId, `bash ${shellQuote(scriptPath)}`);
+  // A core-created Bash may inherit a Windows PATH without /usr/bin. Resolve
+  // the interpreter from the orchestrator instead of relying on that shell.
+  runInPane(paneId, `${shellQuote(bashPath(bash))} ${shellQuote(scriptPath)}`);
   return scriptPath;
 }
 
