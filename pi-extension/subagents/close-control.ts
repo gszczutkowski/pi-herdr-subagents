@@ -1,4 +1,4 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { randomUUID } from "node:crypto";
 import { existsSync, linkSync, mkdirSync, readFileSync, readdirSync, rmSync, watch, writeFileSync, type FSWatcher } from "node:fs";
 import { join } from "node:path";
@@ -20,6 +20,14 @@ function publish(file: string, value: unknown): void {
 function matches(a: any, b: any): boolean {
   return !!a && !!b && a.runId === b.runId && a.sessionFile === b.sessionFile && a.nonce === b.nonce &&
     !!a.process && !!b.process && sameProcess(a.process, b.process);
+}
+
+/** Only the TUI has a synchronous live editor getter. RPC UI getters return
+ * defaults, so they cannot prove that a client's editor is safe to discard. */
+function editorSafe(ctx: ExtensionContext): boolean {
+  if (!ctx.hasUI) return true;
+  try { return ctx.mode === "tui" && typeof ctx.ui.getEditorText === "function" && ctx.ui.getEditorText() === ""; }
+  catch { return false; }
 }
 
 /** A distinct non-model CLOSE capability. Never terminal input, Escape, or force kill. */
@@ -54,8 +62,8 @@ export function registerCloseControl(pi: ExtensionAPI): void {
       const valid = request?.capability === CLOSE_CAPABILITY && request.requestId === requestId && matches(request, identity) &&
         canonicalSessionPath(ctx.sessionManager.getSessionFile() ?? "") === identity!.sessionFile &&
         ctx.sessionManager.getHeader()?.id === identity!.headerId;
-      if (!valid || !idleToken || request.idleToken !== idleToken || !ctx.isIdle() || ctx.hasPendingMessages()) {
-        publish(ack, { runId, requestId, status: "rejected", reason: valid ? "Child is busy or idle proof expired" : "Wrong run/session/process identity" });
+      if (!valid || !idleToken || request.idleToken !== idleToken || !ctx.isIdle() || ctx.hasPendingMessages() || !editorSafe(ctx)) {
+        publish(ack, { runId, requestId, status: "rejected", reason: valid ? "Child is busy, has a draft/unverifiable editor, or idle proof expired" : "Wrong run/session/process identity" });
         return;
       }
       publish(claim, { runId, requestId, status: "requested" });

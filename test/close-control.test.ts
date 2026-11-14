@@ -106,8 +106,8 @@ test("child validates wrong run/process, busy state, immutable claims and replay
   if (own.kind !== "present") return;
   const identity = { ...f.identity, process: own.identity };
   put(`${runCompletionFile(f.child.sessionFile, "run")}.identity.json`, identity);
-  let shutdowns = 0, idle = true;
-  const ctx = { sessionManager: { getHeader: () => ({ id: "header" }), getSessionFile: () => f.child.sessionFile },
+  let shutdowns = 0, idle = true, draft = "";
+  const ctx = { hasUI: true, mode: "tui", ui: { getEditorText: () => draft },  sessionManager: { getHeader: () => ({ id: "header" }), getSessionFile: () => f.child.sessionFile },
     isIdle: () => idle, hasPendingMessages: () => false, shutdown: () => { shutdowns++; } };
   try {
     Object.assign(process.env, env);
@@ -130,6 +130,22 @@ test("child validates wrong run/process, busy state, immutable claims and replay
     assert.equal((await request()).ack.status, "rejected");
     assert.equal(shutdowns, 0);
     idle = true;
+    // The idle capability already exists: typing after settlement must still
+    // reject immediately before a claim, without discarding the draft.
+    draft = "unsent draft after idle publication";
+    const drafted = await request();
+    assert.equal(drafted.ack.status, "rejected");
+    assert.equal(existsSync(join(f.control, `${drafted.requestId}.claim.json`)), false);
+    assert.equal(shutdowns, 0);
+    draft = "";
+    ctx.mode = "rpc";
+    assert.equal((await request()).ack.status, "rejected", "RPC editor defaults cannot prove safety");
+    ctx.mode = "tui";
+    const getter = ctx.ui.getEditorText;
+    ctx.ui.getEditorText = () => { throw new Error("unavailable editor"); };
+    assert.equal((await request()).ack.status, "rejected");
+    ctx.ui.getEditorText = getter;
+    assert.equal(shutdowns, 0);
     const accepted = await request();
     assert.equal(accepted.ack.status, "requested"); assert.equal(shutdowns, 1);
     const ackBytes = readFileSync(join(f.control, `${accepted.requestId}.ack.json`), "utf8");
@@ -148,7 +164,7 @@ test("child validates wrong run/process, busy state, immutable claims and replay
   }
 });
 
-test("real Pi RPC settled child accepts CLOSE without a model turn and exits its audited OS identity", { timeout: 90000 }, async () => {
+test("real Pi RPC UI cannot prove editor safety and rejects CLOSE without a model turn", { timeout: 90000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "close-pi-rpc-"));
   const session = join(dir, "session.jsonl"), activityFile = join(dir, "activity.json");
   put(session, { type: "session", version: 3, id: "close-rpc", timestamp: new Date().toISOString(), cwd: dir });
@@ -172,13 +188,10 @@ test("real Pi RPC settled child accepts CLOSE without a model turn and exits its
     const before = readFileSync(session, "utf8");
     const closing = closeOwnedChild({ runId: "rpc-run", dispatched: true }, { id: "rpc-run", cli: "pi", sessionFile: session, activityFile }, { validate: () => {}, audit, timeoutMs: 10000 });
     await until(() => readdirSync(closeDir(activityFile)).some(name => name.endsWith(".ack.json")));
-    // Pi RPC applies ctx.shutdown at its next command-response boundary (documented
-    // mode behavior). This read-only command starts no model turn and sends no quit.
-    child.stdin.write(JSON.stringify({ type: "get_state", id: "shutdown-boundary" }) + "\n");
     const result = await closing;
-    assert.equal(result.status, "closed");
-    await exit;
-    assert.equal(probeProcess(identity.process.pid).kind, "absent");
+    assert.equal(result.status, "rejected");
+    assert.equal(existsSync(join(closeDir(activityFile), `${result.requestId}.claim.json`)), false);
+    assert.equal(probeProcess(identity.process.pid).kind, "present");
     const after = readFileSync(session, "utf8");
     assert.equal(after, before, "close does not start another model turn or append a prompt");
   } finally {
