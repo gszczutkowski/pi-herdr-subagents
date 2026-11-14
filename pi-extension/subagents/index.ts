@@ -75,7 +75,7 @@ import {
 import { registerSubagentAssignmentRenderer } from "./assignment.ts";
 import { registerPlanTools } from "./plan-tools.ts";
 import type { PlanPersistence } from "./plan-persistence.ts";
-import { AssignmentContractSchema, resolveAssignmentContract, contractTask } from "./contracts.ts";
+import { AssignmentContractSchema, resolveAssignmentContract, contractTask, normalizeStructuredResult, type StructuredResult } from "./contracts.ts";
 import { PlanTaskParams, bindPlanRun, importPlanEnvelope, recordDispatchFailure, type PlanTaskBinding } from "./plan-runtime.ts";
 import { registerPlanCommand } from "./plan-preflight.ts";
 import { createDeliveryState, enqueueDelivery, flushDeliveries, pauseDeliveries, restoreDurableDeliveries, type DeliveryState } from "./delivery.ts";
@@ -557,6 +557,8 @@ function resolveResultPresentation(
  * Result from running a single subagent.
  */
 interface SubagentResult {
+  structuredResult?: StructuredResult;
+  resultDiagnostic?: string;
   eventId?: string;
   supervisionEnded?: boolean;
   name: string;
@@ -818,7 +820,11 @@ export function enqueueSubagentCompletion(running: RunningSubagent, result: Suba
     }, result);
     return;
   }
-  const base = resolveResultPresentation(result, running.name);
+  const normalized = normalizeStructuredResult(result.structuredResult);
+  const resultDiagnostic = normalized.resultDiagnostic ?? result.resultDiagnostic;
+  const base = resolveResultPresentation(result, running.name)
+    + (normalized.structuredResult ? `\n\nStructured result (proposal, requires parent review):\n${JSON.stringify(normalized.structuredResult, null, 2)}` : "")
+    + (resultDiagnostic ? `\n\n${resultDiagnostic}` : "");
   enqueueCompletion(running, {
     customType: "subagent_result",
     content: running.runtimePlan?.runtimeMismatch
@@ -827,6 +833,8 @@ export function enqueueSubagentCompletion(running: RunningSubagent, result: Suba
     details: {
       name: running.name, recipient: "Parent", task: running.task,
       response: result.errorMessage ? `Error: ${result.errorMessage}` : result.summary,
+      ...normalized,
+      ...(resultDiagnostic ? { resultDiagnostic } : {}),
       keepOpen: result.keepOpen, agent: running.agent, exitCode: result.exitCode,
       elapsed: result.elapsed, sessionFile: result.sessionFile, lineage: running.lineage,
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
@@ -1543,7 +1551,9 @@ async function watchSubagent(
         return {
           name,
           task,
-          summary: extracted.summary,
+          summary: result.structuredResult?.summary ?? result.summary ?? extracted.summary,
+          structuredResult: result.structuredResult, resultDiagnostic: result.resultDiagnostic,
+          eventId: result.eventId, sessionFile,
           exitCode: result.exitCode,
           elapsed,
           ...(extracted.sessionId ? { claudeSessionId: extracted.sessionId } : {}),
@@ -1608,7 +1618,9 @@ async function watchSubagent(
     return {
       name,
       task,
-      summary: result.summary ?? summary,
+      summary: result.structuredResult?.summary ?? result.summary ?? summary,
+      structuredResult: result.structuredResult,
+      resultDiagnostic: result.resultDiagnostic,
       eventId: result.eventId,
       supervisionEnded,
       sessionFile,

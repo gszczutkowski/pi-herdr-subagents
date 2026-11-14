@@ -11,6 +11,7 @@ import { getBehaviorConfig } from "./config.ts";
 import { createSubagentActivityRecorder } from "./activity.ts";
 import { registerSubagentAssignment } from "./assignment.ts";
 import { registerLiveContinuation } from "./live-continuation.ts";
+import { StructuredResultSchema, normalizeStructuredResult } from "./contracts.ts";
 import { registerRecoveryIdentity } from "./recovery-identity.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
@@ -321,8 +322,9 @@ export default function (pi: ExtensionAPI) {
     description:
       "Call this tool when you have completed your task. " +
       "It returns this turn's results to the immediate parent and optionally closes this session. " +
-      "Your LAST assistant message before calling this becomes the summary returned to the caller.",
+      "Optionally provide a structured result (worker proposals only, never acceptance). Otherwise your LAST assistant message becomes the summary.",
     parameters: Type.Object({
+      result: Type.Optional(StructuredResultSchema),
       close: Type.Optional(Type.Boolean({
         description: "False leaves this session and its pane open for follow-up. True closes it. Omitting it uses behavior.closeOnDone.",
       })),
@@ -334,7 +336,7 @@ export default function (pi: ExtensionAPI) {
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
       recorder.subagentDone();
       if (sessionFile) {
-        writeRunCompletion({ type: "done", ...(keepOpen ? { keepOpen: true } : {}) });
+        writeRunCompletion({ type: "done", ...normalizeStructuredResult(params.result), ...(keepOpen ? { keepOpen: true } : {}) });
       }
       completionDelivered = true;
       if (!keepOpen) ctx.shutdown();
@@ -343,7 +345,7 @@ export default function (pi: ExtensionAPI) {
           ? "Result published. This session remains supervised; follow-up results return to the parent until the child process closes."
           : "Shutting down subagent session." }],
         terminate: true,
-        details: {},
+        details: normalizeStructuredResult(params.result),
       };
     },
   });

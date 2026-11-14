@@ -1,4 +1,5 @@
 import { existsSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { normalizeStructuredResult, type StructuredResult } from "./contracts.ts";
 import { runCompletionFile } from "./run-artifacts.ts";
 
 const ABORT_MESSAGE = "Aborted while waiting for subagent to finish";
@@ -7,6 +8,8 @@ const TERMINAL_SENTINEL = /__SUBAGENT_DONE_(\d+)__/;
 export interface CompletionResult {
   eventId?: string;
   summary?: string;
+  structuredResult?: StructuredResult;
+  resultDiagnostic?: string;
   reason: "done" | "ping" | "sentinel" | "error";
   exitCode: number;
   keepOpen?: boolean;
@@ -37,6 +40,8 @@ export function interpretExitSidecar(data: unknown): CompletionResult {
   const payload = data as {
     type?: unknown;
     keepOpen?: unknown;
+    structuredResult?: unknown;
+    resultDiagnostic?: unknown;
     name?: unknown;
     message?: unknown;
     errorMessage?: unknown;
@@ -68,6 +73,8 @@ export function interpretExitSidecar(data: unknown): CompletionResult {
     return {
       reason: "done",
       exitCode: 0,
+      ...normalizeStructuredResult(payload.structuredResult),
+      ...(typeof payload.resultDiagnostic === "string" ? { resultDiagnostic: payload.resultDiagnostic.slice(0, 8192) } : {}),
       ...(typeof payload.keepOpen === "boolean" ? { keepOpen: payload.keepOpen } : {}),
     };
   }

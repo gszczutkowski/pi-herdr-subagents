@@ -1,6 +1,6 @@
 # Stage 3 — assignment and result contracts
 
 - [x] Optional bounded assignment contract. `subagent.assignmentContract` supplies objective, scope, criteria (`criterionId`, `text`), dependencies, inputs, files, decisions and changeConstraints. With `planTask`, objective/scope/criteria/dependencies/inputs are derived from the existing task (artifact refs are inputs); supplied values must agree exactly. Supplemental constraints are caller-owned. Limits: 100 items per list and 8192 characters per nonempty field. Metadata is saved in the launch profile, runtime manifest profile and assignment card. The contract is also included once in the actual model task; the card is display-only. Unbound plain tasks are unchanged.
-- [ ] Optional structured per-turn result.
+- [x] Optional structured per-turn result. `subagent_done({ result, close: false })` publishes a supervised turn without closing. Result fields: status (`complete`, `partial`, `blocked`), summary, artifact refs, checks (`criterionIds`, `ref`, `outcome`: `passed`/`failed`/`not_run`), unmetCriterionIds and risks. Strict fields and the same bounded lists/text apply. Claims survive immutable completion events, outbox, parent presentation and artifact-only recovery; the assistant's final text remains a separate compatibility summary. A result is a proposal, never an acceptance decision.
 - [ ] Parent-validated criterion evidence and explicit acceptance.
 - [ ] Legacy and malformed optional-result compatibility.

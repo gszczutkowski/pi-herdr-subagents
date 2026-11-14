@@ -31,6 +31,24 @@ export function resolveAssignmentContract(value: unknown, task?: PlanTask): Assi
   return contract ? structuredClone(contract) : undefined;
 }
 
+export const StructuredResultSchema = Type.Object({
+  status: Type.Union([Type.Literal("complete"), Type.Literal("partial"), Type.Literal("blocked")]),
+  summary: text(), artifacts: texts(),
+  checks: Type.Array(Type.Object({ criterionIds: texts(), ref: text(),
+    outcome: Type.Union([Type.Literal("passed"), Type.Literal("failed"), Type.Literal("not_run")]),
+  }, { additionalProperties: false }), { maxItems: 100 }),
+  unmetCriterionIds: texts(), risks: texts(),
+}, { additionalProperties: false });
+export type StructuredResult = Static<typeof StructuredResultSchema>;
+export function isStructuredResult(value: unknown): value is StructuredResult {
+  return Value.Check(StructuredResultSchema, value);
+}
+export function normalizeStructuredResult(value: unknown): { structuredResult?: StructuredResult; resultDiagnostic?: string } {
+  if (value === undefined) return {};
+  if (!isStructuredResult(value)) return { resultDiagnostic: "Malformed optional structured result; retained plain-text delivery requires parent review." };
+  return { structuredResult: structuredClone(value) };
+}
+
 export function contractTask(task: string, contract?: AssignmentContract): string {
   if (!contract) return task;
   return `${task}\n\nAssignment contract (worker claims are proposals; parent verifies all criteria):\n${JSON.stringify(contract, null, 2)}`;
