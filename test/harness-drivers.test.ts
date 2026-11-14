@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -136,6 +136,51 @@ describe("Pi Harness Driver", () => {
     assert.ok(built.command.includes("--thinking 'high'"));
     assert.ok(built.command.includes("echo '__SUBAGENT_DONE_'$?'__'"));
   });
+});
+
+describe("parallel launch input artifacts", () => {
+  for (const systemPromptMode of ["append", "replace"] as const) {
+    it(`preserves same-name tasks, ${systemPromptMode} prompts, and assignment cards in the same second`, async (t) => {
+      t.mock.timers.enable({ apis: ["Date"], now: new Date("2026-11-14T12:00:00.000Z") });
+      const artifactDir = mkdtempSync(join(tmpdir(), "parallel-launch-inputs-"));
+      try {
+        const driver = new PiHarnessDriver();
+        const launches = await Promise.all(["run-a", "run-b"].map(async (id) => {
+          const context = createMockLaunchContext({
+            artifactDir,
+            params: { id, name: "Same Worker", task: `TASK_${id}\nExact  whitespace 日本語` },
+            taskDelivery: "artifact",
+            identityInSystemPrompt: true,
+            identity: `SYSTEM_${id}`,
+            systemPromptMode,
+          });
+          const built = driver.buildCommand(context);
+          const taskFile = /'@([^']+)'/.exec(built.command)?.[1];
+          const systemFile = /--(?:append-system-prompt|system-prompt) '([^']+)'/.exec(built.command)?.[1];
+          const assignmentFile = /PI_SUBAGENT_ASSIGNMENT_FILE='([^']+)'/.exec(built.command)?.[1];
+          assert.ok(taskFile);
+          assert.ok(systemFile);
+          assert.ok(assignmentFile);
+          return { context, taskFile, systemFile, assignmentFile };
+        }));
+        for (const field of ["taskFile", "systemFile", "assignmentFile"] as const) {
+          assert.notEqual(launches[0][field], launches[1][field]);
+        }
+        // Read only after both launches have written, as delayed children do.
+        for (const { context, taskFile, systemFile, assignmentFile } of launches) {
+          assert.ok(taskFile.includes(context.params.id));
+          assert.ok(systemFile.includes(context.params.id));
+          const assignment = JSON.parse(readFileSync(assignmentFile, "utf8"));
+          assert.equal(assignment.task, context.params.task);
+          assert.equal(assignment.childId, context.params.id);
+          assert.equal(readFileSync(taskFile, "utf8"), `\n\n\n\n${assignment.task}\n\n`);
+          assert.equal(readFileSync(systemFile, "utf8"), context.identity);
+        }
+      } finally {
+        rmSync(artifactDir, { recursive: true, force: true });
+      }
+    });
+  }
 });
 
 describe("OpenCode Harness Driver", () => {

@@ -51,7 +51,7 @@ Agent główny
 ### R1. Unikalne artefakty wejściowe
 
 - [x] Umieścić niepowtarzalny identyfikator uruchomienia we wszystkich nazwach artefaktów przekazywanych dziecku: zadanie, system prompt, wiadomość resume.
-- [ ] Dodać regresję dla równoległych uruchomień o tej samej nazwie w tej samej sekundzie.
+- [x] Dodać regresję dla równoległych uruchomień o tej samej nazwie w tej samej sekundzie.
 
 Problem: nazwy oparte na nazwie agenta i czasie zaokrąglonym do sekundy mogą się pokrywać. Izolowany reproduktor niezależnego przeglądu potwierdził nadpisanie promptu: karta pierwszego agenta może pokazywać TASK_A, podczas gdy oba uruchomienia odczytają TASK_B.
 
