@@ -80,6 +80,46 @@ test("registered tools and native store update the widget without model messages
   } finally { f.cleanup(); }
 });
 
+test("completed task rows survive actual runtime removal and disk reopen with zero agents", async () => {
+  const f = fixture();
+  const { observeSubagentCompletion } = await import("../pi-extension/subagents/index.ts");
+  const runtime = (globalThis as any)[Symbol.for("pi-subagents/runtime")];
+  const previousCtx = runtime.latestCtx;
+  try {
+    let plan = f.p.create(f.sm, 0, "Retained");
+    const mutate = (fn: (p: store.PlanSnapshot, c: store.CommandContext) => store.PlanSnapshot) => { plan = f.p.mutate(f.sm, plan.planId, plan.revision, fn); };
+    for (const status of ["in_review", "accepted", "failed", "skipped", "cancelled"] as const) {
+      const criterionId = randomUUID();
+      mutate((p, c) => store.addTask(p, c, `Retained ${status}`, { criteria: [{ criterionId, text: "Checked" }] }));
+      const id = plan.tasks.at(-1)!.taskId;
+      if (status === "in_review" || status === "accepted") mutate((p, c) => store.submitReview(p, c, id, "Submitted, not process success"));
+      if (status === "accepted") {
+        mutate((p, c) => store.addEvidence(p, c, id, { criterionId, ref: "check" }));
+        mutate((p, c) => store.accept(p, c, id, { [criterionId]: p.tasks.at(-1)!.evidence.map(e => e.evidenceId) }, "Parent acceptance"));
+      }
+      if (status === "failed") {
+        mutate((p, c) => store.startAttempt(p, c, id));
+        mutate((p, c) => store.attachRun(p, c, id, p.tasks.at(-1)!.attempts[0].attemptId, "failed-run"));
+        mutate((p, c) => store.recordResult(p, c, id, p.tasks.at(-1)!.attempts[0].attemptId, { eventId: "failed-event", runId: "failed-run", kind: "failure", reason: "failed", ref: "report" }));
+      }
+      if (status === "skipped" || status === "cancelled") mutate((p, c) => store[status === "skipped" ? "skip" : "cancel"](p, c, id, "Explicit"));
+    }
+    const before = f.readWidget();
+    const running = { id: randomUUID(), lifecycle: { delivery: "pending" } } as any;
+    runtime.latestCtx = f.ctx;
+    runtime.runningSubagents.set(running.id, running);
+    // The real watcher settlement path deletes the last process and clears its widget.
+    await observeSubagentCompletion(running, Promise.resolve({ supervisionEnded: true } as any));
+    assert.equal(runtime.runningSubagents.has(running.id), false);
+    assert.equal(f.widgets.get("subagent-status"), undefined);
+    assert.equal(f.readWidget(), before);
+    assert.match(before, /1\/5 accepted/);
+    const reopened = SessionManager.open(f.sm.getSessionFile()!);
+    assert.equal(renderPlan(f.p.restore(reopened), 200).join("\n"), before);
+    assert.deepEqual(f.p.read(reopened).snapshot, plan);
+  } finally { runtime.latestCtx = previousCtx; f.cleanup(); }
+});
+
 test("Unicode, controls, zero width, resize and theme invalidation respect terminal columns", () => {
   const plan = store.addTask(store.createPlan("界👩‍💻é\u001b[31m", { sessionId: "s", branchInstanceId: "b" }), { sessionId: "s", branchInstanceId: "b", expectedRevision: 0 }, "界".repeat(100));
   const view = { snapshot: plan, writable: true, recoveryUncertain: [] };

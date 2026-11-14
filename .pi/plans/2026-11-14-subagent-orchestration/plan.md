@@ -160,7 +160,9 @@ Nie utożsamiać sukcesu procesu z sukcesem zadania. Zgłoszenie wykonania przez
 - [x] Wyświetlać listę punktów, statusy, role/właścicieli, blokady i licznik zaakceptowanych zadań.
 
 Weryfikacja Panel 1: `plan-view.ts` jest czystą projekcją magazynu; natywny widget rejestrowany przez `registerPlanTools`, bez zmiany `/plan` ani tur modelu. Role/właściciele to jawne pole owner (bez zgadywania roli runtime); checkbox tylko dla accepted. Subskrypcja save/restore i odświeżanie narzędzi także po błędzie. `test/plan-view.test.ts`: 3/3, rzeczywisty SessionManager i zarejestrowane execute, osiem statusów, Unicode/wąskie terminale/theme, tree/reload/detach/uszkodzony schemat/pusta gałąź. Bez live herdr i bez adaptera caller_ping.
-- [ ] Pozostawiać zakończone zadania w planie, mimo usunięcia agentów z widgetu procesów.
+- [x] Pozostawiać zakończone zadania w planie, mimo usunięcia agentów z widgetu procesów.
+
+Weryfikacja Panel 2: osobny klucz widgetu `subagent-plan`, wiersze wyłącznie z trwałego store (bez runtime map). Regresja wywołuje rzeczywistą ścieżkę `observeSubagentCompletion(supervisionEnded)`: usunięcie ostatniego agenta i wyczyszczenie widgetu procesów nie usuwa zadań in_review/accepted/failed/skipped/cancelled. Odczyt po ponownym otwarciu sesji z dysku zachowuje identyczny plan i licznik 1/5; exit nie akceptuje zadania. Focused panel 4/4; bez live herdr.
 - [ ] Zachować blokadę i jej przyczynę po `caller_ping`.
 - [ ] Dla długich planów udostępnić skrót oraz rozwijaną pełną listę.
 - [ ] Udostępnić szczegóły zadania: kryteria, próby, wyniki, testy, decyzje i odnośniki do sesji.
