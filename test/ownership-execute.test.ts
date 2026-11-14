@@ -14,6 +14,8 @@ let serial = 0;
 let inspect: (pane: string) => Promise<string> = async () => JSON.stringify({ error: { code: "pane_not_found" } });
 const closed: string[] = [];
 const sent: string[] = [];
+let onRun: (surface: string, command: string) => void = () => {};
+const escapes: string[] = [];
 const originalWrite = fs.writeFileSync;
 mock.method(fs, "writeFileSync", (path: any, ...args: any[]) => {
   if (prepareFails && String(path).endsWith(".sh")) throw new Error("preparation failed");
@@ -27,7 +29,9 @@ mock.method(childProcess, "execFileSync", (_command: any, args: any) => {
   if (args[1] === "run") {
     sent.push(args[2]);
     if (sendFails) throw new Error("ambiguous send failure");
+    onRun(args[2], args[3]);
   }
+  if (args[1] === "send-keys") escapes.push(args[2]);
   if (args[1] === "close") closed.push(args[2]);
   return "";
 });
@@ -41,6 +45,7 @@ const { canonicalSessionPath, reserveSession, releaseSession, sessionOwners } = 
 const { persistLaunchProfile, resolveLaunchProfile } = await import("../pi-extension/subagents/launch-profile.ts");
 const { runCompletionFile } = await import("../pi-extension/subagents/run-artifacts.ts");
 const { runInPane, runScriptInPane } = await import("../pi-extension/subagents/terminal.ts");
+const { CONTINUE_COMMAND, continuationCommand, registerLiveContinuation } = await import("../pi-extension/subagents/live-continuation.ts");
 const keys = ["HERDR_ENV", "HERDR_WORKSPACE_ID", "HC_TERMINAL_ID", "HC_TERMINAL_SOCKET", "PI_SUBAGENT_SHELL_READY_DELAY_MS", "PI_DENY_TOOLS", "PI_SUBAGENT_LAYOUT"];
 const saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
 process.env.HERDR_ENV = "1";
@@ -80,10 +85,13 @@ async function fixture(run: (f: any) => Promise<void>) {
     modelRegistry: { find: () => ({ provider: "test", id: "model", reasoning: true }), getAvailable: () => [{ provider: "test", id: "model" }], hasConfiguredAuth: () => true },
     sessionManager: { getSessionFile: () => session, getSessionDir: () => dir, getSessionId: () => "parent" },
   };
-  const resume = () => tools.get("subagent_resume").execute("call", { sessionPath: session }, undefined, undefined, ctx);
-  try { await run({ dir, session, ctx, resume }); } finally {
+  const resume = (params = {}) => tools.get("subagent_resume").execute("call", { sessionPath: session, ...params }, undefined, undefined, ctx);
+  const interrupt = (id: string) => tools.get("subagent_interrupt").execute("interrupt", { id }, undefined, undefined, ctx);
+  try { await run({ dir, session, ctx, resume, interrupt }); } finally {
     prepareFails = false;
     sendFails = false;
+    onRun = () => {};
+    inspect = async () => JSON.stringify({ error: { code: "pane_not_found" } });
     handlers.get("session_shutdown")({ reason: "exit" }, ctx);
     for (const [path, owner] of sessionOwners) if (!existingOwners.has(path)) releaseSession(path, owner.runId);
     fs.rmSync(dir, { recursive: true, force: true });
@@ -95,6 +103,134 @@ async function until(predicate: () => boolean) {
   const deadline = Date.now() + 4000;
   while (!predicate()) { assert.ok(Date.now() < deadline, "condition timed out"); await pause(); }
 }
+
+test("registered interrupt/resume preserves the live run and watcher; concurrent continuation has one winner", async () => fixture(async ({ session, resume, interrupt }: any) => {
+  const started = await resume();
+  const child = __test__.runningSubagents.get(started.details.id)!;
+  const owner = sessionOwners.get(session)!;
+  const abort = child.abortController;
+  const activityFile = child.activityFile;
+  const launchScript = child.launchScriptFile;
+  const surfacesBefore = serial;
+  const sendsBefore = sent.length;
+  const events = new Map<string, Function>();
+  const commands = new Map<string, any>();
+  const messages: any[] = [];
+  const env = { PI_SUBAGENT_ID: child.id, PI_SUBAGENT_SESSION: session, PI_SUBAGENT_ACTIVITY_FILE: activityFile };
+  const previous = Object.fromEntries(Object.keys(env).map((key) => [key, process.env[key]]));
+  Object.assign(process.env, env);
+  try {
+    registerLiveContinuation({ on: (event: string, handler: Function) => events.set(event, handler),
+      registerCommand: (name: string, command: any) => commands.set(name, command),
+      sendUserMessage: (...args: any[]) => messages.push(args) } as any);
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  }
+  const childCtx = { isIdle: () => true, hasPendingMessages: () => false,
+    sessionManager: { getSessionFile: () => session } };
+  fs.writeFileSync(activityFile, JSON.stringify({ version: 1, runningChildId: child.id,
+    createdAt: Date.now(), updatedAt: Date.now(), sequence: 1, latestEvent: "agent_start",
+    phase: "active", activeScope: "agent", agentActive: true, turnActive: true, providerActive: false, toolActive: false }));
+  assert.equal((await interrupt(child.id)).details.status, "interrupt_requested");
+  assert.equal(escapes.at(-1), child.surface);
+  assert.equal(child.lifecycle.process.kind, "running");
+  assert.equal(child.lifecycle.turn.kind, "interrupted");
+  assert.equal(abort.signal.aborted, false);
+  assert.equal(sessionOwners.get(session), owner);
+  assert.equal(__test__.runningSubagents.get(child.id), child);
+  inspect = async (pane) => JSON.stringify({ result: { pane: { pane_id: pane, agent_status: "idle" } } });
+  const message = "  /subagent_done\n!echo unsafe\n@private.txt\n/skill:secret\n${shell}; ' \"\n\r\n ";
+  await assert.rejects(resume({ message }), /not confirmed settled/);
+  assert.equal(messages.length, 0, "Escape alone is not child settlement evidence");
+  assert.equal(sent.length, sendsBefore);
+  events.get("agent_settled")!({ aborted: true }, childCtx);
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let inspectionHeld = false;
+  inspect = async (pane) => {
+    if (owner.continuationRequestId && !inspectionHeld) { inspectionHeld = true; await gate; }
+    return JSON.stringify({ result: { pane: { pane_id: pane, agent_status: "idle" } } });
+  };
+  onRun = (surface, command) => {
+    assert.equal(surface, child.surface);
+    assert.equal(command, continuationCommand(owner.continuationRequestId!));
+    commands.get(CONTINUE_COMMAND).handler(command.split(" ")[1], childCtx);
+  };
+  const first = resume({ message });
+  try {
+    await until(() => !!owner.continuationRequestId);
+    // Keep the winner suspended at continuation inspection while the loser passes routing.
+    await assert.rejects(resume({ message: "must not be delivered" }), /in flight/);
+    assert.equal(messages.length, 0);
+    assert.equal(sent.length, sendsBefore);
+    release();
+    const result = await first;
+    assert.equal(result.details.status, "continued");
+    assert.equal(result.details.id, child.id);
+    assert.equal(result.details.sessionPath, session);
+  } finally { release(); }
+  assert.deepEqual(messages, [[message, { expandPromptTemplates: false }]]);
+  assert.equal(serial, surfacesBefore, "no replacement process/pane");
+  assert.equal(sent.length, sendsBefore + 1, "only the private continuation command was sent");
+  assert.equal(sessionOwners.get(session), owner);
+  assert.equal(__test__.runningSubagents.get(child.id), child);
+  assert.equal(child.abortController, abort);
+  assert.equal(abort.signal.aborted, false);
+  assert.equal(child.activityFile, activityFile);
+  assert.equal(child.launchScriptFile, launchScript);
+  // No replacement launch: the original watcher must still consume this run's sidecar.
+  assert.equal(child.lifecycle.process.completion, undefined);
+  fs.writeFileSync(runCompletionFile(session, child.id), JSON.stringify({ type: "done", runId: child.id, keepOpen: true }));
+  await until(() => child.lifecycle.process.completion != null);
+  assert.equal(serial, surfacesBefore);
+}));
+
+test("simultaneous registered resumes of a closed owner reserve once after shared inspection", async () => fixture(async ({ session, resume }: any) => {
+  const old = reserveSession(session, "closed-owner"); old.surface = "closed-pane";
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let inspections = 0;
+  inspect = async () => { inspections++; await gate; return JSON.stringify({ error: { code: "pane_not_found" } }); };
+  const before = serial;
+  const sendsBefore = sent.length;
+  const attempts = [resume(), resume()];
+  const results = Promise.allSettled(attempts);
+  try {
+    await until(() => inspections === 2);
+    assert.equal(sessionOwners.get(session), old);
+    assert.equal(serial, before, "no launch before inspection resolves");
+    release();
+    const settled = await results;
+    const winners = settled.filter((result) => result.status === "fulfilled");
+    const losers = settled.filter((result) => result.status === "rejected");
+    assert.equal(winners.length, 1);
+    assert.equal(losers.length, 1);
+    assert.match(String(losers[0].reason), /already owned/);
+    const winner = winners[0].value;
+    assert.equal(winner.details.status, "started");
+    assert.equal(sessionOwners.get(session)!.runId, winner.details.id);
+    assert.equal(sessionOwners.get(session)!.dispatched, true);
+    assert.equal(serial, before + 1);
+    assert.equal(sent.length, sendsBefore + 1);
+    assert.ok(__test__.runningSubagents.has(winner.details.id));
+  } finally { release(); }
+}));
+
+test("registered resume recovers a missing pane before selecting its tracked live run", async () => fixture(async ({ session, resume }: any) => {
+  const first = await resume();
+  const original = __test__.runningSubagents.get(first.details.id)!;
+  const oldOwner = sessionOwners.get(session)!;
+  const before = serial;
+  // The fixture reports missing, even though the previous running entry still exists.
+  const next = await resume({ message: "closed session follow-up" });
+  assert.equal(next.details.status, "started");
+  assert.notEqual(next.details.id, original.id);
+  assert.notEqual(sessionOwners.get(session), oldOwner);
+  assert.equal(sessionOwners.get(session)!.runId, next.details.id);
+  assert.equal(serial, before + 1);
+}));
 
 test("real resume execute: completion retains ownership, closed pane inspection unlocks fresh resume", async () => fixture(async ({ session, resume }: any) => {
   const first = await resume();
