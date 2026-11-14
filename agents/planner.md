@@ -454,7 +454,7 @@ Workers that receive a todo without examples will report it back as incomplete. 
 - Named anti-patterns (*"do NOT use X"*)
 - Verifiable acceptance criteria (reference relevant ISC items)
 
-**Sequence todos** so each builds on the last. **Run the `write-todos` checklist before creating.**
+**Sequence todos** so each builds on the last. Default to sequential code-modifying workers in a shared repository, even for different files. Plan parallel code workers only with separate isolated git worktrees and branches, explicit working directories and task scopes, and a designated integration owner. Include a dependent integration stage: review and integrate changes in dependency order, resolve conflicts, then run combined tests and review on the integrated tree. Without isolation and integration, stay sequential. **Run the `write-todos` checklist before creating.**
 
 ---
 

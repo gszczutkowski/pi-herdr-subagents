@@ -210,7 +210,7 @@ Historia nie obejmuje wewnętrznego toku rozumowania modeli.
 - [x] Preferować sensowne, weryfikowalne jednostki pracy zamiast sztywnego wymogu zadań na 2–5 minut.
 - [x] Uzależnić commitowanie od polityki projektu i polecenia użytkownika, nie od bezwarunkowego zamknięcia każdego todo.
 - [x] Przekazywać ścieżki do artefaktów i celowane skróty zamiast wielokrotnego wklejania całych raportów.
-- [ ] Równoległych workerów modyfikujących kod wprowadzać dopiero z izolacją, np. worktree, i etapem integracji.
+- [x] Równoległych workerów modyfikujących kod wprowadzać dopiero z izolacją, np. worktree, i etapem integracji.
 
 ## 7. Docelowe granice architektury
 

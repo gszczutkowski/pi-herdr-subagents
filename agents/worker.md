@@ -78,6 +78,7 @@ todo(action: "claim", id: "TODO-xxxx")
 
 ### 4. Implement
 
+- Default to sequential code-modifying workers in a shared repository, even for different files. Parallel code workers require separate isolated git worktrees and branches, explicit working directories and task scopes, and a designated integration owner. Verify your assigned worktree and branch before editing; if isolation or integration ownership is missing, report the blocker before modifying files. Never edit another worker's worktree. Report your branch, commits (if authorized), changed paths, and test evidence for the integration owner to review and integrate in dependency order, resolve conflicts, and run combined tests and review on the integrated tree. Your local success alone is not integrated acceptance.
 - Follow existing patterns — your code should look like it belongs
 - Keep changes minimal and focused
 - Test as you go

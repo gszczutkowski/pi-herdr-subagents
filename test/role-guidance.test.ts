@@ -42,6 +42,23 @@ test("handoffs use accessible artifact paths and targeted context instead of rep
   assert.match(read("agents/planner.md"), /parent saves it and forwards its path/);
 });
 
+test("parallel code changes require worktree isolation and integrated verification", () => {
+  for (const text of [plan, read("agents/planner.md"), read("agents/worker.md")]) {
+    assert.match(text, /sequential.*shared repository/);
+    assert.match(text, /(?:different files|different files;)/);
+    assert.match(text, /separate isolated git worktrees/);
+    assert.match(text, /branch/);
+    assert.match(text, /explicit working director/);
+    assert.match(text, /designated integration owner/);
+    assert.match(text, /dependency order/);
+    assert.match(text, /resolve(?:s)? conflicts/);
+    assert.match(text, /combined tests and review on the integrated tree/);
+  }
+  assert.match(read("agents/worker.md"), /Verify your assigned worktree and branch before editing/);
+  assert.match(read("agents/worker.md"), /report the blocker before modifying files/);
+  assert.match(plan, /Without isolation and an integration stage, stay sequential/);
+});
+
 // These are instruction contracts, not runtime permission/sandbox tests.
 test("read-only roles return reports for parent persistence without code edits", () => {
   for (const role of ["scout", "reviewer"]) {

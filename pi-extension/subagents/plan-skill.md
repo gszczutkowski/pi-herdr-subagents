@@ -165,7 +165,9 @@ subagent({
 });
 ```
 
-**Always run workers sequentially in the same git repo** — parallel workers will conflict on commits.
+**Default: run code-modifying workers sequentially in a shared repository**, including when they touch different files; the index, commits, and generated files are still shared.
+
+Parallel code workers are allowed only in separate isolated git worktrees, each with its own branch and explicit working directory, non-overlapping task scope, and a designated integration owner. Pass absolute artifact paths and verify access across worktrees. After workers finish, the integration owner reviews and integrates their changes in dependency order, resolves conflicts, and runs combined tests and review on the integrated tree. Individual worker success is not integrated acceptance. Without isolation and an integration stage, stay sequential.
 
 Commits require both permission under project policy and user authorization. Honor an explicit request for per-point commits when permitted; todo completion alone is not authorization. If instructions conflict, report the conflict before committing. Without authorization, leave changes uncommitted and report paths and verification evidence. Use the `commit` skill when available and authorized, otherwise follow project commit conventions.
 
