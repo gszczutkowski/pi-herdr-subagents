@@ -65,7 +65,7 @@ export class HcTuiRun {
       branch: execFileSync("git", ["branch", "--show-current"], { encoding: "utf8" }).trim(),
       commit: execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
       entry, sha256: createHash("sha256").update(readFileSync(entry)).digest("hex"),
-      sourceHashes: Object.fromEntries(["index.ts", "subagent-done.ts", "live-continuation.ts"].map(name =>
+      sourceHashes: Object.fromEntries(["index.ts", "subagent-done.ts", "live-continuation.ts", "close-control.ts", "session-audit.ts", "process-identity.ts"].map(name =>
         [name, createHash("sha256").update(readFileSync(join(this.root, "pi-extension/subagents", name))).digest("hex")])),
       sourceRoot: this.root,
       model: process.env.PI_TEST_MODEL || "openai-codex/gpt-6.1-sol",
@@ -90,6 +90,11 @@ export class HcTuiRun {
     if (text.startsWith("/")) {
       execFileSync(this.hc.executable, ["keys", target, ...text.split(""), "enter"], { encoding: "utf8", timeout: 15_000 });
     } else this.hc.send(target, text);
+  }
+  keys(target: string, ...keys: string[]) {
+    assert.ok(this.owned.has(target), "Only owned terminals may receive keys");
+    appendFileSync(join(this.evidence, "actions.jsonl"), JSON.stringify({ at: Date.now(), target, keys }) + "\n");
+    execFileSync(this.hc.executable, ["keys", target, ...keys], { encoding: "utf8", timeout: 15_000 });
   }
   messages() { return jsonLines(this.parentSession).flatMap(e => e.type === "message" ? [e.message] : e.type === "custom_message" ? [e] : []); }
   observed() { return jsonLines(this.events); }

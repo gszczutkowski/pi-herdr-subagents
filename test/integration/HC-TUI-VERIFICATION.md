@@ -1,5 +1,7 @@
 # Final MAIN authenticated HC TUI verification — 2026-11-14
 
+For the later owned audit/draft-rejection/verified-close journey and its full automated suite, see [HC-CLOSE-VERIFICATION.md](HC-CLOSE-VERIFICATION.md). The five-journey results below are historical evidence, not a claim that every journey was rerun for close hardening.
+
 Final complete confirmation command: **5 passed, 0 failed, 0 skipped, exit 0**. Across all three complete commands: 13 passes and 2 failures; the earlier failures below are retained, not reclassified. No production changes or weakened journey assertions.
 
 ## Original plan live criterion (T4): evidence for parent review

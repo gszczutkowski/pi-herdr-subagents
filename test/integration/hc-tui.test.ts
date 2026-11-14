@@ -5,6 +5,8 @@ import { it } from "node:test";
 import { HcTuiRun, jsonLines, until } from "./hc-tui-harness.ts";
 import { runCompletionFile } from "../../pi-extension/subagents/run-artifacts.ts";
 import { canonicalSessionPath } from "../../pi-extension/subagents/ownership.ts";
+import { probeProcess } from "../../pi-extension/subagents/process-identity.ts";
+import { closeDir } from "../../pi-extension/subagents/close-control.ts";
 
 const options = { skip: process.env.PI_TEST_HC_TUI !== "1", timeout: 600_000 };
 function journey(name: string, verify: (run: HcTuiRun) => Promise<void>) {
@@ -19,6 +21,60 @@ function journey(name: string, verify: (run: HcTuiRun) => Promise<void>) {
 function metadata(run: HcTuiRun, child: any) {
   return JSON.parse(readFileSync(join(run.evidence, `child-${child.id}.json`), "utf8"));
 }
+
+journey("owned audit draft rejection resume and close", async run => {
+  const child = await run.spawn("Closable", "Run bash: printf ALIVE > close-alive.txt . Summarize, then wait for further instructions without exiting.", "verify-open");
+  await run.marker("close-alive.txt", "ALIVE"); await run.completion(child);
+  const owned = metadata(run, child);
+  const started = run.observed().find(e => e.kind === "session_start" && e.session === child.sessionFile);
+  assert.equal(started?.mode, "tui"); assert.ok(started?.pid);
+  const activity = run.manifest().runs[child.id].activityFile;
+  const control = closeDir(activity);
+  await until(run.evidence, () => existsSync(join(control, "current.json")) ? true : undefined, "real child CLOSE idle capability");
+  const tool = async (name: string) => {
+    const count = run.results(name).length, at = Date.now();
+    run.action(run.parent, `Call ${name} exactly once with id ${JSON.stringify(child.id)}. Report the actual tool result briefly and end your turn. Do not retry, poll, close terminals, or use any other tool.`);
+    const event = await until(run.evidence, () => run.results(name)[count], `actual ${name} result`);
+    assert.ok(!event.data.isError, `${name} must return a lifecycle result, not throw`);
+    await run.idle(at);
+    return event;
+  };
+  const audit = (await tool("subagent_audit")).data.result.details;
+  assert.equal(audit.status, "single"); assert.equal(audit.ownerCount, 1);
+  assert.equal(audit.owners[0].pid, started.pid);
+  run.assertions.ownedAudit = audit;
+  const beforeDraft = readFileSync(child.sessionFile, "utf8");
+  run.keys(owned.surface, ..."unsentclosedraft".split("")); // No Enter: typed after idle publication.
+  await run.capture("live-draft-before-close");
+  const rejected = (await tool("subagent_close")).data.result.details;
+  assert.equal(rejected.status, "rejected"); assert.match(rejected.reason, /draft/);
+  assert.equal(existsSync(join(control, `${rejected.requestId}.claim.json`)), false);
+  assert.equal(existsSync(join(control, "intent.json")), false);
+  assert.equal(probeProcess(started.pid).kind, "present");
+  assert.equal(readFileSync(child.sessionFile, "utf8"), beforeDraft, "draft rejection starts no child model turn");
+  assert.equal(run.observed().some(e => e.kind === "session_shutdown" && e.session === child.sessionFile), false);
+  copyFileSync(join(control, `${rejected.requestId}.ack.json`), join(run.evidence, "draft-rejection-ack.json"));
+  run.assertions.liveDraftRejected = rejected;
+  run.keys(owned.surface, "ctrl+u"); // Only this journey's owned editor, no Escape or user-pane input.
+  const resumed = await run.resume(child, "Run bash: printf RESUMED > close-resumed.txt . Summarize, then wait without exiting.", false);
+  assert.equal(resumed.id, child.id);
+  await run.marker("close-resumed.txt", "RESUMED"); await run.completion(child, 2);
+  assert.equal(run.observed().filter(e => e.kind === "session_start" && e.session === child.sessionFile).length, 1);
+  const beforeClose = readFileSync(child.sessionFile, "utf8");
+  const closedEvent = await tool("subagent_close"), result = closedEvent.data.result.details;
+  assert.equal(result.status, "closed"); assert.notEqual(result.requestId, rejected.requestId);
+  assert.equal(result.process.pid, started.pid); assert.equal(result.remainingOwners, 0);
+  assert.equal(probeProcess(started.pid).kind, "absent");
+  assert.equal(readFileSync(child.sessionFile, "utf8"), beforeClose, "CLOSE must not add a prompt or child model turn");
+  const cleanup = run.observed().filter(e => e.kind === "close_custody" && e.data.id === child.id && e.at <= closedEvent.at);
+  assert.ok(cleanup.some(e => e.data.source === "closure-validation-read" && !e.data.running && !e.data.owner), "normal watcher cleanup must be observed before the registered close returns");
+  run.assertions.verifiedClose = { result, cleanup, noExtraChildTurn: true, originalPidAbsent: true };
+  const receipt = (await tool("subagent_close")).data.result.details;
+  assert.deepEqual(receipt, result, "closed receipt recheck never dispatches another shutdown");
+  await run.capture("verified-close");
+  run.action(run.parent, "/quit");
+  await until(run.evidence, () => run.observed().find(e => e.kind === "session_shutdown" && e.session === run.parentSession && e.data.reason === "quit"), "owned parent graceful quit");
+});
 
 journey("parallel and reload", async run => {
   const a = await run.spawn("ParallelA", "Run bash: node gate.mjs parallel-a . Then finish.");

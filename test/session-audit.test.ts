@@ -66,11 +66,12 @@ test(`real ${label} Pi RPC processes sharing one file are audited, including can
     for (const child of children) assert.ok(audit.owners.some(owner => owner.pid === child.pid));
     const original = probeProcess(children[0].pid!);
     assert.equal(original.kind, "present");
-    children[0].kill(); await new Promise(resolveExit => children[0].once("exit", resolveExit));
+    const firstExit = new Promise(resolveExit => children[0].once("exit", resolveExit));
+    children[0].stdin.end(); await firstExit; // RPC EOF invokes graceful runtime shutdown.
     assert.equal(probeProcess(children[0].pid!).kind, "absent");
     assert.equal(auditSession(session).ownerCount, 1);
   } finally {
-    await Promise.all(children.map(child => child.exitCode !== null || child.signalCode !== null ? undefined : new Promise<void>(resolveExit => { child.once("exit", () => resolveExit()); child.kill(); })));
+    await Promise.all(children.map(child => child.exitCode !== null || child.signalCode !== null ? undefined : new Promise<void>(resolveExit => { child.once("exit", () => resolveExit()); child.stdin.end(); })));
     rmSync(aliasDirectory, { recursive: true, force: true });
     rmSync(dir, { recursive: true, force: true });
   }

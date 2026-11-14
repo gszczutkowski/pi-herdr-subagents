@@ -285,7 +285,11 @@ test("real Pi RPC UI cannot prove editor safety and rejects CLOSE without a mode
     const audit = () => auditSession(session, { rows: snapshot.rows.filter(row => row.pid === child.pid), verified: snapshot.verified });
     assert.equal(audit().status, "single");
     const before = readFileSync(session, "utf8");
-    const closing = closeOwnedChild({ runId: "rpc-run", dispatched: true }, { id: "rpc-run", cli: "pi", sessionFile: session, activityFile }, { validate: () => {}, audit, timeoutMs: 10000 });
+    const closing = closeOwnedChild({ runId: "rpc-run", dispatched: true }, { id: "rpc-run", cli: "pi", sessionFile: session, activityFile }, { validate: () => {}, audit, timeoutMs: 10000,
+      // This test owns the direct spawn handle and targets UI draft safety.
+      // Ancestry enumeration is covered by the registered-tool boundary tests
+      // and the real HC journey, not another load-sensitive global CIM scan.
+      protected: pid => pid === child.pid ? false : undefined });
     await until(() => readdirSync(closeDir(activityFile)).some(name => name.endsWith(".ack.json")));
     const result = await closing;
     assert.equal(result.status, "rejected");
@@ -294,7 +298,7 @@ test("real Pi RPC UI cannot prove editor safety and rejects CLOSE without a mode
     const after = readFileSync(session, "utf8");
     assert.equal(after, before, "close does not start another model turn or append a prompt");
   } finally {
-    if (child.exitCode === null && child.signalCode === null) { child.kill(); await exit; }
+    if (child.exitCode === null && child.signalCode === null) { child.stdin.end(); await exit; } // RPC EOF gracefully shuts down its runtime.
     rmSync(dir, { recursive: true, force: true });
   }
 });

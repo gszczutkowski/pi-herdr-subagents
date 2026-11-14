@@ -4,7 +4,7 @@ Read this index before choosing a journey. This is the maintained source for use
 
 ## HC backend
 
-With `HC_TERMINAL_ID` + `HC_TERMINAL_SOCKET`, use the explicit opt-in real TUI journeys in `../SKILL.md` and `test/integration/hc-tui.test.ts`. The legacy helper and workspace/pane commands below are not HC-compatible. Read `test/integration/HC-TUI-VERIFICATION.md` for actual results and blockers; terminal transport smoke alone is not lifecycle proof.
+With `HC_TERMINAL_ID` + `HC_TERMINAL_SOCKET`, use the explicit opt-in real TUI journeys in `../SKILL.md` and `test/integration/hc-tui.test.ts`. The legacy helper and workspace/pane commands below are not HC-compatible. Read `test/integration/HC-TUI-VERIFICATION.md` for the original lifecycle results and `test/integration/HC-CLOSE-VERIFICATION.md` for owned audit/draft-rejection/close evidence; terminal transport smoke alone is not lifecycle proof.
 
 ## Baseline preconditions (legacy herdr)
 
