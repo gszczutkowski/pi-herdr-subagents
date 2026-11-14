@@ -13,7 +13,7 @@ import { PlanPersistence, PLAN_ENTRY } from "../pi-extension/subagents/plan-pers
 import { bindPlanRun, importPlanEnvelope } from "../pi-extension/subagents/plan-runtime.ts";
 import { RuntimeStore, readRuntimeManifest } from "../pi-extension/subagents/runtime-store.ts";
 import { canonicalSessionPath, releaseSession } from "../pi-extension/subagents/ownership.ts";
-import { continuationDir } from "../pi-extension/subagents/live-continuation.ts";
+import { registerLiveContinuation } from "../pi-extension/subagents/live-continuation.ts";
 import { contractTask, resolveAssignmentContract } from "../pi-extension/subagents/contracts.ts";
 
 // Real native persistence, registered execute, launch builder, completion adapter
@@ -37,7 +37,7 @@ test("registered task-bound spawn, live/closed resume, failure isolation and res
   const tools = new Map<string, any>(); const events = new Map<string, any[]>();
   const sent: any[] = []; const widgets = new Map<string, any>();
   const manifestDir = join(dir, "artifacts", sm.getSessionId(), "subagent-runtime");
-  let continuationChild: any;
+  const continuationEvents = new Map<string, Function>();
   const children: any[] = [];
   let savedContract: any;
   mock.method(childProcess, "execSync", () => "herdr");
@@ -51,14 +51,6 @@ test("registered task-bound spawn, live/closed resume, failure isolation and res
       assert.ok(read().tasks[0].attempts.some(a => a.runIds.includes(run.id)), "native append precedes dispatch");
       assert.equal(run.phase, "dispatch-intent");
       if (failSend) { failAppend = true; throw new Error("ambiguous transport"); }
-    }
-    if (continuationChild && args.some(a => a.includes("/_subagent_continue"))) {
-      liveSends++;
-      const requestId = args.join(" ").match(/\/_subagent_continue ([0-9a-f-]+)/)![1];
-      const cdir = continuationDir(continuationChild.activityFile);
-      const request = JSON.parse(fs.readFileSync(join(cdir, `${requestId}.request.json`), "utf8"));
-      assert.equal(request.message, contractTask("follow-up", savedContract));
-      fs.writeFileSync(join(cdir, `${requestId}.result.json`), JSON.stringify({ runId: continuationChild.id, requestId, status: "accepted" }));
     }
     return "";
   });
@@ -114,10 +106,15 @@ test("registered task-bound spawn, live/closed resume, failure isolation and res
     const beforeLive = read().revision;
     child.lifecycle.process = { kind: "running", since: Date.now() } as any;
     child.lifecycle.turn = { kind: "interrupted", since: Date.now() } as any;
-    continuationChild = child;
-    const cdir = continuationDir(child.activityFile!);
-    fs.mkdirSync(cdir, { recursive: true });
-    fs.writeFileSync(join(cdir, "state.json"), JSON.stringify({ runId: child.id, sessionFile: canonicalSessionPath(child.sessionFile), state: "interrupted-idle", idleToken: randomUUID() }));
+    const previousChildEnv = { ...process.env };
+    Object.assign(process.env, { PI_SUBAGENT_ID: child.id, PI_SUBAGENT_SESSION: child.sessionFile, PI_SUBAGENT_ACTIVITY_FILE: child.activityFile });
+    registerLiveContinuation({ on: (name: string, handler: Function) => continuationEvents.set(name, handler), registerCommand: () => {},
+      sendUserMessage: (message: string) => { liveSends++; assert.equal(message, contractTask("follow-up", savedContract)); } } as any);
+    for (const key of Object.keys(process.env)) if (!(key in previousChildEnv)) delete process.env[key];
+    Object.assign(process.env, previousChildEnv);
+    const continuationCtx = { isIdle: () => true, hasPendingMessages: () => false, sessionManager: { getSessionFile: () => child.sessionFile } };
+    continuationEvents.get("session_start")!({}, continuationCtx);
+    continuationEvents.get("agent_settled")!({ aborted: true }, continuationCtx);
     const liveSnapshot = structuredClone(read());
     const liveDispatches = dispatches;
     await assert.rejects(execute("subagent_resume", { sessionPath: child.sessionFile, message: "stale", planTask: { ...selection(), expectedRevision: 0 } }), /Revision conflict/);
@@ -143,7 +140,7 @@ test("registered task-bound spawn, live/closed resume, failure isolation and res
     assert.equal(read().revision, beforeLive, "idempotent attach does not append");
     assert.equal(liveSends, 1, "rejected live bindings never reach transport");
     assertSavedContract(child.id);
-    continuationChild = undefined;
+    continuationEvents.get("session_shutdown")!();
     const structuredResult = { status: "complete" as const, summary: "Implementation proposal", artifacts: ["report.txt"],
       checks: [{ criterionIds: [criterionId], ref: "report.txt#check", outcome: "passed" as const }], unmetCriterionIds: [], risks: [] };
     const { runCompletionFile } = await import("../pi-extension/subagents/run-artifacts.ts");

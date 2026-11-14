@@ -2212,10 +2212,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               persistProfileBinding(child.sessionFile, child.planTask, continuationContract);
             }
             if (liveOwner.continuationRequestId) child.durableStore?.continuation(child.id, liveOwner.continuationRequestId);
-          }, send: (surface, command) => {
-            // A live bridge rejection/uncertain send cannot certify that the
-            // existing healthy process or its task attempt failed.
-            runInPane(surface, command);
           } });
           recordHistory(child.lineage, child.id, "continuation", `Parent continuation (${result.status}): ${params.message ?? ""}`,
             result.requestId, [child.sessionFile]);

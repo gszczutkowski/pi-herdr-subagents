@@ -16,6 +16,7 @@ const closed: string[] = [];
 const sent: string[] = [];
 let onRun: (surface: string, command: string) => void = () => {};
 const escapes: string[] = [];
+const childShutdowns: Array<() => void> = [];
 const originalWrite = fs.writeFileSync;
 mock.method(fs, "writeFileSync", (path: any, ...args: any[]) => {
   if (prepareFails && String(path).endsWith(".sh")) throw new Error("preparation failed");
@@ -96,6 +97,7 @@ async function fixture(run: (f: any) => Promise<void>) {
     shutdown: () => handlers.get("session_shutdown")({ reason: "reload" }, ctx),
     reload: () => { extension(api); handlers.get("session_start")({ reason: "reload" }, ctx); },
     failNotifications: (value: boolean) => { failNotifications = value; } }); } finally {
+    for (const stop of childShutdowns.splice(0)) stop();
     prepareFails = false;
     sendFails = false;
     onRun = () => {};
@@ -138,6 +140,8 @@ test("registered interrupt/resume preserves the live run and watcher; concurrent
   }
   const childCtx = { isIdle: () => true, hasPendingMessages: () => false,
     sessionManager: { getSessionFile: () => session } };
+  events.get("session_start")!({}, childCtx);
+  childShutdowns.push(() => events.get("session_shutdown")!({}, childCtx));
   fs.writeFileSync(activityFile, JSON.stringify({ version: 1, runningChildId: child.id,
     createdAt: Date.now(), updatedAt: Date.now(), sequence: 1, latestEvent: "agent_start",
     phase: "active", activeScope: "agent", agentActive: true, turnActive: true, providerActive: false, toolActive: false }));
@@ -181,7 +185,7 @@ test("registered interrupt/resume preserves the live run and watcher; concurrent
   } finally { release(); }
   assert.deepEqual(messages, [[message, { expandPromptTemplates: false }]]);
   assert.equal(serial, surfacesBefore, "no replacement process/pane");
-  assert.equal(sent.length, sendsBefore + 1, "only the private continuation command was sent");
+  assert.equal(sent.length, sendsBefore, "artifact continuation never sends terminal input");
   assert.equal(sessionOwners.get(session), owner);
   assert.equal(__test__.runningSubagents.get(child.id), child);
   assert.equal(child.abortController, abort);
@@ -369,6 +373,8 @@ test("keepOpen first result retains watcher and owner; parent follow-up and manu
     }
   }
   const childCtx = { isIdle: () => true, hasPendingMessages: () => false, sessionManager: { getSessionFile: () => session } };
+  events.get("session_start")!({}, childCtx);
+  childShutdowns.push(() => events.get("session_shutdown")!({}, childCtx));
   events.get("agent_settled")!({ aborted: false }, childCtx);
   onRun = (_surface, command) => {
     const id = command.split(" ")[1];

@@ -1,11 +1,12 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, watch, writeFileSync, type FSWatcher } from "node:fs";
 import { join } from "node:path";
 import { canonicalSessionPath, type SessionOwner } from "./ownership.ts";
 import type { SubagentLifecycle, PaneInspection } from "./lifecycle.ts";
 
 export const CONTINUE_COMMAND = "_subagent_continue";
+export const CONTINUATION_TRANSPORT = "artifact-v1";
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 export const continuationDir = (activityFile: string) => `${activityFile}.continuation`;
 function read(path: string): any {
@@ -30,28 +31,47 @@ export function registerLiveContinuation(pi: ExtensionAPI): void {
   if (!runId || !session || !activity) return;
   const sessionFile = canonicalSessionPath(session);
   const dir = continuationDir(activity);
-  mkdirSync(dir, { recursive: true });
+  let watcher: FSWatcher | undefined;
   let idleToken: string | undefined;
   const busy = () => {
     idleToken = undefined;
-    publish(join(dir, "state.json"), { runId, sessionFile, state: "busy" });
+    mkdirSync(dir, { recursive: true });
+    publish(join(dir, "state.json"), { runId, sessionFile, transport: watcher ? CONTINUATION_TRANSPORT : undefined, state: "busy" });
   };
-  pi.on("session_start", busy);
+  pi.on("session_start", (_event, ctx) => {
+    watcher?.close();
+    mkdirSync(dir, { recursive: true });
+    // Only atomic request renames are dispatchable, never partial temporary files.
+    watcher = watch(dir, (_event, filename) => {
+      try {
+        const names = filename ? [filename.toString()] : readdirSync(dir);
+        for (const name of names) {
+          if (name.endsWith(".request.json")) receive(name.slice(0, -".request.json".length), ctx);
+        }
+      } catch {
+        // An I/O or API failure is ambiguous after claiming. Never replay it.
+        watcher?.close();
+        watcher = undefined;
+        busy();
+      }
+    });
+    watcher.on("error", () => { watcher?.close(); watcher = undefined; busy(); });
+    busy(); // Startup/reload invalidates every previous settled token.
+  });
   pi.on("before_agent_start", busy);
   pi.on("agent_start", busy);
-  pi.on("session_shutdown", busy);
+  pi.on("session_shutdown", () => { watcher?.close(); watcher = undefined; busy(); });
   pi.on("agent_settled", (event, ctx) => {
     if (!ctx.isIdle() || ctx.hasPendingMessages()) { busy(); return; }
     idleToken = randomUUID();
-    publish(join(dir, "state.json"), { runId, sessionFile, state: event.aborted ? "interrupted-idle" : "settled-idle", idleToken });
+    publish(join(dir, "state.json"), { runId, sessionFile, transport: watcher ? CONTINUATION_TRANSPORT : undefined, state: event.aborted ? "interrupted-idle" : "settled-idle", idleToken });
   });
-  pi.registerCommand(CONTINUE_COMMAND, {
-    description: "Private run-bound continuation transport",
-    handler: (requestId, ctx) => {
+  function receive(requestId: string, ctx: ExtensionContext): void {
       if (!uuid.test(requestId)) return;
       const resultFile = join(dir, `${requestId}.result.json`);
+      const claimFile = join(dir, `${requestId}.claim.json`);
       // A durable claim survives reload; even an ambiguous dispatch must never be replayed.
-      if (existsSync(resultFile)) return;
+      if (existsSync(claimFile) || existsSync(resultFile)) return;
       const request = read(join(dir, `${requestId}.request.json`));
       const reject = (reason: string) => publish(resultFile, { runId, requestId, status: "rejected", reason });
       if (request?.runId !== runId || request?.requestId !== requestId ||
@@ -62,13 +82,19 @@ export function registerLiveContinuation(pi: ExtensionAPI): void {
       if (!idleToken || request.idleToken !== idleToken || !ctx.isIdle() || ctx.hasPendingMessages()) {
         reject("Child is not settled interrupted idle"); return;
       }
-      writeFileSync(resultFile, JSON.stringify({ runId, requestId, status: "dispatching" }), { flag: "wx", mode: 0o600 });
+      writeFileSync(claimFile, JSON.stringify({ runId, requestId, status: "dispatching" }), { flag: "wx", mode: 0o600 });
       busy();
       // Explicitly bypass extension slash commands, skills and prompt templates.
       // This is the API path, not terminal input: !, @ and multiline text stay data.
       pi.sendUserMessage(request.message, { expandPromptTemplates: false });
+      // Publish once to a distinct acknowledgement path: replacing a claim that a
+      // parent is reading can fail on Windows. Never remove the durable claim.
+      // Accepted means the API call returned, not exactly-once model execution.
       publish(resultFile, { runId, requestId, status: "accepted" });
-    },
+  }
+  pi.registerCommand(CONTINUE_COMMAND, {
+    description: "Private run-bound continuation transport (manual compatibility)",
+    handler: receive,
   });
 }
 
@@ -80,7 +106,7 @@ interface LiveChild {
 /** Reserve synchronously before inspection/transport awaits; never launch a replacement on failure. */
 export async function continueLiveChild(owner: SessionOwner, child: LiveChild | undefined,
   params: { message?: string; name?: string },
-  transport: { inspect: (surface: string) => Promise<PaneInspection>; send: (surface: string, text: string) => void;
+  transport: { inspect: (surface: string) => Promise<PaneInspection>; send?: (surface: string, text: string) => void;
     beforeSend?: () => void; timeoutMs?: number },
 ): Promise<{ requestId: string; status: "accepted" | "pending" }> {
   if (owner.continuationRequestId) throw new Error(`Continuation ${owner.continuationRequestId} is in flight or uncertain; do not retry.`);
@@ -107,12 +133,14 @@ export async function continueLiveChild(owner: SessionOwner, child: LiveChild | 
         state?.state !== (child.lifecycle.turn.kind === "interrupted" ? "interrupted-idle" : "settled-idle") || !uuid.test(state?.idleToken)) {
       throw new Error("Child has not confirmed settled interrupted idle.");
     }
+    if (state.transport !== CONTINUATION_TRANSPORT) {
+      throw new Error("Child lacks artifact continuation support. Update/reload the child and complete a turn before continuing; no terminal fallback was attempted.");
+    }
+    transport.beforeSend?.(); // Validate binding/custody BEFORE making a request observable.
+    dispatched = true; // A failed publication/acknowledgement is conservatively uncertain.
     publish(join(dir, `${requestId}.request.json`), {
       runId: child.id, requestId, sessionFile: state.sessionFile, idleToken: state.idleToken, message: params.message,
     });
-    transport.beforeSend?.(); // Rejected validation is not a transport attempt.
-    dispatched = true; // A throwing transport may already have submitted the input.
-    try { transport.send(child.surface, continuationCommand(requestId)); } catch { /* reconcile durable acknowledgement below */ }
     const deadline = Date.now() + (transport.timeoutMs ?? 3000);
     do {
       const result = read(join(dir, `${requestId}.result.json`));
