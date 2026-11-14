@@ -9,6 +9,7 @@ import { resolveSubagentCwd } from "./paths.ts";
 import { persistLaunchProfile, persistProfileBinding, readPiLaunchProfile, resolveLaunchProfile, resumeLaunchContext } from "./launch-profile.ts";
 import { continueLiveChild } from "./live-continuation.ts";
 import { createLineage, type Lineage } from "./lineage.ts";
+import { recordHistory, registerPlanHistory } from "./history.ts";
 import { RuntimeStore, readRuntimeManifest, type RuntimeParent } from "./runtime-store.ts";
 import { reconcileRuntime } from "./runtime-recovery.ts";
 import type { SubagentLaunchContext } from "./harness/types.ts";
@@ -798,6 +799,9 @@ export function enqueueSubagentCompletion(running: RunningSubagent, result: Suba
     if (!suspended.has(key)) suspended.set(key, { running, result: structuredClone(result) });
     return;
   }
+  recordHistory(running.lineage, running.id, result.ping ? "ping" : result.errorMessage ? "failure" : "result",
+    result.ping?.message ?? result.errorMessage ?? result.summary ?? "Result available",
+    result.eventId ?? `${result.sessionFile}:${result.elapsed}`, [result.sessionFile]);
   if (result.ping) {
     const sessionRef = `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`;
     enqueueCompletion(running, {
@@ -832,6 +836,7 @@ export function enqueueSubagentCompletion(running: RunningSubagent, result: Suba
 export function enqueueSubagentError(running: RunningSubagent, err: unknown, resumed = false): void {
   if (!shouldDeliverSubagentCompletion(running)) return;
   const error = err instanceof Error ? err.message : String(err);
+  recordHistory(running.lineage, running.id, "failure", error, "watcher-error", [running.sessionFile]);
   enqueueCompletion(running, {
     customType: "subagent_result",
     content: resumed ? `Resume error: ${error}` : `Sub-agent "${running.name}" error: ${error}`,
@@ -1419,6 +1424,7 @@ async function launchSubagent(
   });
 
   store?.phase(id, "supervised");
+  recordHistory(lineage, id, "assignment", params.task, id, [subagentSessionFile, launchScriptFile]);
   const running: RunningSubagent = {
     planTask,
     durableStore: store,
@@ -1644,6 +1650,7 @@ async function watchSubagent(
 export default function subagentsExtension(pi: ExtensionAPI) {
   registerSubagentAssignmentRenderer(pi);
   runtime.plans = registerPlanTools(pi);
+  const stopPlanHistory = registerPlanHistory(runtime.plans);
   runtime.planImportErrors ??= new Map();
   delivery.onEnvelope = (runId, envelope) => {
     const binding = runtime.store?.snapshot().runs[runId]?.planTask ?? runningSubagents.get(runId)?.planTask;
@@ -1759,6 +1766,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
   // Clean up on session shutdown
   pi.on("session_shutdown", (event, _ctx) => {
+    stopPlanHistory();
     // Invalidate session-bound API immediately, including the shutdown/factory gap.
     pauseDeliveries(delivery);
     if (runtime.treeSuspension) clearInterval(runtime.treeSuspension.timer);
@@ -2186,6 +2194,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             // existing healthy process or its task attempt failed.
             runInPane(surface, command);
           } });
+          recordHistory(child.lineage, child.id, "continuation", `Parent continuation (${result.status}): ${params.message ?? ""}`,
+            result.requestId, [child.sessionFile]);
           return {
             content: [{ type: "text", text: result.status === "accepted"
               ? `Session "${child.name}" continued in its existing process.`
@@ -2262,6 +2272,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // Register as a running subagent for widget tracking
         store?.phase(id, "supervised");
+        recordHistory(profile.lineage, id, "continuation", `Parent closed-session resume: ${params.message ?? ""}`,
+          id, [params.sessionPath, launchScriptFile]);
         const running: RunningSubagent = {
           planTask,
           durableStore: store,

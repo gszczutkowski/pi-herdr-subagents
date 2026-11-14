@@ -213,7 +213,9 @@ Weryfikacja Provenance: opcjonalne `planTask` na zarejestrowanych spawn/resume w
 - [x] Zachować identyfikator bezpośredniego rodzica i sesji głównej.
 
 Weryfikacja: opcjonalne strict-schema lineage zawiera rzeczywiste header IDs i canonical session paths rodzica, korzenia i dziecka; standalone nie kopiuje rozmowy, fork zachowuje własny header. Assignment/profile/manifest/result i closed/live resume zachowują oryginalne pochodzenie. Focused lineage/assignment/profile 19/19, lint OK; mockowane granice OS/Pi, bez live herdr. Foreign harness nie otrzymuje obietnicy dziedziczenia Pi ani zweryfikowanej tożsamości sesji.
-- [ ] Dodać krótką historię jawnych komunikatów, decyzji i zmian stanu.
+- [x] Dodać krótką historię jawnych komunikatów, decyzji i zmian stanu.
+
+Weryfikacja: root-owned subagent-history zawiera atomowe, immutable unique-event records (320 bajtów skrótu, maks. cztery refs), assignment/ping/result/failure/continuation oraz diff autorytatywnego PlanPersistence (status/accept/invalidate). Root odczytuje tylko zgodne aktywne natywne assignment/custody checkpoints, canonical root ID/file/token; bez pełnych rozmów, raportów ani reasoning i bez sendMessage/model wake dla descendant history. Focused lineage/history/runtime-execute/profile 13/13, lint OK; bez live herdr. Same-user fs trust, ograniczony odczyt, brak sandbox i gwarancji trwałości katalogu po awarii zasilania.
 - [ ] Dodać zwijane drzewo zagnieżdżonych podagentów bez kopiowania ich całych rozmów do rodzica głównego.
 
 Przykład:

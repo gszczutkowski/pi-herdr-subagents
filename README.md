@@ -32,6 +32,25 @@ follow-up. Legacy launches may have no lineage. Foreign harnesses do not promise
 Pi context inheritance or verified native session identity. This metadata grants
 no terminal custody or child authentication.
 
+Explicit handoff history is stored in a root-owned `subagent-history` artifact
+directory, carried to descendants through assignment metadata. Immutable atomic
+records keep at most 320 UTF-8 bytes of explicit summary and four artifact/session
+references: assignments, pings, results, continuation decisions and authoritative
+plan status/acceptance changes. No hidden reasoning, full reports, conversations
+or general tool chatter are copied. Nested results still report to the immediate
+parent; descendant history never calls a model-facing send/wake API.
+
+Root reads require a matching native active-branch assignment and custody
+checkpoint/token plus root header ID and canonical file. A copied/forked root
+cannot ingest history merely by pointing at the same directory. This is bounded,
+best-effort history under same-user filesystem trust, not authenticated messaging,
+a security sandbox, a second task store or proof of process liveness. Unknown or
+partial records are ignored. Hard-link publication must be supported by the local
+filesystem; publication failures omit history without changing task execution.
+Reads cap directory enumeration at 10,000 records and retain at most 2,000 events;
+older omitted records remain on disk. File fsync does not promise directory fsync
+or survival of every event after power loss.
+
 ### Result delivery boundary
 
 Pi's extension `sendMessage` returns `void`. A normal return acknowledges only
