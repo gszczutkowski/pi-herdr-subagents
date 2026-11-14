@@ -20,16 +20,18 @@ interface PendingDelivery {
   readonly onHandoff: () => void;
   attempts: number;
   retryAt: number;
+  inFlight: boolean;
 }
 
 export interface DeliveryState {
   api?: Pick<ExtensionAPI, "sendMessage">;
   pending: Map<string, PendingDelivery>;
+  handedOff: Set<string>;
   timer?: ReturnType<typeof setTimeout>;
 }
 
 export function createDeliveryState(): DeliveryState {
-  return { pending: new Map() };
+  return { pending: new Map(), handedOff: new Set() };
 }
 
 function freeze<T>(value: T): T {
@@ -47,12 +49,15 @@ export function enqueueDelivery(
   message: Message,
   onHandoff: () => void,
 ): void {
-  if (owner.lifecycle.delivery !== "pending") return;
+  const eventId = `subagent:${owner.id}:completion`;
+  // The first terminal callback owns the payload, including while a retry waits.
+  if (owner.lifecycle.delivery !== "pending" || state.pending.has(eventId) || state.handedOff.has(eventId)) return;
+  const snapshot = structuredClone(message);
   const envelope = freeze({
-    message: structuredClone(message),
+    message: { ...snapshot, details: { ...snapshot.details, eventId } },
     options: { triggerTurn: true, deliverAs: "steer" } as Options,
   });
-  state.pending.set(owner.id, { envelope, owner, onHandoff, attempts: 0, retryAt: 0 });
+  state.pending.set(eventId, { envelope, owner, onHandoff, attempts: 0, retryAt: 0, inFlight: false });
   flushDeliveries(state);
 }
 
@@ -72,14 +77,18 @@ export function flushDeliveries(state: DeliveryState): void {
       state.pending.delete(id);
       continue;
     }
-    if (entry.retryAt > Date.now()) continue;
+    if (entry.inFlight || entry.retryAt > Date.now()) continue;
+    entry.inFlight = true;
     try {
       state.api.sendMessage(entry.envelope.message, entry.envelope.options);
     } catch {
       // Do not let a transport exception become a fabricated watcher error.
       entry.retryAt = Date.now() + Math.min(250 * 2 ** Math.min(entry.attempts++, 7), 30_000);
       continue;
+    } finally {
+      entry.inFlight = false;
     }
+    state.handedOff.add(id);
     entry.owner.lifecycle = markDelivery(entry.owner.lifecycle, "delivered");
     state.pending.delete(id);
     entry.onHandoff();

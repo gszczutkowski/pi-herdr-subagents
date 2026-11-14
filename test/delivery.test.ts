@@ -35,6 +35,30 @@ describe("completion outbox", () => {
     pauseDeliveries(state);
   });
 
+  it("deduplicates pending and handed-off IDs without replacing the first payload", () => {
+    const state = createDeliveryState();
+    const owner = { id: "duplicate", lifecycle: createLifecycle(0) };
+    enqueueDelivery(state, owner, message, () => {});
+    const original = [...state.pending.values()][0].envelope;
+    enqueueDelivery(state, owner, { ...message, content: "replacement error" }, () => assert.fail("replacement callback"));
+    assert.equal(state.pending.size, 1);
+    assert.equal([...state.pending.values()][0].envelope, original);
+    let calls = 0;
+    state.api = { sendMessage(payload) {
+      calls++;
+      assert.equal(payload, original.message);
+      assert.equal((payload.details as any).eventId, "subagent:duplicate:completion");
+      flushDeliveries(state); // A reentrant start/flush must not resend.
+    } };
+    flushDeliveries(state);
+    enqueueDelivery(state, { id: owner.id, lifecycle: createLifecycle(0) }, message, () => assert.fail("duplicate"));
+    flushDeliveries(state);
+    assert.equal(calls, 1);
+    assert.equal(state.handedOff.size, 1);
+    assert.equal(state.pending.size, 0);
+    pauseDeliveries(state);
+  });
+
   it("queues without an API", () => {
     const state = createDeliveryState();
     const owner = { id: "gap", lifecycle: createLifecycle(0) };

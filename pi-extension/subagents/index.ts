@@ -620,6 +620,7 @@ const runtime: SubagentRuntime =
   ((globalThis as any)[RUNTIME_KEY] = createSubagentRuntime());
 const runningSubagents = runtime.runningSubagents;
 const delivery = runtime.delivery ??= createDeliveryState();
+delivery.handedOff ??= new Set();
 
 function enqueueCompletion(running: RunningSubagent, message: Parameters<ExtensionAPI["sendMessage"]>[0]) {
   enqueueDelivery(delivery, running, message, () => {
@@ -1480,6 +1481,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     if (!shouldPreserveSubagentsOnShutdown((event as any).reason)) {
       pauseDeliveries(delivery);
       delivery.pending.clear();
+      delivery.handedOff.clear();
     }
   });
 

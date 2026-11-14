@@ -70,7 +70,7 @@ Akceptacja: rodzic odczytuje właściwy snapshot i pokazuje szczegóły narzędz
 
 - [x] Nie usuwać oczekującego wyniku ani nie oznaczać go jako dostarczonego przed skutecznym przekazaniem.
 - [ ] Zachować wynik podczas wymiany API przy `/reload` i wznowić dostarczanie po gotowości nowej sesji.
-- [ ] Wprowadzić identyfikację zdarzeń i deduplikację ponowień.
+- [x] Wprowadzić identyfikację zdarzeń i deduplikację ponowień.
 - [x] Określić granicę potwierdzenia dostarczenia dostępną w API Pi; nie obiecywać exactly-once na podstawie flagi w pamięci.
 - [ ] Dodać test wyjątku `sendMessage` oraz ukończenia dziecka w trakcie `/reload`.
 
