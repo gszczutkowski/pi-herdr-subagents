@@ -244,7 +244,11 @@ Weryfikacja: notification-policy.ts klasyfikuje jawne zdarzenia, delivery.ts sto
 - [x] Zwykły postęp udostępniać w panelu lub zbiorczym skrócie zamiast strumienia powiadomień.
 
 Weryfikacja: rzeczywisty callback status refresh nie wysyła subagent_status; aktualizuje lifecycle i istniejący widget zarówno autonomous, jak interactive, także stalled → active. Test produkcyjnej ścieżki sprawdza zmianę renderu i zero send, potem waking result/ping/error. Zachowano legacy renderer historii. Focused notification/delivery/keepOpen/recovery/panel: 35/35; bez live herdr.
-- [ ] Rozważyć niewymuszający zakończenia sesji kanał pytania/postępu dopiero po ustaleniu bezpiecznej kontynuacji żywego dziecka.
+- [x] Rozważyć niewymuszający zakończenia sesji kanał pytania/postępu dopiero po ustaleniu bezpiecznej kontynuacji żywego dziecka.
+
+Decyzja: rozważono i odroczono, bez nowego narzędzia/protokołu. README porównuje exiting caller_ping z istniejącą guarded settled-idle continuation Pi/keepOpen, wskazuje wymagane correlation, trwałą blokadę, authority, cancellation/late answers, manual input i restart uncertainty. Bezpieczne resume jest warunkiem koniecznym, nie dowodem gotowości niezamykającego kanału pytań. Testy keepOpen/continuation/delivery pozostają wymaganym kontraktem.
+
+Końcowa weryfikacja polityki: focused notification/delivery/keepOpen/continuation/ownership/recovery/panel/context 57/57, zero skip; lint bez ostrzeżeń. Pełny npm test: 399/418, zero skip, te same 19 bazowych błędów (18 brak Python/Claude, 1 regex CRLF release). Prawdziwy Pi RPC uruchomiony z izolowanym agentDir i jawnym -e rozszerzenia tego worktree: get_state success, exit 0, brak extension errors; bez wywołania modelu i bez live herdr. Pierwszy probe z domyślnym agentDir przekroczył 20 s bez odpowiedzi; izolowany probe rozdziela dowód załadowania od środowiska globalnego.
 
 ### Dopasowanie instrukcji ról
 

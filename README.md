@@ -508,6 +508,12 @@ For an owned, tracked Pi child interrupted with Escape, resume continues the **s
 
 Acceptance/rejection artifacts deduplicate requests. A transport timeout or ambiguous dispatch returns `pending`, retains the in-flight reservation and never starts a replacement process; do not retry that continuation. This is a conservative synchronous API-dispatch acknowledgement, not proof that the provider processed the prompt. Unowned closed Pi sessions still use the saved-profile launch path. The same guarded transport supports tracked keep-open children after their completed turn and settled-idle acknowledgement.
 
+### Nonclosing question/progress channel: considered and deferred
+
+A dedicated nonclosing question channel could preserve a worker's pane while the parent decides, but it is **not implemented**. `caller_ping` still exits; it must not be advertised as a pause-and-wait tool. Ordinary progress belongs in the existing panel, not a new tool or wakeup protocol.
+
+The existing guarded live continuation is a prerequisite, not a complete question protocol: it requires a tracked Pi owner and run-bound settled-idle acknowledgement, reserves dispatch, deduplicates request IDs, disables prompt expansion, and fails closed on ambiguous transport or recovered artifact-only custody. A future question channel would additionally need explicit question/answer correlation, persistent blocked state, cancellation/late-answer rules, authority checks and safe handling of concurrent manual input/reload/restart. Until those semantics have dedicated tests, use exiting `caller_ping` for help and `subagent_resume` under its existing guards; use keepOpen for already-supported settled-turn collaboration. No speculative question/progress tool is registered by this policy change.
+
 ### Chosen keep-open semantics
 
 `keepOpen` is defined as **tracked ongoing collaboration**, not a one-time
