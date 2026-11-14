@@ -41,9 +41,9 @@ export function registerLiveContinuation(pi: ExtensionAPI): void {
   pi.on("agent_start", busy);
   pi.on("session_shutdown", busy);
   pi.on("agent_settled", (event, ctx) => {
-    if (!event.aborted || !ctx.isIdle() || ctx.hasPendingMessages()) { busy(); return; }
+    if (!ctx.isIdle() || ctx.hasPendingMessages()) { busy(); return; }
     idleToken = randomUUID();
-    publish(join(dir, "state.json"), { runId, sessionFile, state: "interrupted-idle", idleToken });
+    publish(join(dir, "state.json"), { runId, sessionFile, state: event.aborted ? "interrupted-idle" : "settled-idle", idleToken });
   });
   pi.registerCommand(CONTINUE_COMMAND, {
     description: "Private run-bound continuation transport",
@@ -74,7 +74,7 @@ export function registerLiveContinuation(pi: ExtensionAPI): void {
 
 interface LiveChild {
   id: string; name: string; cli?: string; sessionFile: string; surface: string;
-  activityFile?: string; lifecycle: SubagentLifecycle;
+  activityFile?: string; lifecycle: SubagentLifecycle; hasTurnResult?: boolean;
 }
 
 /** Reserve synchronously before inspection/transport awaits; never launch a replacement on failure. */
@@ -85,8 +85,8 @@ export async function continueLiveChild(owner: SessionOwner, child: LiveChild | 
 ): Promise<{ requestId: string; status: "accepted" | "pending" }> {
   if (owner.continuationRequestId) throw new Error(`Continuation ${owner.continuationRequestId} is in flight or uncertain; do not retry.`);
   if (!child || child.id !== owner.runId || child.cli !== "pi" || !child.activityFile ||
-      child.lifecycle.process.kind !== "running" || child.lifecycle.turn.kind !== "interrupted") {
-    throw new Error("Owned session is not a tracked interrupted live Pi child; close its process before closed-session resume.");
+      child.lifecycle.process.kind !== "running" || !(child.lifecycle.turn.kind === "interrupted" || (child.hasTurnResult && child.lifecycle.turn.kind === "waiting"))) {
+    throw new Error("Owned session is not a tracked interrupted or settled idle live Pi child; close its process before closed-session resume.");
   }
   if (typeof params.message !== "string" || !params.message.trim()) throw new Error("Live continuation requires a nonempty message.");
   if (params.name !== undefined && params.name !== child.name) throw new Error("Live continuation cannot change the child name/configuration.");
@@ -96,13 +96,13 @@ export async function continueLiveChild(owner: SessionOwner, child: LiveChild | 
   try {
     const pane = await transport.inspect(child.surface);
     if (pane.kind !== "present" || pane.agentStatus !== "idle") throw new Error("Live child pane is not confirmed idle.");
-    if (child.lifecycle.process.kind !== "running" || child.lifecycle.turn.kind !== "interrupted") {
+    if (child.lifecycle.process.kind !== "running" || !(child.lifecycle.turn.kind === "interrupted" || (child.hasTurnResult && child.lifecycle.turn.kind === "waiting"))) {
       throw new Error("Live child changed state during continuation inspection.");
     }
     const dir = continuationDir(child.activityFile);
     const state = read(join(dir, "state.json"));
     if (state?.runId !== child.id || state?.sessionFile !== canonicalSessionPath(child.sessionFile) ||
-        state?.state !== "interrupted-idle" || !uuid.test(state?.idleToken)) {
+        state?.state !== (child.lifecycle.turn.kind === "interrupted" ? "interrupted-idle" : "settled-idle") || !uuid.test(state?.idleToken)) {
       throw new Error("Child has not confirmed settled interrupted idle.");
     }
     publish(join(dir, `${requestId}.request.json`), {

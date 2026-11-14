@@ -1,10 +1,12 @@
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { runCompletionFile } from "./run-artifacts.ts";
 
 const ABORT_MESSAGE = "Aborted while waiting for subagent to finish";
 const TERMINAL_SENTINEL = /__SUBAGENT_DONE_(\d+)__/;
 
 export interface CompletionResult {
+  eventId?: string;
+  summary?: string;
   reason: "done" | "ping" | "sentinel" | "error";
   exitCode: number;
   keepOpen?: boolean;
@@ -78,7 +80,10 @@ export function interpretExitSidecar(data: unknown): CompletionResult {
 function consumeExitSidecar(sessionFile: string | undefined, runId?: string): CompletionResult | null {
   if (!sessionFile) return null;
 
-  const exitFile = runId ? runCompletionFile(sessionFile, runId) : `${sessionFile}.exit`;
+  const base = runId ? runCompletionFile(sessionFile, runId) : `${sessionFile}.exit`;
+  const events = `${base}.events`;
+  const next = runId && existsSync(events) ? readdirSync(events).filter((name) => name.endsWith(".json")).sort()[0] : undefined;
+  const exitFile = next ? `${events}/${next}` : base;
   if (!existsSync(exitFile)) return null;
 
   try {
@@ -86,7 +91,8 @@ function consumeExitSidecar(sessionFile: string | undefined, runId?: string): Co
     if (runId && payload.runId !== runId) return null;
     const result = interpretExitSidecar(payload);
     rmSync(exitFile, { force: true });
-    return result;
+    return { ...result, ...(typeof payload.eventId === "string" ? { eventId: payload.eventId } : {}),
+      ...(typeof payload.summary === "string" ? { summary: payload.summary } : {}) };
   } catch {
     // The child may still be writing the file. Retry on the next polling cycle.
     return null;

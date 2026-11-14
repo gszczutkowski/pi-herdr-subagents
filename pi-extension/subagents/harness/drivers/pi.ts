@@ -53,6 +53,7 @@ export class PiHarnessDriver implements HarnessDriver {
   readonly name = "Pi";
   readonly hasActivitySnapshots = true;
   readonly supportsTurnInterrupt = true;
+  readonly supportsTrackedKeepOpen = true;
   readonly supportedSessionModes = ["standalone", "lineage-only", "fork"] as const;
   // Pi resume uses the separate session-file resume tool, not resumeSessionId.
   readonly supportsNativeResume = false;

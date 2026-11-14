@@ -523,7 +523,7 @@ function resolveResultPresentation(
   >,
   name: string,
 ): string {
-  const followUp = result.keepOpen === true ? "\n\nThe pane stayed open for follow-up conversation." : "";
+  const followUp = result.keepOpen === true ? "\n\nThe child remains supervised for follow-up; subsequent results return here. Use subagent_resume with a message, or type in its pane. Close the child process to end supervision." : "";
   const sessionRef = result.sessionFile
     ? `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`
     : "";
@@ -551,6 +551,8 @@ function resolveResultPresentation(
  * Result from running a single subagent.
  */
 interface SubagentResult {
+  eventId?: string;
+  supervisionEnded?: boolean;
   name: string;
   task: string;
   summary: string;
@@ -588,6 +590,7 @@ interface RunningSubagent {
   cli?: string;
   sentinelFile?: string;
   completionRunId?: string;
+  hasTurnResult?: boolean;
   /**
    * Optional legacy status snapshot retained only for hydrating pre-lifecycle
    * runtime entries after /reload. Live observation uses `lifecycle` only.
@@ -628,11 +631,15 @@ const runningSubagents = runtime.runningSubagents;
 const delivery = runtime.delivery ??= createDeliveryState();
 delivery.handedOff ??= new Set();
 
-function enqueueCompletion(running: RunningSubagent, message: Parameters<ExtensionAPI["sendMessage"]>[0]) {
-  enqueueDelivery(delivery, running, message, () => {
-    runningSubagents.delete(running.id);
+function enqueueCompletion(running: RunningSubagent, message: Parameters<ExtensionAPI["sendMessage"]>[0], result?: SubagentResult) {
+  // Independent event lifecycles preserve failed handoffs across later turns.
+  const owner = result?.eventId
+    ? { id: running.id, lifecycle: { ...running.lifecycle, delivery: "pending" as const }, source: running }
+    : running;
+  enqueueDelivery(delivery, owner, message, () => {
+    if (!result?.keepOpen) runningSubagents.delete(running.id);
     updateWidget();
-  });
+  }, result?.eventId);
 }
 
 export function shouldPreserveSubagentsOnShutdown(reason: unknown): boolean {
@@ -675,7 +682,7 @@ export function enqueueSubagentCompletion(running: RunningSubagent, result: Suba
         name: result.ping.name, message: result.ping.message,
         agent: running.agent, sessionFile: result.sessionFile,
       },
-    });
+    }, result);
     return;
   }
   const base = resolveResultPresentation(result, running.name);
@@ -693,7 +700,7 @@ export function enqueueSubagentCompletion(running: RunningSubagent, result: Suba
       ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
       ...(running.runtimePlan ? { runtimePlan: running.runtimePlan } : {}),
     },
-  });
+  }, result);
 }
 
 export function enqueueSubagentError(running: RunningSubagent, err: unknown, resumed = false): void {
@@ -719,8 +726,13 @@ export function observeSubagentCompletion(
   return completion.then(
     (result) => {
       if (!shouldDeliverSubagentCompletion(running)) return;
+      if (result.supervisionEnded) {
+        runningSubagents.delete(running.id);
+        updateWidget();
+        return;
+      }
       try {
-        if (resume) {
+        if (resume && !result.eventId) {
           const summary = result.ping ? result.summary
             : findLastAssistantMessage(getNewEntries(resume.sessionPath, resume.entryCountBefore)) ??
               (result.errorMessage ? `Subagent error: ${result.errorMessage}`
@@ -729,6 +741,9 @@ export function observeSubagentCompletion(
           result = { ...result, summary, sessionFile: resume.sessionPath };
         }
         enqueueSubagentCompletion(running, result);
+        if (result.keepOpen && running.abortController && !running.abortController.signal.aborted) {
+          return observeSubagentCompletion(running, watchSubagent(running, running.abortController.signal));
+        }
       } catch (err) {
         enqueueSubagentError(running, err, !!resume);
       }
@@ -764,7 +779,7 @@ function formatLifecycleWidgetLabel(
     : ` active${duration} `;
   if (projection.kind === "blocked") return ` blocked${duration} `;
   if (projection.kind === "running") return " running… ";
-  if (projection.kind === "waiting") return ` waiting${duration} `;
+  if (projection.kind === "waiting") return ` idle · waiting${duration} `;
   if (projection.kind === "interrupted") return ` interrupted${duration} `;
   if (projection.kind === "stalled") return ` stalled${duration} `;
   // completed/failed exist as lifecycle projections for delivery bookkeeping,
@@ -1350,9 +1365,14 @@ async function watchSubagent(
     });
 
     // Only a shell trailer proves process exit; completion delivery alone does not.
-    if (result.reason === "sentinel" && !running.sentinelFile) releaseSession(sessionFile, running.id);
+    if ((result.reason === "sentinel" && !running.sentinelFile) || running.lifecycle.pane.kind === "missing") {
+      releaseSession(sessionFile, running.id);
+    }
+    const supervisionEnded = running.hasTurnResult && !result.eventId &&
+      (result.reason === "sentinel" || running.lifecycle.pane.kind === "missing");
+    if (result.keepOpen) running.hasTurnResult = true;
     const detectedAt = Date.now();
-    running.lifecycle = markCompletionDetected(running.lifecycle, result, detectedAt);
+    if (!result.keepOpen) running.lifecycle = markCompletionDetected(running.lifecycle, result, detectedAt);
     updateWidget();
     const elapsed = Math.floor((detectedAt - startTime) / 1000);
 
@@ -1432,14 +1452,18 @@ async function watchSubagent(
     }
 
     if (result.keepOpen !== true) closePane(surface);
-    running.lifecycle = result.exitCode === 0
-      ? markCompleted(running.lifecycle, Date.now())
-      : markFailed(running.lifecycle, result.errorMessage ?? summary, Date.now(), result.exitCode);
+    running.lifecycle = result.keepOpen
+      ? { ...markProcessRunning(running.lifecycle, Date.now()), hasWorked: true, turn: { kind: "waiting", startedAt: Date.now() }, activityDetail: null }
+      : result.exitCode === 0
+        ? markCompleted(running.lifecycle, Date.now())
+        : markFailed(running.lifecycle, result.errorMessage ?? summary, Date.now(), result.exitCode);
 
     return {
       name,
       task,
-      summary,
+      summary: result.summary ?? summary,
+      eventId: result.eventId,
+      supervisionEnded,
       sessionFile,
       exitCode: result.exitCode,
       elapsed,
@@ -1835,14 +1859,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagent_resume",
       label: "Resume Subagent",
       description:
-        "Continue a settled interrupted live Pi child in its existing pane, or resume a closed session in a new pane. " +
+        "Continue a settled interrupted or keepOpen idle live Pi child in its existing pane, or resume a closed session in a new pane. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT poll for status. All of that is wasted work — the harness handles delivery for you. " +
         "DO NOT fabricate or assume results. After resuming, either end your turn or work on other independent tasks; the harness will wake you when the result is ready. " +
         "Use when a sub-agent was cancelled or needs follow-up work.",
       promptSnippet:
-        "Continue a settled interrupted live Pi child in its existing pane, or resume a closed session in a new pane. " +
+        "Continue a settled interrupted or keepOpen idle live Pi child in its existing pane, or resume a closed session in a new pane. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT poll for status. All of that is wasted work — the harness handles delivery for you. " +
@@ -1855,7 +1879,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         ),
         message: Type.Optional(
           Type.String({
-            description: "Exact follow-up message. Required and nonempty for live interrupted continuation; optional for closed-session resume.",
+            description: "Exact follow-up message. Required and nonempty for live interrupted or keepOpen continuation; optional for closed-session resume.",
           }),
         ),
         autoExit: Type.Optional(

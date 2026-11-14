@@ -278,7 +278,7 @@ The copyable example is model-neutral, so it works without requiring credentials
 
 `environment.allowOutsideHerdr` lifts the inside-herdr requirement. When `true`, the extension accepts a session running in any terminal as long as a compatible CLI exists and its server responds (`herdr workspace list`, or `hc server status` when the legacy CLI is absent). With legacy herdr, subagent tabs are created in the first workspace when the current pane cannot be resolved. Split layouts need a parent pane, so they fall back to a new tab when running outside herdr. With hc, launches always create separate terminals; app workspace/split placement is not controlled. Defaults to `false`, which keeps the fail-fast setup hint for new users.
 
-`behavior.closeOnDone` sets the default for what happens to a subagent's pane after its result is delivered. `true` closes the pane as before. `false` leaves the pane and its pi session open so you can continue the conversation in place. A subagent can override the default per call with `subagent_done({ close: false })` or `subagent_done({ close: true })`. The parent is told the pane stayed open so it can send a follow-up there instead of calling `subagent_resume`.
+`behavior.closeOnDone` sets the default for what happens to a subagent's pane after its result is delivered. `true` closes the pane as before. `false` leaves the pane and its pi session open so you can continue the conversation in place. A subagent can override the default per call with `subagent_done({ close: false })` or `subagent_done({ close: true })`. The parent retains supervision and can use `subagent_resume` with a message to continue the same live Pi process.
 
 `config.json` is gitignored so local overrides don't get committed.
 
@@ -344,7 +344,7 @@ A subagent finishes by calling `subagent_done`, and the parent closes its pane a
 subagent_done({ close: false });
 ```
 
-The result is still delivered to the parent as a steer message. The pane stays open and idle, so the next message can continue the same conversation in place. The orchestrator sees that the pane stayed open and can send a follow-up there instead of starting a new tab with `subagent_resume`. Omitting `close` uses `behavior.closeOnDone` from `config.json`, which defaults to `true`.
+The result is still delivered to the parent as a steer message. The pane stays open and idle, so the next message can continue the same conversation in place. The orchestrator can use `subagent_resume` with a message to continue that same live process without starting another pane. Omitting `close` uses `behavior.closeOnDone` from `config.json`, which defaults to `true`.
 
 ---
 
@@ -363,16 +363,27 @@ The `caller_ping` tool lets a subagent request help from its parent agent. When 
 
 For an owned, tracked Pi child interrupted with Escape, resume continues the **same process, run, pane and watcher** only after the child confirms `agent_settled` with an aborted run and idle state. Active, starting, finalizing or unknown states reject. The launch configuration is unchanged. A run-bound private command transports only a request UUID; exact follow-up text is read from an atomic request artifact and passed to `sendUserMessage` with template/command expansion disabled (not shell input or `@file` expansion).
 
-Acceptance/rejection artifacts deduplicate requests. A transport timeout or ambiguous dispatch returns `pending`, retains the in-flight reservation and never starts a replacement process; do not retry that continuation. This is a conservative synchronous API-dispatch acknowledgement, not proof that the provider processed the prompt. Unowned closed Pi sessions still use the saved-profile launch path. Live interrupted continuation is separate from keep-open follow-up support.
+Acceptance/rejection artifacts deduplicate requests. A transport timeout or ambiguous dispatch returns `pending`, retains the in-flight reservation and never starts a replacement process; do not retry that continuation. This is a conservative synchronous API-dispatch acknowledgement, not proof that the provider processed the prompt. Unowned closed Pi sessions still use the saved-profile launch path. The same guarded transport supports tracked keep-open children after their completed turn and settled-idle acknowledgement.
 
 ### Chosen keep-open semantics
 
 `keepOpen` is defined as **tracked ongoing collaboration**, not a one-time
-terminal handoff. A completed turn should publish its result while preserving
-session ownership and observation; subsequent results should return to the
-immediate parent. Supervision ends only after confirmed process closure or an
-explicit handoff. This is the selected behavior; the tracking/follow-up
-implementation and its regression coverage are being completed separately.
+terminal handoff. Each completed turn publishes a distinct result to its immediate
+parent while preserving session ownership and the watcher. Manual pane input and
+`subagent_resume` follow-ups both retain tracking. Once `close:false` opts the
+session into collaboration, later settled turns stay open even if the initial
+`closeOnDone` default was true; use explicit `close:true` to close it. Idle children count as open,
+not active, in the widget. `subagent_done({close:true})`, `/exit`, or confirmed
+pane disappearance ends supervision; turn completion alone never releases ownership.
+There is no explicit terminal-handoff API in this version.
+
+Tracked keep-open is **Pi-only** (`supportsTrackedKeepOpen`). Other harnesses do
+not support this repeated-result/live-follow-up contract; `behavior.closeOnDone`
+and Pi's `subagent_done` do not give them that capability. Each Pi completion has
+a run/turn event identity and immutable result snapshot; failed parent notifications
+remain in the in-memory outbox across subsequent turns and `/reload`. Handoff means
+normal synchronous `sendMessage` return, not exactly-once execution. Parent process
+restart recovery is not supported.
 
 **Interaction flow:**
 1. Child calls `caller_ping({ message: "Not sure which schema to use" })`

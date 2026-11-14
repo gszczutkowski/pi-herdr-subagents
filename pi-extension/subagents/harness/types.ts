@@ -114,6 +114,9 @@ export interface HarnessDriver {
   /** Whether resumeSessionId is forwarded to this harness's native resume command. */
   readonly supportsNativeResume?: boolean;
 
+  /** Repeated settled-turn results and owned live follow-up. Missing means unsupported. */
+  readonly supportsTrackedKeepOpen?: boolean;
+
   /** Format the model reference for this CLI */
   formatModel(runtimePlan: Pick<ResolvedRuntimePlan, "model" | "modelId" | "provider">): string;
 

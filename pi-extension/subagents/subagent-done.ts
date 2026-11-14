@@ -6,7 +6,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { writeRunCompletion } from "./run-artifacts.ts";
+import { beginCompletionTurn, writeRunCompletion } from "./run-artifacts.ts";
 import { getBehaviorConfig } from "./config.ts";
 import { createSubagentActivityRecorder } from "./activity.ts";
 import { registerSubagentAssignment } from "./assignment.ts";
@@ -90,6 +90,9 @@ export default function (pi: ExtensionAPI) {
   const subagentAgent = process.env.PI_SUBAGENT_AGENT ?? "";
   const deniedToolsValue = process.env.PI_DENY_TOOLS;
   const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1";
+  // Keeping a child open opts the session into collaboration, not just one turn.
+  const keepOpenKey = Symbol.for(`pi-subagents/keep-open/${process.env.PI_SUBAGENT_ID ?? "legacy"}`);
+  let keepOpenSession = (globalThis as any)[keepOpenKey] ?? (!autoExit || !getBehaviorConfig().closeOnDone);
   const recorder = createSubagentActivityRecorder({
     runningChildId: process.env.PI_SUBAGENT_ID,
     activityFile: process.env.PI_SUBAGENT_ACTIVITY_FILE,
@@ -170,6 +173,9 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("before_agent_start", () => {
+    beginCompletionTurn();
+    completionDelivered = false;
+    latestAgentMessages = undefined;
     recorder.beforeAgentStart();
   });
 
@@ -187,11 +193,11 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_settled", (_event, ctx) => {
-    const shouldExit = autoExit
+    const shouldExit = !_event.aborted
       && shouldAutoExitOnAgentEnd(userTookOver, latestAgentMessages);
 
     if (shouldExit && !completionDelivered) {
-      const keepOpen = !getBehaviorConfig().closeOnDone;
+      const keepOpen = keepOpenSession;
       // Surface stopReason: "error" turns (auto-retry exhausted, provider
       // overload, etc.) to the parent via the .exit sidecar so the watcher
       // can report a clear failure with the underlying error message.
@@ -312,7 +318,7 @@ export default function (pi: ExtensionAPI) {
     label: "Subagent Done",
     description:
       "Call this tool when you have completed your task. " +
-      "It returns your results to the main session and optionally closes this session. " +
+      "It returns this turn's results to the immediate parent and optionally closes this session. " +
       "Your LAST assistant message before calling this becomes the summary returned to the caller.",
     parameters: Type.Object({
       close: Type.Optional(Type.Boolean({
@@ -320,7 +326,9 @@ export default function (pi: ExtensionAPI) {
       })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const keepOpen = !(params.close ?? getBehaviorConfig().closeOnDone);
+      const keepOpen = params.close === undefined ? keepOpenSession : !params.close;
+      keepOpenSession = keepOpen;
+      (globalThis as any)[keepOpenKey] = keepOpen;
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
       recorder.subagentDone();
       if (sessionFile) {
@@ -330,8 +338,9 @@ export default function (pi: ExtensionAPI) {
       if (!keepOpen) ctx.shutdown();
       return {
         content: [{ type: "text", text: keepOpen
-          ? "Result delivered. This session and its pane stay open for follow-up."
+          ? "Result published. This session remains supervised; follow-up results return to the parent until the child process closes."
           : "Shutting down subagent session." }],
+        terminate: true,
         details: {},
       };
     },

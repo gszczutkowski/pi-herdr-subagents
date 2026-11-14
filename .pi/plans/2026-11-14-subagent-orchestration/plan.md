@@ -99,7 +99,9 @@ Weryfikacja R4.5: `test/ownership-execute.test.ts` dodaje regresje na zarejestro
 - [x] Wybrać i udokumentować jeden model: dalsza śledzona współpraca albo jednorazowe przekazanie terminala użytkownikowi.
 
 Decyzja użytkownika: dalsza śledzona współpraca. `keepOpen` zachowuje nadzór i właściciela sesji; zakończenie tury publikuje wynik, ale nie kończy obserwacji. Kolejne wyniki wracają do bezpośredniego rodzica. Zakończenie nadzoru wymaga potwierdzonego zamknięcia procesu albo jawnego przekazania terminala. Sam wybór modelu nie oznacza ukończenia implementacji poniżej.
-- [ ] Dostosować rejestr, watcher, publikację kolejnych wyników i komunikaty do wybranego modelu.
+- [x] Dostosować rejestr, watcher, publikację kolejnych wyników i komunikaty do wybranego modelu.
+
+Weryfikacja implementacji R5: per-turn run-bound artefakty z niezmiennym snapshotem wyniku, oddzielny lifecycle każdej dostawy w outbox, zachowany watcher i właściciel keepOpen, guarded settled-idle follow-up oraz jawna granica Pi-only. Focused delivery/continuation/resume/profile/rendering: 51/51; lint OK. Bez live herdr E2E; regresje follow-up poniżej pozostają osobnym krokiem.
 - [ ] Przetestować follow-up po pierwszym zakończeniu.
 
 Problem: terminal zostaje otwarty, ale obserwacja kończy się i wpis znika. Kolejne automatyczne wyniki nie mają obecnie pełnego kanału dostarczenia.

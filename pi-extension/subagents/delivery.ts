@@ -4,6 +4,7 @@ import { markDelivery, type SubagentLifecycle } from "./lifecycle.ts";
 export interface DeliveryOwner {
   id: string;
   lifecycle: SubagentLifecycle;
+  source?: DeliveryOwner;
 }
 
 type Message = Parameters<ExtensionAPI["sendMessage"]>[0];
@@ -48,8 +49,9 @@ export function enqueueDelivery(
   owner: DeliveryOwner,
   message: Message,
   onHandoff: () => void,
+  completionId?: string,
 ): void {
-  const eventId = `subagent:${owner.id}:completion`;
+  const eventId = `subagent:${owner.id}:completion${completionId ? `:${completionId}` : ""}`;
   // The first terminal callback owns the payload, including while a retry waits.
   if (owner.lifecycle.delivery !== "pending" || state.pending.has(eventId) || state.handedOff.has(eventId)) return;
   const snapshot = structuredClone(message);
@@ -73,7 +75,7 @@ export function flushDeliveries(state: DeliveryState): void {
   state.timer = undefined;
   if (!state.api) return;
   for (const [id, entry] of state.pending) {
-    if (entry.owner.lifecycle.delivery !== "pending") {
+    if (entry.owner.lifecycle.delivery !== "pending" || entry.owner.source?.lifecycle.delivery === "suppressed") {
       state.pending.delete(id);
       continue;
     }
