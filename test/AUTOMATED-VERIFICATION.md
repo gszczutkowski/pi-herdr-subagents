@@ -37,5 +37,10 @@ second checklist; status is tracked in `.pi/plans/2026-11-14-subagent-orchestrat
   (72 tests passed with the new seam). This is mocked transport/command and
   artifact validation, not a claim that foreign CLIs ran live.
 
-Logs are local temporary artifacts, not committed fixtures. Full-suite green is
-not claimed: known environment Python-hook / CRLF failures are outside this scope.
+Logs are local temporary artifacts, not committed fixtures. The initial evidence
+recorded 19 Python-hook / CRLF baseline failures. Follow-up commits `635d284` and
+`be4c163` fix interpreter selection, UTF-8/LF hook I/O, native transcript basename
+handling, and checkout-independent workflow assertions. Parent verification after
+those fixes: `npm test` **454 passed, 0 failed, 0 skipped**; lint and diff checks
+passed. The portability review also passed. Earlier live-HC evidence remains an
+immutable record of its tested source snapshot; no live Claude CLI run is claimed.

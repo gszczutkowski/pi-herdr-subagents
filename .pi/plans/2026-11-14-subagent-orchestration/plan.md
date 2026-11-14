@@ -360,4 +360,8 @@ Najważniejsze pliki:
 - `pi-extension/subagents/plan-skill.md`, `agents/*.md`: instrukcje workflow i ról.
 - `test/assignment.test.ts`, `test/response-rendering.test.ts`, `test/test.ts`: istniejące punkty zaczepienia testów.
 
-Zapisanie tego dokumentu nie oznacza zatwierdzenia wszystkich decyzji ani rozpoczęcia implementacji.
+Powyższe źródła dokumentują pierwotną analizę; aktualne decyzje i status realizacji są zapisane przy punktach planu.
+
+## 11. Domknięcie błędów bazowych Python/CRLF
+
+Po wdrożeniu planu usunięto również 19 wcześniejszych błędów bazowych, zamiast traktować je jako trwały wyjątek. Commity `635d284` i `be4c163`: wybór działającego Python 3.8+ (`python3`, `python`, `py -3`), niezależne od locale wejście JSON, UTF-8/LF wyjścia, natywna nazwa pliku transkryptu Windows oraz walidacja workflow zarówno dla LF, jak i CRLF. Dodano regresje wyboru interpretera, braku Pythona, Unicode/nowych linii i ścisłego sprawdzania gałęzi release. Niezależny przegląd bez uwag. Aktualny pełny wynik `npm test`: **454/454, zero błędów i pominięć**; lint i diff-check OK. Wcześniejsze wyniki 429/448 opisują historyczny stan sprzed tych poprawek. Dowody live HC zachowują oryginalne hashe badanego snapshotu; nie deklarujemy dodatkowego live uruchomienia Claude CLI.
