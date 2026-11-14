@@ -150,6 +150,10 @@ export class RuntimeStore {
 
   assertCustody(): void {
     if (this.isCurrent && !this.isCurrent()) throw new Error("Parent session/active branch lost custody");
+    this.assertWriterCustody();
+  }
+
+  private assertWriterCustody(): void {
     if (this.closed || JSON.parse(readFileSync(join(this.lease, "owner.json"), "utf8")).generation !== this.generation) {
       throw new Error("Runtime writer lost custody");
     }
@@ -160,8 +164,9 @@ export class RuntimeStore {
     }
   }
 
-  private commit(next: RuntimeManifest): void {
-    this.assertCustody();
+  private commit(next: RuntimeManifest, requireActiveBranch = true): void {
+    if (requireActiveBranch) this.assertCustody();
+    else this.assertWriterCustody();
     next.revision = this.manifest.revision + 1;
     validate(next);
     atomicRuntimeWrite(join(this.directory, "manifest.json"), next);
@@ -217,7 +222,10 @@ export class RuntimeStore {
   }
 
   pauseCustody(reason: string): void {
-    this.commit({ ...this.snapshot(), custodyPaused: reason });
+    // Revocation is valid after confirmed navigation away from our branch.
+    // It still requires the exact writer lease and manifest revision; no event
+    // publication or other mutation may bypass the active-branch fence.
+    this.commit({ ...this.snapshot(), custodyPaused: reason }, false);
   }
 
   continuation(id: string, requestId: string): void {

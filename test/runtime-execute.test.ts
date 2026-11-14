@@ -45,7 +45,7 @@ test("spawn and closed-session resume durably record intent before terminal disp
     : key === "getAllTools" ? () => [] : key === "getThinkingLevel" ? () => "off"
     : key === "appendEntry" ? (customType: string, data: any) => branch.push({ id: "custody", type: "custom", customType, data })
     : key === "sendMessage" ? (message: any) => notifications.push(message) : () => {} });
-  const ctx: any = { hasUI: false, scopedModels: [], cwd: dir, model: { provider: "test", id: "model" },
+  const ctx: any = { hasUI: false, isIdle: () => false, scopedModels: [], cwd: dir, model: { provider: "test", id: "model" },
     modelRegistry: { find: () => ({ provider: "test", id: "model", reasoning: true }), getAvailable: () => [{ provider: "test", id: "model" }], hasConfiguredAuth: () => true },
     sessionManager: { getHeader: () => ({ id: "parent" }), getBranch: () => branch,
       getSessionFile: () => parent, getSessionDir: () => dir, getSessionId: () => "parent" } };
@@ -81,8 +81,11 @@ test("spawn and closed-session resume durably record intent before terminal disp
     assert.equal(fs.readdirSync(events).length, 2, "immutable child events retained");
     const closesBeforeTree = closes;
     handlers.get("session_before_tree")({}, ctx);
-    assert.equal(child.terminalActionsAllowed, false);
+    assert.notEqual(child.terminalActionsAllowed, false, "pending navigation is only provisional suspension");
+    assert.equal(JSON.parse(fs.readFileSync(manifestFile, "utf8")).custodyPaused, undefined);
+    branch.length = 0; // Host confirms navigation to a different custody lineage.
     await handlers.get("session_tree")({}, ctx);
+    assert.equal(child.terminalActionsAllowed, false);
     await new Promise((r) => setTimeout(r, 30));
     assert.equal(closes, closesBeforeTree, "losing branch custody cannot close a potentially reused pane");
     await assert.rejects(tools.get("subagent_resume").execute("blocked", { sessionPath: saved }, undefined, undefined, ctx), /branch decision/);

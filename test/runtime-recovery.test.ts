@@ -111,11 +111,12 @@ test("real child process answers fresh generation challenges; stale nonce/PID an
     atomicRuntimeWrite(`${base}.identity.json`, identity);
     const store = new RuntimeStore(join(dir, "runtime"), { sessionFile: "parent", headerId: "parent", branchToken: "branch", checkpoint: "checkpoint" });
     store.prepare({ id: "run", sessionFile: session, cli: "pi", surface: "reused-pane", name: "child", task: "task", startTime: 1 });
-    const recovering = reconcileRuntime(store, (run, event) => {
+    const onEvidence = (run: any, event: any) => {
       const id = `subagent:${run.id}:completion:${event.eventId}`;
       store.enqueue(id, run.id, { message: { customType: "subagent_result", content: event.summary!, details: { eventId: id } },
         options: { triggerTurn: true, deliverAs: "steer" } });
-    }, () => true);
+    };
+    const recovering = reconcileRuntime(store, onEvidence, () => true);
     assert.equal(sessionOwners.get(session)?.runId, "run", "reservation is synchronous before probing");
     assert.equal(sessionOwners.get(session)?.surface, undefined);
     const stop = await recovering;
@@ -126,7 +127,13 @@ test("real child process answers fresh generation challenges; stale nonce/PID an
     }
     await until(() => store.snapshot().runs.run.eventCursor.length === 2);
     assert.equal(Object.keys(store.snapshot().outbox).length, 2, "authenticated artifact-only supervisor harvests later turns");
-    stop(); store.close(); releaseSession(session, "run");
+    stop();
+    const resumed = await reconcileRuntime(store, onEvidence, () => true);
+    assert.match(store.snapshot().runs.run.reconciliation!, /verified-live: artifact-only/);
+    writeFileSync(`${base}.events/three.json`, JSON.stringify({ type: "done", runId: "run", eventId: "three", summary: "after suspension", keepOpen: true }));
+    await until(() => store.snapshot().runs.run.eventCursor.length === 3);
+    assert.equal(Object.keys(store.snapshot().outbox).length, 3, "same-run reservation resumes authenticated artifact supervision");
+    resumed(); store.close(); releaseSession(session, "run");
   } finally {
     child.kill(); await new Promise((r) => child.once("exit", r));
     releaseSession(session, "run"); rmSync(dir, { recursive: true, force: true });
@@ -193,5 +200,86 @@ test("durable observer preserves original settlements across reload gaps and rec
       await observeSubagentCompletion(children[0],Promise.reject(new Error('observer failure')));
       assert.equal(delivered.length,3);
       fresh.get('session_shutdown')({reason:'quit'},ctx);`);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("real Pi tree cancellation, summary abort/error resume original custody; changed lineage fences old runs", () => {
+  const dir = mkdtempSync(join(tmpdir(), "runtime-tree-"));
+  try {
+    execute(`import extension,{observeSubagentCompletion} from ${JSON.stringify(moduleURL("index"))};
+      import {RuntimeStore} from ${JSON.stringify(moduleURL("runtime-store"))};
+      import {createLifecycle} from ${JSON.stringify(moduleURL("lifecycle"))};
+      import {canonicalSessionPath} from ${JSON.stringify(moduleURL("ownership"))};
+      import {createAgentSession,DefaultResourceLoader,SessionManager,SettingsManager,ModelRuntime} from '@earendil-works/pi-coding-agent';
+      import {getModel} from '@earendil-works/pi-ai/compat';
+      import assert from 'node:assert/strict';
+      const directory=${JSON.stringify(dir)};const delivered=[];const errors=[];
+      let mode='cancel',release,entered=false,summaryStarted=false;
+      const settingsManager=SettingsManager.inMemory({compaction:{enabled:false},retry:{enabled:false}});
+      const modelRuntime=await ModelRuntime.create({authPath:directory+'/auth.json',modelsPath:directory+'/models.json',refreshOnCreate:false});
+      const sm=SessionManager.create(directory,directory+'/sessions');
+      const target=sm.appendCustomEntry('root',{});
+      const checkpoint=sm.appendCustomEntry('subagent-custody',{branchToken:'token'});
+      sm.appendMessage({role:'user',content:'Work worth summarizing',timestamp:Date.now()});
+      const loader=new DefaultResourceLoader({cwd:directory,agentDir:directory,settingsManager,
+        noExtensions:true,noSkills:true,noPromptTemplates:true,noThemes:true,noContextFiles:true,
+        extensionFactories:[pi=>extension(new Proxy(pi,{get:(api,key)=>key==='sendMessage'?message=>delivered.push(message):api[key]})),
+          pi=>pi.on('session_before_tree',async()=>{entered=true;await new Promise(r=>release=r);if(mode==='cancel')return {cancel:true};})]});
+      await loader.reload();assert.deepEqual(loader.getExtensions().errors,[]);
+      const {session}=await createAgentSession({cwd:directory,agentDir:directory,sessionManager:sm,settingsManager,modelRuntime,
+        model:getModel('anthropic','claude-sonnet-4-5'),resourceLoader:loader,tools:[]});
+      await session.bindExtensions({onError:error=>errors.push(error)});
+      const runtime=globalThis[Symbol.for('pi-subagents/runtime')];
+      const parent={sessionFile:canonicalSessionPath(sm.getSessionFile()),headerId:sm.getHeader().id,checkpoint,branchToken:'token'};
+      const store=new RuntimeStore(directory+'/artifacts/'+parent.headerId+'/subagent-runtime',parent);
+      runtime.store=store;runtime.delivery.store=store;
+      store.isCurrent=()=>!!runtime.latestCtx&&sm.getBranch().some(entry=>entry.id===checkpoint);
+      const wait=async predicate=>{const end=Date.now()+5000;while(!predicate()){assert.ok(Date.now()<end,'boundary timed out');await new Promise(r=>setTimeout(r,10));}};
+      // Keep a live supervised run through all cancelled/failed operations.
+      const child={id:'live',name:'live',task:'task',sessionFile:directory+'/child.jsonl',startTime:1,
+        durableStore:store,lifecycle:createLifecycle(1),interactive:false,terminalActionsAllowed:true};
+      runtime.runningSubagents.set(child.id,child);
+      store.prepare({id:child.id,name:child.name,task:child.task,sessionFile:child.sessionFile,startTime:1});
+      session._getSummarizationRequestAuth=async()=>({model:session.model,apiKey:'test-only'});
+      session.agent.streamFunction=(_model,_context,options)=>({result:async()=>{
+        summaryStarted=true;
+        if(mode==='abort')await new Promise(r=>options.signal.addEventListener('abort',r,{once:true}));
+        return {role:'assistant',content:[],api:'anthropic-messages',provider:'anthropic',model:session.model.id,
+          usage:{input:0,output:0,cacheRead:0,cacheWrite:0,totalTokens:0,cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}},
+          stopReason:mode==='abort'?'aborted':'error',errorMessage:'test summary failure',timestamp:Date.now()};
+      }});
+      for(mode of ['cancel','abort','error']){
+        entered=false;summaryStarted=false;
+        const oldLeaf=sm.getLeafId();
+        const navigation=session.navigateTree(target,{summarize:mode!=='cancel'});
+        // Attach the expected error immediately so rejection is always observed.
+        const outcome=navigation.then(value=>({value}),error=>({error}));
+        await wait(()=>entered);
+        assert.equal(session.isIdle,false);assert.throws(()=>store.assertCustody(),/branch/);
+        assert.equal(store.snapshot().custodyPaused,undefined);
+        await observeSubagentCompletion(child,Promise.resolve({name:'live',task:'task',sessionFile:child.sessionFile,
+          summary:'original '+mode,eventId:mode,elapsed:1,exitCode:0,keepOpen:true}));
+        assert.equal(delivered.length,['cancel','abort','error'].indexOf(mode),'no publication while navigation awaits a handler');
+        release();
+        if(mode==='abort'){await wait(()=>summaryStarted);session.abortBranchSummary();}
+        const result=await outcome;
+        if(mode==='error')assert.match(result.error.message,/test summary failure/);
+        else assert.equal(result.value.cancelled,true);
+        assert.equal(sm.getLeafId(),oldLeaf);
+        await wait(()=>runtime.latestCtx&&delivered.length===['cancel','abort','error'].indexOf(mode)+1);
+        assert.equal(runtime.recoveryError,undefined);assert.equal(store.snapshot().custodyPaused,undefined);
+        store.assertCustody();assert.equal(child.terminalActionsAllowed,true);
+        assert.equal(runtime.runningSubagents.get('live'),child);
+        assert.equal(delivered.at(-1).details.eventId,'subagent:live:completion:'+mode);
+        assert.equal(delivered.at(-1).details.response,'original '+mode);
+      }
+      mode='change';entered=false;
+      const navigation=session.navigateTree(target);await wait(()=>entered);release();await navigation;
+      assert.match(store.snapshot().custodyPaused,/changed active lineage/);
+      assert.equal(child.terminalActionsAllowed,false);assert.equal(runtime.runningSubagents.size,0);
+      assert.match(runtime.recoveryError,/explicit branch decision/);
+      await observeSubagentCompletion(child,Promise.resolve({name:'live',task:'task',summary:'foreign',elapsed:1,exitCode:0,eventId:'foreign'}));
+      assert.equal(delivered.length,3);assert.deepEqual(errors,[]);
+      session.dispose();`);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

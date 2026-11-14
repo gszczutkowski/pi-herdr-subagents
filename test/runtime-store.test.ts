@@ -82,6 +82,22 @@ test("unknown dispatch survives reopen; tombstones cannot be replayed", () => fi
   store.delivery(id, "handedOff"); assert.throws(() => store.delivery(id, "pending"), /tombstone/); store.close();
 }));
 
+test("confirmed lineage loss can persist revocation but never bypass writer fencing", () => fixture((dir) => {
+  const store = new RuntimeStore(dir, parent); store.prepare(run);
+  store.isCurrent = () => false;
+  assert.throws(() => store.phase(run.id, "supervised"), /branch lost custody/);
+  store.pauseCustody("confirmed lineage change");
+  assert.equal(readRuntimeManifest(dir)!.custodyPaused, "confirmed lineage change");
+  assert.throws(() => store.phase(run.id, "supervised"), /branch lost custody/);
+  const file = join(dir, "manifest.json");
+  const valid = readFileSync(file, "utf8");
+  const stale = JSON.parse(valid); stale.revision++;
+  writeFileSync(file, JSON.stringify(stale));
+  assert.throws(() => store.pauseCustody("stale writer"), /Stale/);
+  writeFileSync(file, valid); store.close();
+  assert.throws(() => store.pauseCustody("closed writer"), /lost custody/);
+}));
+
 test("lease, stale revisions, corruption and future schemas fail closed", () => fixture((dir) => {
   const store = new RuntimeStore(dir, parent);
   assert.throws(() => new RuntimeStore(dir, parent));

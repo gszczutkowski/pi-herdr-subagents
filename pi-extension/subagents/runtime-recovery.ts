@@ -16,7 +16,10 @@ export async function reconcileRuntime(
     const path = canonicalSessionPath(run.sessionFile);
     const previous = sessionOwners.get(path);
     if (previous) {
-      // Even another run in this manifest cannot inherit a writer reservation.
+      // Re-establish artifact-only supervision after a temporary suspension.
+      // The same run keeps its reservation, but must pass a fresh identity probe.
+      if (previous.runId === run.id) { reserved.add(run.id); continue; }
+      // Another run in this manifest cannot inherit a writer reservation.
       store.reconcileRun(run.id, `decision: session reserved by ${previous.runId}`);
       continue;
     }

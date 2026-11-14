@@ -624,6 +624,7 @@ interface SubagentRuntime {
   runningSubagents: Map<string, RunningSubagent>;
   pi?: ExtensionAPI;
   latestCtx?: ExtensionContext;
+  treeSuspension?: { timer: ReturnType<typeof setInterval> };
   modelCatalog?: string;
   agentCatalog?: string;
   delivery?: DeliveryState;
@@ -664,7 +665,7 @@ function durableStoreFor(ctx: ExtensionContext): RuntimeStore | undefined {
     sessionFile: canonicalSessionPath(sessionFile), headerId: header.id,
     branchToken: (checkpoint.data as any).branchToken, checkpoint: checkpoint.id,
   });
-  store.isCurrent = () => ownsActiveBranch(runtime.latestCtx ?? ctx, store.snapshot().parent);
+  store.isCurrent = () => ownsActiveBranch(runtime.latestCtx, store.snapshot().parent);
   runtime.store = store;
   delivery.store = store;
   return store;
@@ -1100,7 +1101,7 @@ function requestSubagentInterrupt(
   interruptPaneKey: (surface: string) => void = interruptPane,
 ): { ok: true } | { error: string } {
   try {
-    if (running.terminalActionsAllowed === false) throw new Error("Terminal custody is detached/unverified");
+    if (runtime.treeSuspension || running.terminalActionsAllowed === false) throw new Error("Terminal custody is detached/unverified");
     running.durableStore?.assertCustody();
     interruptPaneKey(running.surface);
     return { ok: true };
@@ -1175,6 +1176,7 @@ function startStatusRefresh(_pi: ExtensionAPI) {
   if (!config.status.enabled || statusInterval) return;
 
   statusInterval = setInterval(() => {
+    if (!runtime.latestCtx || runtime.treeSuspension || runtime.recoveryError) return;
     if (runningSubagents.size === 0) {
       if (statusInterval) {
         clearInterval(statusInterval);
@@ -1450,7 +1452,7 @@ async function watchSubagent(
 ): Promise<SubagentResult> {
   const { name, task, surface, startTime, sessionFile } = running;
   const safeClose = () => {
-    if (running.terminalActionsAllowed === false) return;
+    if (runtime.treeSuspension || running.terminalActionsAllowed === false) return;
     try { running.durableStore?.assertCustody(); } catch { return; }
     closePane(surface);
   };
@@ -1666,30 +1668,52 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     }
   });
 
-  pi.on("session_before_tree", () => {
-    runtime.store?.pauseCustody("/tree navigation: terminal custody detached; reconcile explicitly before further dispatch");
-    runtime.recoveryError = "Subagent custody paused for /tree; terminal controls disabled";
-    pauseDeliveries(delivery);
-    detachRuntimeWatchers();
-    // Navigation may replace the active branch while a probe is in flight.
-    runtime.latestCtx = undefined;
-  });
-  pi.on("session_tree", async (_event, ctx) => {
+  const finishTreeNavigation = async (ctx: ExtensionContext) => {
+    if (runtime.treeSuspension) clearInterval(runtime.treeSuspension.timer);
+    runtime.treeSuspension = undefined;
     runtime.latestCtx = ctx;
-    // Never inherit live terminal custody after navigation. Preserve reservations
-    // and durable evidence, require an explicit restart/reconciliation decision.
-    cleanupSubagentsForShutdown("tree", runningSubagents);
-    if (runtime.store) {
-      runtime.store.close();
-      runtime.store = undefined;
-      delivery.store = undefined;
+    if (runtime.store && !ownsActiveBranch(ctx, runtime.store.snapshot().parent)) {
+      // Only a confirmed lineage change is irreversible. Cancellation, summary
+      // abort and summary errors leave the original branch's custody intact.
+      runtime.recoveryError = "Subagent custody paused: changed active lineage requires an explicit branch decision";
+      detachRuntimeWatchers();
+      cleanupSubagentsForShutdown("tree", runningSubagents);
+      try {
+        runtime.store.pauseCustody("/tree changed active lineage; explicit reconciliation required");
+      } finally {
+        runtime.store.close();
+        runtime.store = undefined;
+        delivery.store = undefined;
+        delivery.pending.clear();
+        delivery.handedOff.clear();
+        runtime.suspendedCompletions?.clear();
+      }
+      return;
     }
-    delivery.pending.clear();
-    delivery.handedOff.clear();
-    runtime.recoveryError = undefined;
     await recoverParentRuntime(ctx);
     if (runtime.latestCtx !== ctx) return;
     if (!runtime.recoveryError) { delivery.api = pi; flushDeliveries(delivery); }
+  };
+  pi.on("session_before_tree", (_event, ctx) => {
+    if (runtime.treeSuspension) clearInterval(runtime.treeSuspension.timer);
+    pauseDeliveries(delivery);
+    // Pi's navigateTree holds its branch-summary controller throughout the
+    // operation (including extension handlers), and clears it in finally.
+    // ctx.isIdle() includes that controller. There is no tree-failed event:
+    // poll the real idle boundary to recover cancellations/errors safely.
+    runtime.latestCtx = undefined;
+    const suspension = { timer: setInterval(() => {
+      if (runtime.treeSuspension !== suspension || !ctx.isIdle()) return;
+      void finishTreeNavigation(ctx).catch((error) => {
+        runtime.recoveryError = `Subagent tree recovery paused: ${String(error)}`;
+        pauseDeliveries(delivery);
+      });
+    }, 25) };
+    runtime.treeSuspension = suspension;
+    suspension.timer.unref?.();
+  });
+  pi.on("session_tree", async (_event, ctx) => {
+    await finishTreeNavigation(ctx);
   });
 
   pi.registerCommand("subagents-recovery", {
@@ -1714,6 +1738,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   pi.on("session_shutdown", (event, _ctx) => {
     // Invalidate session-bound API immediately, including the shutdown/factory gap.
     pauseDeliveries(delivery);
+    if (runtime.treeSuspension) clearInterval(runtime.treeSuspension.timer);
+    runtime.treeSuspension = undefined;
     runtime.pi = undefined;
     runtime.latestCtx = undefined;
     if (widgetInterval) {
@@ -2120,9 +2146,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const liveOwner = sessionOwners.get(params.sessionPath);
         if (liveOwner && runningSubagents.has(liveOwner.runId)) {
           const child = runningSubagents.get(liveOwner.runId)!;
-          if (child.terminalActionsAllowed === false) throw new Error("Live continuation requires verified terminal custody");
+          if (runtime.treeSuspension || child.terminalActionsAllowed === false) throw new Error("Live continuation requires verified terminal custody");
           const result = await continueLiveChild(liveOwner, child, params, { inspect: inspectPane, send: (surface, command) => {
-            if (child.terminalActionsAllowed === false) throw new Error("Terminal custody was detached during continuation");
+            if (runtime.treeSuspension || child.terminalActionsAllowed === false) throw new Error("Terminal custody was detached during continuation");
             child.durableStore?.assertCustody();
             // Validate after async inspection, immediately before dispatch.
             try {
