@@ -334,7 +334,9 @@ Przed uznaniem wdrożenia za zakończone:
 - [x] Testy renderowania dla długich planów, wąskich terminali i historii wyników.
 
 Weryfikacja: `automated-render-boundary.test.ts` łączy rzeczywiste rejestracje panelu, historii i kart wyników z natywnym magazynem. Sprawdza szerokości 1–160 kolumn, Unicode/combining marks, 36 zadań, skrócenie szczegółów do 120 wierszy, cykle/osierocone węzły historii, zmianę motywu i gałęzi oraz brak zapisów i dodatkowych tur modelu. Rozwinięta karta pokazuje ograniczony podgląd strukturalnej propozycji niezależnie od tekstowej odpowiedzi; nie certyfikuje dowodów. Testy tekstowego renderera nie zastępują screenshotów ani live E2E.
-- [ ] Testy live: równoległy spawn, wynik podczas reloadu, interrupt/kontynuacja/resume, wybrana semantyka keepOpen.
+- [x] Testy live: równoległy spawn, wynik podczas reloadu, interrupt/kontynuacja/resume, wybrana semantyka keepOpen.
+
+Akceptacja rodzica: niezależnie od raportu wykonawcy sprawdzono `assertions.json` i `cleanup.json` wszystkich pięciu końcowych, uwierzytelnionych prób Pi TUI/HC oraz zgodność 60 hashy aktualnych źródeł z `source-manifest.json`. Cztery próby lifecycle potwierdzają równoległy spawn z wynikiem w rzeczywistym, instrumentowanym oknie reloadu, closed resume, dwa wyniki keepOpen w tej samej sesji i interrupt → kontynuację tego samego procesu. Cała końcowa komenda: 5/5, zero błędów i pominięć. Szczegóły i granice: `test/integration/HC-TUI-VERIFICATION.md`; prywatne dowody `.git/verification/2026-11-14-final-main-confirmation/summary.json`. Wcześniejsze nieudane próby zachowano, nie policzono ich jako zaliczonych. Dowód dotyczy Pi/HC i wskazanego modelu, nie wszystkich harnessów ani wizualnego wyglądu.
 - [ ] Testy restartu i odtworzenia nadzoru, jeśli taka gwarancja zostanie wdrożona.
 - [x] Testy możliwości wspieranych harnessów; jawne odrzucanie nieobsługiwanych operacji.
 
