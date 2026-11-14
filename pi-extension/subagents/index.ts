@@ -66,7 +66,7 @@ import {
   type SubagentActivityState,
 } from "./activity.ts";
 import { registerSubagentAssignmentRenderer } from "./assignment.ts";
-import { createDeliveryState, enqueueDelivery, pauseDeliveries, type DeliveryState } from "./delivery.ts";
+import { createDeliveryState, enqueueDelivery, flushDeliveries, pauseDeliveries, type DeliveryState } from "./delivery.ts";
 import {
   createLifecycle,
   formatLifecycleTransitionLine,
@@ -654,10 +654,6 @@ export function shouldDeliverSubagentCompletion(
   // Authoritative gate: only pending deliveries may be sent.
   // Missing lifecycle (pre-migration fixtures) defaults to pending/true.
   return (running.lifecycle?.delivery ?? "pending") === "pending";
-}
-
-export function selectCompletionApi<T>(previous: T, current: T | undefined): T {
-  return current ?? previous;
 }
 
 /** Shared by spawn and resume; transport failures stay inside the outbox. */
@@ -1433,13 +1429,16 @@ async function watchSubagent(
 
 export default function subagentsExtension(pi: ExtensionAPI) {
   registerSubagentAssignmentRenderer(pi);
-  runtime.pi = pi;
-  delivery.api = pi;
+  // A factory API is not bound yet. Never fall back to a captured pre-reload API.
+  runtime.pi = undefined; // Also invalidate the legacy global runtime field.
+  pauseDeliveries(delivery);
 
   // Capture the UI context for widget updates and restore presentation for
   // subagents whose watchers survived a reload.
   pi.on("session_start", (_event, ctx) => {
     runtime.latestCtx = ctx;
+    delivery.api = pi;
+    flushDeliveries(delivery);
     runtime.modelCatalog = buildAuthenticatedModelCatalog(
       wrapPiModelRegistry(ctx.modelRegistry),
       24,
@@ -1464,7 +1463,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
   // Clean up on session shutdown
   pi.on("session_shutdown", (event, _ctx) => {
-    // Preserved watchers must not touch a ctx that is about to go stale.
+    // Invalidate session-bound API immediately, including the shutdown/factory gap.
+    pauseDeliveries(delivery);
+    runtime.pi = undefined;
     runtime.latestCtx = undefined;
     if (widgetInterval) {
       clearInterval(widgetInterval);
@@ -1479,9 +1480,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
     cleanupSubagentsForShutdown((event as any).reason, runningSubagents);
     if (!shouldPreserveSubagentsOnShutdown((event as any).reason)) {
-      pauseDeliveries(delivery);
+      for (const entry of delivery.pending.values()) {
+        entry.owner.lifecycle = markDelivery(entry.owner.lifecycle, "suppressed");
+      }
       delivery.pending.clear();
       delivery.handedOff.clear();
+      runtime.modelCatalog = undefined;
+      runtime.agentCatalog = undefined;
     }
   });
 

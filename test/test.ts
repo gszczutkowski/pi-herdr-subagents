@@ -9,7 +9,6 @@ import * as subagentsModule from "../pi-extension/subagents/index.ts";
 import { captureGuidanceRequests } from "./guidance-session.ts";
 import {
   cleanupSubagentsForShutdown,
-  selectCompletionApi,
   shouldDeliverSubagentCompletion,
   shouldPreserveSubagentsOnShutdown,
 } from "../pi-extension/subagents/index.ts";
@@ -2250,13 +2249,6 @@ describe("subagent parent lifecycle", () => {
     assert.equal(shouldDeliverSubagentCompletion({} as any), true);
   });
 
-  it("delivers completion through the reloaded extension API", () => {
-    const previous = { id: "previous" };
-    const current = { id: "current" };
-
-    assert.equal(selectCompletionApi(previous, current), current);
-    assert.equal(selectCompletionApi(previous, undefined), previous);
-  });
 });
 
 describe("subagent activity snapshots", () => {
