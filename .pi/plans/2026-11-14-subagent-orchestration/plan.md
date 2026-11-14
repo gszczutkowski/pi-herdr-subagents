@@ -285,7 +285,9 @@ Trzy odrębne modele:
 2. Zadanie: oczekuje, realizowane, zablokowane, do weryfikacji, zaakceptowane.
 3. Dostarczenie: wynik oczekuje, został przekazany, wymaga ponowienia.
 
-- [ ] Wydzielać discovery, uruchamianie, dostarczanie i UI z `index.ts` przy okazji realizacji zmian, bez jednorazowego przepisywania całości.
+- [x] Wydzielać discovery, uruchamianie, dostarczanie i UI z `index.ts` przy okazji realizacji zmian, bez jednorazowego przepisywania całości.
+
+Weryfikacja: `discovery.ts` przejmuje typy, parser, name-keyed discovery i katalog, z zachowaniem aliasów `__test__`, call-time cwd/config, CRLF i local override. Istniejące moduły launch/delivery/UI pozostają oddzielne; granice opisuje `ARCHITECTURE.md`. `node --test test/discovery.test.ts test/test.ts`: 185/185, bez skip; bez live herdr.
 - [ ] Współdzielić ścieżki spawn i resume oraz definicję manifestu uruchomienia.
 - [ ] Określić jedno miejsce zatwierdzania zmian zadania; dzieci zgłaszają wyniki zamiast niezależnie nadpisywać wspólny stan.
 - [ ] Użyć natywnych mechanizmów Pi do widgetów i zapisów sesji tam, gdzie wystarczą; trwały transport wyników traktować oddzielnie od prezentacji.
