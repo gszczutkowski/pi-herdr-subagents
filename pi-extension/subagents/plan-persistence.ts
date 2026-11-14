@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { SessionManager, type ExtensionContext, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createPlan, deserializePlan, serializePlan, type Authority, type CommandContext, type PlanSnapshot } from "./plan-store.ts";
+import { createPlan, detachPlan, deserializePlan, serializePlan, type Authority, type CommandContext, type PlanSnapshot } from "./plan-store.ts";
 
 export const PLAN_ENTRY = "pi-subagents-plan/v1";
 type Manager = ExtensionContext["sessionManager"];
@@ -15,10 +15,11 @@ export interface PlanView {
   readonly writable: boolean;
   readonly error?: string;
   readonly recoveryUncertain: readonly string[];
+  readonly detachRequired?: "foreign" | "historical";
 }
 
 export class PlanPersistence {
-  private recovery = new Set<string>();
+  private recovery = new Map<string, string | undefined>();
   private readonly append: ExtensionAPI["appendEntry"];
   private readonly child: boolean;
   constructor(append: ExtensionAPI["appendEntry"], child: boolean) { this.append = append; this.child = child; }
@@ -37,22 +38,64 @@ export class PlanPersistence {
     this.recovery.clear();
     const view = this.read(sm);
     for (const task of view.snapshot?.tasks ?? []) {
-      if (task.status === "in_progress") this.recovery.add(task.taskId);
+      if (task.status === "in_progress") this.recovery.set(task.taskId, task.attempts.at(-1)?.attemptId);
     }
     return this.read(sm);
+  }
+  private storageError(sm: Manager): string | undefined {
+    return faults.get(this.key(sm)) ?? (this.child ? "Child sessions cannot write parent plans" :
+      !sm.getSessionFile() || !existsSync(sm.getSessionFile()!) || !sm.getBranch().some(e => e.type === "message" && (e.message.role === "user" || e.message.role === "assistant"))
+        ? "A durable session with an actual user/assistant message is required (not --no-session or setup-only)" : undefined);
+  }
+  private historical(sm: Manager, plan: PlanSnapshot): boolean {
+    const latest = this.latest(sm);
+    if (!latest) return false;
+    const active = new Set(sm.getBranch().map(entry => entry.id));
+    // Tree topology only determines whether this snapshot has an abandoned future.
+    // Snapshot selection/content ALWAYS comes exclusively from getBranch().
+    type Node = ReturnType<Manager["getTree"]>[number];
+    const abandonedFuture = (node: Node): boolean => {
+      // An explicit detach marks a different branch, not a future of this one.
+      // Inspect identity only; never restore snapshot state from another path.
+      const entry = node.entry;
+      if (entry.type === "custom" && entry.customType === PLAN_ENTRY) {
+        const identity = entry.data as Partial<PlanSnapshot> | undefined;
+        if (identity?.planId !== plan.planId && identity?.authority?.branchInstanceId !== plan.authority.branchInstanceId &&
+          identity?.source?.planId === plan.planId && identity.source.authority.sessionId === plan.authority.sessionId &&
+          identity.source.authority.branchInstanceId === plan.authority.branchInstanceId) return false;
+        return true;
+      }
+      return node.children.length === 0 || node.children.some(abandonedFuture);
+    };
+    const pending = [...sm.getTree()];
+    while (pending.length) {
+      const node = pending.pop()!;
+      if (node.entry.id === latest.id) {
+        const descendants = [...node.children];
+        while (descendants.length) {
+          const descendant = descendants.pop()!;
+          if (!active.has(descendant.entry.id)) {
+            if (abandonedFuture(descendant)) return true;
+          } else descendants.push(...descendant.children);
+        }
+        return false;
+      }
+      pending.push(...node.children);
+    }
+    return false;
   }
   read(sm: Manager): PlanView {
     try {
       const snapshot = this.load(sm);
-      const error = faults.get(this.key(sm)) ?? (this.child ? "Child sessions cannot write parent plans" :
-        !sm.getSessionFile() || !existsSync(sm.getSessionFile()!) || !sm.getBranch().some(e => e.type === "message" && (e.message.role === "user" || e.message.role === "assistant")) ? "A durable session with an actual user/assistant message is required (not --no-session or setup-only)" :
-        snapshot && snapshot.authority.sessionId !== sm.getSessionId() ? "Foreign inherited plan is read-only; detach explicitly before editing" : undefined);
-      return { snapshot, writable: !error, ...(error ? { error } : {}), recoveryUncertain: [...this.recovery].filter(id => snapshot?.tasks.some(t => t.taskId === id && t.status === "in_progress")) };
+      const detachRequired = snapshot && (snapshot.authority.sessionId !== sm.getSessionId() ? "foreign" : this.historical(sm, snapshot) ? "historical" : undefined);
+      const error = this.storageError(sm) ?? (detachRequired ? `${detachRequired === "foreign" ? "Foreign inherited" : "Historical"} plan is read-only; detach explicitly before editing` : undefined);
+      return { snapshot, writable: !error, ...(detachRequired ? { detachRequired } : {}), ...(error ? { error } : {}), recoveryUncertain: [...this.recovery].filter(([id, attemptId]) => snapshot?.tasks.some(t => t.taskId === id && t.status === "in_progress" && t.attempts.at(-1)?.attemptId === attemptId)).map(([id]) => id) };
     } catch (error) {
       return { writable: false, error: String(error), recoveryUncertain: [] };
     }
   }
   reconcile(sm: Manager): PlanView {
+    if (this.child) throw new Error("Child sessions cannot reconcile parent plan storage");
     // Never trust the possibly advanced in-memory leaf after a failed append.
     const file = sm.getSessionFile();
     if (!file || !existsSync(file)) throw new Error("Cannot reconcile an ephemeral/unflushed session");
@@ -87,6 +130,16 @@ export class PlanPersistence {
     if (view.snapshot) throw new Error("Plan already exists");
     if (expectedRevision !== 0) throw new Error("Revision conflict");
     return this.save(sm, createPlan(title, { sessionId: sm.getSessionId(), branchInstanceId: randomUUID() }));
+  }
+  detach(sm: Manager, planId: string, expectedRevision: number, reason: string): PlanSnapshot {
+    const error = this.storageError(sm);
+    if (error) throw new Error(error);
+    const plan = this.load(sm);
+    if (!plan) throw new Error("No active plan to detach");
+    if (plan.planId !== planId) throw new Error("Plan identity conflict");
+    if (plan.revision !== expectedRevision) throw new Error("Revision conflict");
+    const detached = detachPlan(plan, { sessionId: sm.getSessionId(), branchInstanceId: randomUUID() }, this.latest(sm)!.id, reason);
+    return this.save(sm, detached);
   }
   /** Synchronous compare-command-append serializes model mutations, including
    * parallel execute calls. This is not cross-process storage CAS or an OS lock. */

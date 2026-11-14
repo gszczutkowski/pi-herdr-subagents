@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { truncateHead, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type, type Static, type TProperties } from "@sinclair/typebox";
 import { Value } from "@sinclair/typebox/value";
 import * as store from "./plan-store.ts";
@@ -23,6 +23,7 @@ export const PlanUpdateParams = object({
   expectedRevision: Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
   command: Type.Union([
     object({ action: Type.Literal("create"), title: text() }),
+    command("detach", { reason: text() }),
     command("add", { title: text(), details: Type.Optional(object(definitions)) }),
     command("edit", { taskId: text(), patch: object({ title: Type.Optional(text()), ...definitions }) }),
     command("attempt", { taskId: text(), mode: Type.Union([Type.Literal("start"), Type.Literal("retry")]), childSession: Type.Optional(text()) }),
@@ -38,7 +39,7 @@ export const PlanUpdateParams = object({
 });
 export type PlanUpdate = Static<typeof PlanUpdateParams>;
 
-function apply(plan: store.PlanSnapshot, context: store.CommandContext, command: Exclude<PlanUpdate["command"], { action: "create" }>): store.PlanSnapshot {
+function apply(plan: store.PlanSnapshot, context: store.CommandContext, command: Exclude<PlanUpdate["command"], { action: "create" | "detach" }>): store.PlanSnapshot {
   switch (command.action) {
     case "add": return store.addTask(plan, context, command.title, command.details);
     case "edit": return store.editTask(plan, context, command.taskId, command.patch);
@@ -53,8 +54,9 @@ function apply(plan: store.PlanSnapshot, context: store.CommandContext, command:
 }
 
 function response(details: unknown) {
-  const json = JSON.stringify(details);
-  return { content: [{ type: "text" as const, text: json.length <= 40000 ? json : `${json.slice(0, 40000)}\n[Truncated; use plan_read with taskId for details]` }], details };
+  const json = JSON.stringify(details, null, 2);
+  const output = truncateHead(json, { maxBytes: 40000, maxLines: 2000 });
+  return { content: [{ type: "text" as const, text: output.content + (output.truncated ? "\n[Truncated; use plan_read with taskId for details]" : "") }], details };
 }
 
 /** Single registration boundary; no launches, runtime result adapters, or UI/context hooks. */
@@ -65,7 +67,7 @@ export function registerPlanTools(pi: ExtensionAPI): PlanPersistence {
   pi.on("session_tree", restore);
   pi.registerTool({
     name: "plan_read", label: "Read plan",
-    description: "Read the active branch's durable plan, revision and recovery uncertainty. Optional taskId returns full task details. No runtime liveness is implied. Output bounded to 40k characters.",
+    description: "Read the active branch's durable plan, revision and recovery uncertainty. Optional taskId returns full task details. No runtime liveness is implied. Output bounded to 40KB.",
     parameters: object({ taskId: Type.Optional(text()), reconcile: Type.Optional(Type.Boolean()) }),
     async execute(_id, params, _signal, _update, ctx) {
       const view = params.reconcile ? persistence.reconcile(ctx.sessionManager) : persistence.read(ctx.sessionManager);
@@ -76,13 +78,14 @@ export function registerPlanTools(pi: ExtensionAPI): PlanPersistence {
   });
   pi.registerTool({
     name: "plan_update", label: "Update plan", executionMode: "sequential",
-    description: "Parent-only revision-checked durable commands (not snapshot replacement). Read first; supply planId and expectedRevision. Criteria/artifact IDs are UUIDs supplied by caller. Attempts/runs are references only, never launches. Results require original authority. Acceptance requires review and evidence for all criteria. Definition edits invalidate acceptance. No --no-session/setup-only durability.",
+    description: "Parent-only revision-checked durable commands (not snapshot replacement). Read first; supply planId and expectedRevision. Criteria/artifact IDs are UUIDs supplied by caller. Attempts/runs are references only, never launches. Results require original authority. Acceptance requires review and evidence for all criteria. Definition edits invalidate acceptance. Foreign/forked or historical plans are read-only until explicit detach (new planId/authority; inherited attempts need retry). No --no-session/setup-only durability.",
     parameters: PlanUpdateParams,
     async execute(_id, params, signal, _update, ctx) {
       signal?.throwIfAborted();
       if (!Value.Check(PlanUpdateParams, params)) throw new Error("Invalid bounded plan command");
       const c = params.command;
       const snapshot = c.action === "create" ? persistence.create(ctx.sessionManager, params.expectedRevision, c.title) :
+        c.action === "detach" ? persistence.detach(ctx.sessionManager, c.planId, params.expectedRevision, c.reason) :
         persistence.mutate(ctx.sessionManager, c.planId, params.expectedRevision, (plan, context) => apply(plan, context, c), c.action === "result" ? c.origin : undefined);
       return response({ planId: snapshot.planId, revision: snapshot.revision, authority: snapshot.authority, tasks: snapshot.tasks });
     },

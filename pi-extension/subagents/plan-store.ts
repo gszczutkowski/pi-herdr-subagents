@@ -13,6 +13,7 @@ export interface Attempt {
   readonly attemptId: string;
   readonly runIds: readonly string[];
   readonly childSession?: string;
+  readonly origin?: { readonly planId: string; readonly authority: Authority };
   readonly results: readonly ResultReference[];
 }
 export interface ResultReference {
@@ -52,6 +53,7 @@ export interface PlanSnapshot {
   readonly title: string;
   readonly authority: Authority;
   readonly tasks: readonly PlanTask[];
+  readonly source?: { readonly planId: string; readonly authority: Authority; readonly revision: number; readonly entryId: string; readonly reason: string };
 }
 
 function requireValue(condition: unknown, message: string): asserts condition {
@@ -74,11 +76,19 @@ function keys(value: object, allowed: readonly string[]): void {
   requireValue(value !== null && typeof value === "object" && Object.keys(value).every(key => allowed.includes(key)), "Unsupported snapshot field");
 }
 function validate(plan: PlanSnapshot): void {
-  keys(plan, ["schemaVersion", "revision", "planId", "title", "authority", "tasks"]);
+  keys(plan, ["schemaVersion", "revision", "planId", "title", "authority", "tasks", "source"]);
   keys(plan.authority, ["sessionId", "branchInstanceId"]);
   requireValue(plan.schemaVersion === 1, "Unsupported schema version");
   requireValue(Number.isSafeInteger(plan.revision) && plan.revision >= 0, "Invalid revision");
   uuid(plan.planId); text(plan.title); text(plan.authority.sessionId); text(plan.authority.branchInstanceId);
+  if (plan.source !== undefined) {
+    keys(plan.source, ["planId", "authority", "revision", "entryId", "reason"]);
+    keys(plan.source.authority, ["sessionId", "branchInstanceId"]);
+    uuid(plan.source.planId); text(plan.source.entryId); text(plan.source.reason);
+    text(plan.source.authority.sessionId); text(plan.source.authority.branchInstanceId);
+    requireValue(plan.source.planId !== plan.planId && Number.isSafeInteger(plan.source.revision) && plan.source.revision >= 0 && plan.source.revision < plan.revision, "Invalid source provenance");
+    requireValue(plan.source.authority.branchInstanceId !== plan.authority.branchInstanceId, "Detach requires new branch authority");
+  }
   requireValue(Array.isArray(plan.tasks) && plan.tasks.length <= 1000, "Invalid tasks");
   const ids = new Set<string>();
   const attemptIds = new Set<string>();
@@ -166,7 +176,12 @@ function validate(plan: PlanSnapshot): void {
     requireValue(!ids.has(task.taskId), "Duplicate task ID"); ids.add(task.taskId);
     requireValue(Array.isArray(task.attempts) && task.attempts.length <= 1000, "Invalid attempts");
     for (const attempt of task.attempts) {
-      keys(attempt, ["attemptId", "runIds", "childSession", "results"]);
+      keys(attempt, ["attemptId", "runIds", "childSession", "results", "origin"]);
+      if (attempt.origin !== undefined) {
+        keys(attempt.origin, ["planId", "authority"]);
+        keys(attempt.origin.authority, ["sessionId", "branchInstanceId"]);
+        uuid(attempt.origin.planId); text(attempt.origin.authority.sessionId); text(attempt.origin.authority.branchInstanceId);
+      }
       uuid(attempt.attemptId);
       requireValue(!attemptIds.has(attempt.attemptId), "Duplicate attempt"); attemptIds.add(attempt.attemptId);
       if (attempt.childSession !== undefined) text(attempt.childSession);
@@ -261,6 +276,7 @@ export function attachRun(plan: PlanSnapshot, context: CommandContext, taskId: s
   return changeTask(plan, context, taskId, task => {
     requireValue(task.status === "in_progress" || task.status === "blocked" || task.status === "in_review", "Cannot attach run in terminal/pending state");
     requireValue(task.attempts.at(-1)?.attemptId === attemptId, "Attach requires current attempt");
+    requireAttemptAuthority(plan, task.attempts.at(-1)!);
     return { ...task, attempts: task.attempts.map(a => a.attemptId === attemptId ? { ...a, runIds: [...a.runIds, runId] } : a) };
   });
 }
@@ -273,8 +289,11 @@ function setStatus(task: PlanTask, plan: PlanSnapshot, status: TaskStatus, reaso
   text(reason);
   return { ...task, status, statusReason: reason, statusHistory: [...task.statusHistory, { revision: plan.revision + 1, status, reason }] };
 }
+function requireAttemptAuthority(plan: PlanSnapshot, attempt: Attempt): void {
+  requireValue(attempt.origin ? attempt.origin.planId === plan.planId && attempt.origin.authority.sessionId === plan.authority.sessionId && attempt.origin.authority.branchInstanceId === plan.authority.branchInstanceId : !plan.source, "Inherited attempt is read-only; retry to create a new attempt");
+}
 function newAttempt(task: PlanTask, plan: PlanSnapshot, childSession: string | undefined, reason: string): PlanTask {
-  return { ...setStatus(task, plan, "in_progress", reason), attempts: [...task.attempts, { attemptId: randomUUID(), runIds: [], ...(childSession === undefined ? {} : { childSession }), results: [] }] };
+  return { ...setStatus(task, plan, "in_progress", reason), attempts: [...task.attempts, { attemptId: randomUUID(), origin: { planId: plan.planId, authority: plan.authority }, runIds: [], ...(childSession === undefined ? {} : { childSession }), results: [] }] };
 }
 export function startAttempt(plan: PlanSnapshot, context: CommandContext, taskId: string, childSession?: string): PlanSnapshot {
   return changeTask(plan, context, taskId, task => {
@@ -321,6 +340,9 @@ export function recordResult(plan: PlanSnapshot, context: CommandContext, taskId
   keys(result, ["eventId", "runId", "ref", "kind", "reason"]);
   const task = plan.tasks.find(t => t.taskId === taskId);
   requireValue(task, "Unknown task");
+  const targetAttempt = task.attempts.find(a => a.attemptId === attemptId);
+  requireValue(targetAttempt, "Unknown attempt");
+  requireAttemptAuthority(plan, targetAttempt);
   const existing = task.attempts.flatMap(a => a.results).find(r => r.eventId === result.eventId);
   if (existing) {
     requireValue(existing.runId === result.runId && existing.ref === result.ref && (existing.kind ?? "result") === (result.kind ?? "result") && existing.reason === result.reason && task.attempts.some(a => a.attemptId === attemptId && a.results.includes(existing)), "Conflicting event");
@@ -335,6 +357,20 @@ export function recordResult(plan: PlanSnapshot, context: CommandContext, taskId
     if (result.kind === "ping") return setStatus(recorded, plan, "blocked", result.reason!);
     if (result.kind === "failure") return setStatus(recorded, plan, "failed", result.reason!);
     return setStatus(recorded, plan, "in_review", result.reason ?? "Worker result requires parent review");
+  });
+}
+/** Explicit conservative copy: preserve history, never inherit live ownership.
+ * Revision remains chronological; plan identity and branch authority are new. */
+export function detachPlan(plan: PlanSnapshot, authority: Authority, entryId: string, reason: string): PlanSnapshot {
+  validate(plan); text(reason); text(entryId);
+  requireValue(authority.branchInstanceId !== plan.authority.branchInstanceId, "Detach requires new branch authority");
+  const explanation = `Inherited attempt requires explicit retry after detach: ${reason}`;
+  return snapshot({ ...plan, planId: randomUUID(), authority, revision: plan.revision + 1,
+    source: { planId: plan.planId, authority: plan.authority, revision: plan.revision, entryId, reason },
+    tasks: plan.tasks.map(task => ({
+      ...(["in_progress", "blocked", "in_review"].includes(task.status) && task.attempts.length ? setStatus(task, plan, "blocked", explanation) : task),
+      attempts: task.attempts.map(attempt => ({ ...attempt, origin: attempt.origin ?? { planId: plan.planId, authority: plan.authority } })),
+    })),
   });
 }
 export function serializePlan(plan: PlanSnapshot): string { validate(plan); return JSON.stringify(plan); }

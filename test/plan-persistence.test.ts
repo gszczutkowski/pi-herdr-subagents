@@ -131,6 +131,12 @@ test("registered tools execute bounded command API, not snapshot replacement", a
     events.get("session_start")!({ reason: "reload" }, ctx);
     const read = await tools.get("plan_read").execute("read", { taskId }, undefined, undefined, ctx);
     assert.equal(read.details.snapshot.revision, result.revision);
+    const detached = await invoke({ action: "detach", planId: created.planId, reason: "Independent branch" }, result.revision);
+    assert.notEqual(detached.planId, created.planId);
+    assert.notEqual(detached.authority.branchInstanceId, result.authority.branchInstanceId);
+    const competing = await Promise.allSettled(["A", "B"].map(title => invoke({ action: "add", planId: detached.planId, title }, detached.revision)));
+    assert.equal(competing.filter(item => item.status === "fulfilled").length, 1);
+    assert.equal(competing.filter(item => item.status === "rejected").length, 1);
   } finally {
     for (const [i, name] of ["PI_SUBAGENT_ID", "PI_SUBAGENT_SESSION"].entries()) { if (prior[i] === undefined) delete process.env[name]; else process.env[name] = prior[i]; }
     cleanup();

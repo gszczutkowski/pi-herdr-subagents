@@ -83,7 +83,7 @@ supervision; keep its session for manual recovery instead.
 `plan_read` reads the active branch's plan/revision; pass `taskId` for full
 criteria, attempts, results, evidence and decision history. `plan_update` takes
 `expectedRevision` and a discriminated `command`: `create`, `add`, `edit`,
-`attempt` (start/retry), `run`, `result`, `evidence`, `status`, or `accept`.
+`attempt` (start/retry), `run`, `result`, `evidence`, `status`, `accept`, or `detach`.
 Existing-plan commands also require `planId`. Criteria/artifact IDs are UUIDs.
 Results require their original `{ sessionId, branchInstanceId }` authority.
 Definition edits invalidate acceptance; acceptance requires evidence for every
@@ -103,6 +103,28 @@ Restored `in_progress` tasks stay unchanged and are reported as
 There is no automatic launch, acceptance, runtime result adapter, task panel or
 context injection here. Read/update commands do not restore runtime supervision.
 This is single-parent serialization, not multi-process CAS or an OS sandbox.
+
+### Branch and plan-change semantics
+
+- `/new` starts with no plan, even when the session header names a parent.
+- Reload/resume restores only the active branch snapshot. `/tree` reads its
+  selected point, not a later snapshot elsewhere in the physical session file.
+- Fork/clone copies the plan at the actual selected point. Its old authority
+  makes it foreign/read-only until `plan_update` with
+  `{ expectedRevision, command: { action: "detach", planId, reason } }`.
+- Historical `/tree` rollback is also read-only before a write: explicitly
+  detach first. This creates a new `planId` and `branchInstanceId`, preserves
+  chronological history, and records source plan/authority/revision/entry and
+  the reason. The source is never rewritten. Returning to an existing branch
+  restores its existing identity, not another automatic clone. Tree topology
+  detects abandoned futures; snapshot contents still come only from the active
+  `getBranch()` path. Detached alternatives do not take ownership of the source.
+- Inherited active attempts become blocked with an explanation. Their original
+  attempts/runs/results remain read-only; explicit retry creates a new attempt.
+  Result commands carry origin authority and cannot apply to the wrong branch.
+- Definition edits on an accepted task move it back to review and retain the
+  invalidated acceptance decision. Plan changes are commands, never replacement
+  snapshots. Detach does not launch, resume, or prove completion of any process.
 
 ## Development
 
