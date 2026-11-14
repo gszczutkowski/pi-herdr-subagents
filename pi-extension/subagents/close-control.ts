@@ -135,13 +135,13 @@ export async function closeOwnedChild(owner: SessionOwner, child: CloseChild, tr
     return current.kind === "absent" || !sameProcess(identity.process, current.identity);
   };
   const closed = async (): Promise<CloseResult> => {
-    // OS probes are synchronous (and slow on Windows). Yield one polling
-    // interval so in-flight supervision callbacks can observe the same exit;
-    // closure validation must tolerate their cleanup, not depend on starvation.
+    const remaining = audit(child.sessionFile);
+    // Both the death probe and owner audit block on Windows. Yield AFTER those
+    // OS reads so supervision can consume pending I/O before final validation;
+    // correctness must not depend on starving the normal cleanup callbacks.
     await new Promise(resolve => setTimeout(resolve, 50));
     if (transport.validateClosed) transport.validateClosed(identity.process);
     else transport.validate();
-    const remaining = audit(child.sessionFile);
     return { status: "closed", requestId: intent?.requestId, process: identity.process, remainingOwners: remaining.ownerCount,
       reason: remaining.ownerCount || remaining.uncertainCount ? "Original owned process exited; session still has other or unverified possible writers." : "Original owned process exited; no other CLI owners observed." };
   };

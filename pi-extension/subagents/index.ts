@@ -1978,8 +1978,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
       };
       const result: CloseResult = await closeOwnedChild(owner, child, { validate, validateClosed });
-      if (result.status === "closed") validateClosed(result.process);
-      else validate();
+      if (result.status === "closed") {
+        // Give the existing supervisor a bounded chance to retire this run.
+        // OS death is already proven; map cleanup is not itself exit evidence.
+        // Recheck every fence across these awaits and never touch replacements.
+        const deadline = Date.now() + 1500;
+        while (runningSubagents.get(child.id) === child && Date.now() < deadline) {
+          validateClosed(result.process);
+          await new Promise(resolve => setTimeout(resolve, 50));
+        }
+        validateClosed(result.process);
+      } else validate();
       if (result.status === "closed") {
         closedProcessReceipts.set(child.id, { id: child.id, name: child.name, result });
         // Bound read-only history across extension reload; no live ownership is evicted.
