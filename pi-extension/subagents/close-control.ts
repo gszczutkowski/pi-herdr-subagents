@@ -134,7 +134,11 @@ export async function closeOwnedChild(owner: SessionOwner, child: CloseChild, tr
     if (current.kind === "unverified") return undefined;
     return current.kind === "absent" || !sameProcess(identity.process, current.identity);
   };
-  const closed = (): CloseResult => {
+  const closed = async (): Promise<CloseResult> => {
+    // OS probes are synchronous (and slow on Windows). Yield one polling
+    // interval so in-flight supervision callbacks can observe the same exit;
+    // closure validation must tolerate their cleanup, not depend on starvation.
+    await new Promise(resolve => setTimeout(resolve, 50));
     if (transport.validateClosed) transport.validateClosed(identity.process);
     else transport.validate();
     const remaining = audit(child.sessionFile);

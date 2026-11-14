@@ -156,6 +156,19 @@ test("lease/branch loss after awaiting never reports closed and retains ownershi
   } finally { f.cleanup(); }
 });
 
+test("closure-phase yield still revalidates binding after original PID death", async () => {
+  const f = fixture();
+  try {
+    let bindingValid = true;
+    const closing = closeOwnedChild(f.owner, f.child, { ...f.transport,
+      probe: () => ({ kind: "absent" }),
+      validateClosed: () => { if (!bindingValid) throw new Error("closure branch/lease lost"); } });
+    bindingValid = false;
+    await assert.rejects(closing, /closure branch\/lease lost/);
+    assert.equal(readdirSync(f.control).some(name => name.endsWith(".request.json")), false);
+  } finally { f.cleanup(); }
+});
+
 test("child validates wrong run/process, busy state, immutable claims and replay; factory starts no watcher", async () => {
   const f = fixture();
   const env = { PI_SUBAGENT_ID: "run", PI_SUBAGENT_SESSION: f.child.sessionFile, PI_SUBAGENT_ACTIVITY_FILE: f.child.activityFile };

@@ -134,6 +134,9 @@ test("Windows missing launcher ancestry needs independent strict birth ordering,
 
 for (const scenario of ["watcher-cleanup", "wrong-branch-live", "replacement-live", "wrong-branch-after-exit", "replacement-after-exit"]) {
 test(`registered close ${scenario} preserves phase-specific ownership fences (Windows OS boundary)`, { skip: process.platform !== "win32" }, async () => fixture(async ({ tools, ctx, session, resume, reload }: any) => {
+  // Keep the independent pane supervisor idle. Only this test's explicit map
+  // removal models cleanup; unrelated pane-missing cleanup must not race it.
+  inspect = async pane => JSON.stringify({ result: { pane: { pane_id: pane, agent_status: "idle" } } });
   const started = await resume();
   const child = __test__.runningSubagents.get(started.details.id)!;
   const targetPid = 98765432;
@@ -152,7 +155,8 @@ test(`registered close ${scenario} preserves phase-specific ownership fences (Wi
     if (command.includes(`-Id ${targetPid} `)) return targetGone ? "null" : JSON.stringify({ pid: targetPid, birth: "2" });
     return JSON.stringify({ pid: process.pid, birth: "1" });
   };
-  const before = closed.length;
+  const targetCloses = () => closed.filter(surface => surface === child.surface).length;
+  const before = targetCloses();
   const closing = tools.get("subagent_close").execute("close", { id: child.id }, undefined, undefined, ctx);
   assert.ok(sessionOwners.get(session), "request itself never releases ownership");
   if (scenario === "watcher-cleanup") {
@@ -167,14 +171,15 @@ test(`registered close ${scenario} preserves phase-specific ownership fences (Wi
     targetGone = scenario.endsWith("after-exit");
     await assert.rejects(closing, /branch|ownership/);
     if (scenario.startsWith("replacement")) assert.equal(sessionOwners.get(session), replacement);
-    assert.equal(closed.length, before, "no terminal action on failed custody");
+    assert.equal(targetCloses(), before, "no terminal action on failed custody for this owned child");
     assert.equal(fs.readdirSync(dir).filter(name => name.endsWith(".request.json")).length, 1);
     return;
   }
   const result = await closing;
   assert.equal(result.details.status, "closed");
   assert.equal(sessionOwners.has(session), false);
-  assert.equal(closed.length, before, "explicit close never operates a terminal locator");
+  assert.equal(targetCloses(), before, "explicit close never operates this child's terminal locator");
+  child.abortController.abort(); // Test removed the map, so fixture shutdown cannot find this watcher.
   reload();
   assert.deepEqual((await tools.get("subagent_close").execute("again", { id: child.id }, undefined, undefined, ctx)).details, result.details);
 }));
