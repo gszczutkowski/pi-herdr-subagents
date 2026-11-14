@@ -70,6 +70,7 @@ test("registered tools and native store update the widget without model messages
       }
       if (status === "skipped" || status === "cancelled") mutate((p, c) => store[status === "skipped" ? "skip" : "cancel"](p, c, id, "Explicit"));
     }
+    await f.commands.get("plan-view").handler("full", f.ctx);
     const output = f.readWidget();
     assert.match(output, /1\/8 accepted/);
     assert.match(output, /Role\/owner: worker/);
@@ -77,6 +78,34 @@ test("registered tools and native store update the widget without model messages
     for (const task of plan.tasks) assert.ok(output.includes(`| ${task.status} |`));
     await assert.rejects(() => f.update({ action: "add", planId: plan.planId, title: "Conflict" }, 0), /Revision conflict/);
     assert.equal(f.readWidget(), output);
+  } finally { f.cleanup(); }
+});
+
+test("registered plan-view command expands long plans without checklist state or writes", async () => {
+  const f = fixture();
+  try {
+    assert.deepEqual([...f.commands.keys()], ["plan-view"]); // Existing /plan is not replaced.
+    let plan = f.p.create(f.sm, 0, "Long plan");
+    for (let i = 1; i <= 30; i++) plan = f.p.mutate(f.sm, plan.planId, plan.revision, (p, c) => store.addTask(p, c, `Task ${i} 界`));
+    const leaf = f.sm.getLeafId();
+    assert.match(f.readWidget(), /24 more tasks/);
+    assert.doesNotMatch(f.readWidget(), /T30 /);
+    for (const mode of ["expand", "full"]) {
+      await f.commands.get("plan-view").handler(mode, f.ctx);
+      assert.match(f.readWidget(), /T30 Task 30/);
+      assert.match(f.readWidget(), /0\/30 accepted/);
+      assert.equal(f.sm.getLeafId(), leaf);
+    }
+    const factory = f.widgets.get(PLAN_WIDGET);
+    const component = factory({}, { fg: (_: string, text: string) => text });
+    for (const width of [1, 12, 40, 120]) for (const line of component.render(width)) assert.ok(visibleWidth(line) <= width);
+    await f.commands.get("plan-view").handler("compact", f.ctx);
+    assert.match(f.readWidget(), /24 more tasks/);
+    await f.commands.get("plan-view").handler("", f.ctx);
+    assert.match(f.readWidget(), /T30 Task 30/);
+    await f.commands.get("plan-view").handler("invalid", f.ctx);
+    assert.match(f.notices.at(-1)!, /Usage/);
+    assert.deepEqual(f.p.read(f.sm).snapshot, plan);
   } finally { f.cleanup(); }
 });
 

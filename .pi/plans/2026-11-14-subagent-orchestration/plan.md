@@ -164,7 +164,9 @@ Weryfikacja Panel 1: `plan-view.ts` jest czystą projekcją magazynu; natywny wi
 
 Weryfikacja Panel 2: osobny klucz widgetu `subagent-plan`, wiersze wyłącznie z trwałego store (bez runtime map). Regresja wywołuje rzeczywistą ścieżkę `observeSubagentCompletion(supervisionEnded)`: usunięcie ostatniego agenta i wyczyszczenie widgetu procesów nie usuwa zadań in_review/accepted/failed/skipped/cancelled. Odczyt po ponownym otwarciu sesji z dysku zachowuje identyczny plan i licznik 1/5; exit nie akceptuje zadania. Focused panel 4/4; bez live herdr.
 - [ ] Zachować blokadę i jej przyczynę po `caller_ping`.
-- [ ] Dla długich planów udostępnić skrót oraz rozwijaną pełną listę.
+- [x] Dla długich planów udostępnić skrót oraz rozwijaną pełną listę.
+
+Weryfikacja Panel 4: domyślnie sześć zadań i liczba ukrytych, licznik accepted zawsze dla całego planu. `/plan-view expand|full|compact` oraz przełączanie bez argumentu zmieniają tylko prezentację; istniejący `/plan` pozostaje bez zmian. Test z 30 zadaniami, rzeczywiste komendy, brak nowych wpisów sesji/rewizji, resize 1–120 kolumn. Panel 5/5, lint OK; bez live herdr.
 - [ ] Udostępnić szczegóły zadania: kryteria, próby, wyniki, testy, decyzje i odnośniki do sesji.
 
 Przykład:
