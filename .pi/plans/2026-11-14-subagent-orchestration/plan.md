@@ -85,7 +85,7 @@ Weryfikacja R3: `test/delivery.test.ts` obejmuje wspólną ścieżkę settlement
 - [x] Odrzucać resume sesji, która ma już aktywnego właściciela.
 - [ ] Rozróżnić kontynuowanie żywego dziecka po interrupt od uruchomienia zamkniętej sesji.
 - [x] Powiązać completion z konkretnym uruchomieniem, nie wyłącznie ze ścieżką JSONL.
-- [ ] Współdzielić profil uruchomienia między spawn i resume: rola, katalog, ograniczenia narzędzi i pozostała konfiguracja.
+- [x] Współdzielić profil uruchomienia między spawn i resume: rola, katalog, ograniczenia narzędzi i pozostała konfiguracja.
 - [ ] Dodać regresje interrupt → resume oraz równoczesnego resume tej samej sesji.
 
 Akceptacja: nie powstają dwa procesy zapisujące ten sam plik sesji i konkurujące o wspólny completion sidecar.

@@ -6,11 +6,12 @@ import { ACTIVE_ACCENT, OPEN_ACCENT, borderLine, borderTop, borderBottom, framed
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { resolveSubagentCwd } from "./paths.ts";
+import { persistLaunchProfile, readPiLaunchProfile, resolveLaunchProfile, resumeLaunchContext } from "./launch-profile.ts";
+import type { SubagentLaunchContext } from "./harness/types.ts";
 import { fileURLToPath } from "node:url";
 import {
   readdirSync,
   readFileSync,
-  writeFileSync,
   existsSync,
   mkdirSync,
 } from "node:fs";
@@ -1175,7 +1176,7 @@ async function launchSubagent(
   const sessionId = ctx.sessionManager.getSessionId();
   const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
 
-  const { effectiveCwd, localAgentDir, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs);
+  const { effectiveCwd, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs);
   const targetCwdForSession = effectiveCwd ?? ctx.cwd;
   const sessionDir = getDefaultSessionDirFor(targetCwdForSession, effectiveAgentDir);
 
@@ -1233,7 +1234,7 @@ async function launchSubagent(
   const roleBlock = identity && !identityInSystemPrompt ? `\n\n${identity}` : "";
   const effectiveModel = driver.formatModel(runtimePlan);
 
-  const built = driver.buildCommand({
+  const launchContext: SubagentLaunchContext = {
     params: { ...params, id },
     agentDefs,
     runtimePlan,
@@ -1244,8 +1245,8 @@ async function launchSubagent(
     artifactDir,
     sessionDir,
     subagentSessionFile,
-    effectiveCwd,
-    localAgentDir,
+    effectiveCwd: targetCwdForSession,
+    localAgentDir: effectiveAgentDir,
     effectiveAutoExit,
     effectiveInteractive,
     inheritsConversationContext,
@@ -1259,7 +1260,11 @@ async function launchSubagent(
     summaryInstruction,
     subagentsDir: SUBAGENTS_DIR,
     shellQuote,
-  });
+  };
+  launchContext.launchProfile = resolveLaunchProfile(launchContext, driver.id,
+    buildSubagentToolAllowlist(params.tools ?? agentDefs?.tools));
+  persistLaunchProfile(launchContext.launchProfile);
+  const built = driver.buildCommand(launchContext);
 
   const launchScriptName = `${(params.name || "subagent")
     .toLowerCase()
@@ -1850,7 +1855,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         autoExit: Type.Optional(
           Type.Boolean({
             description:
-              "Whether the resumed session should automatically exit after completing its response. Defaults to true for autonomous follow-up work; set false for interactive resumed sessions.",
+              "Must match the saved launch profile if specified. Omit to preserve the original autoExit/interactivity behavior.",
           }),
         ),
       }),
@@ -1887,7 +1892,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
         params.sessionPath = canonicalSessionPath(params.sessionPath, ctx.cwd);
         const name = params.name ?? "Resume";
-        const { autoExit, interactive } = resolveResumeLaunchBehavior(params);
+        // Fail closed before reading history (in particular foreign harness transcripts).
+        const profile = readPiLaunchProfile(params.sessionPath);
+        if (params.autoExit !== undefined && params.autoExit !== profile.autoExit) {
+          throw new Error("Resume must preserve the saved autoExit/interactivity profile. Start a new subagent to change it.");
+        }
+        const interactive = profile.interactive;
         const startTime = Date.now();
         const id = randomUUID();
 
@@ -1919,51 +1929,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
         await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
 
-        // Build pi resume command
-        const parts = ["pi", "--session", shellQuote(params.sessionPath)];
-
-        // Load subagent-done extension so the agent can self-terminate if needed
-        const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
-        parts.push("-e", shellQuote(subagentDonePath));
-
         const sessionId = ctx.sessionManager.getSessionId();
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
         const activityFile = getSubagentActivityFile(artifactDir, id);
         mkdirSync(dirname(activityFile), { recursive: true });
-
-        let resumeMsgFile: string | undefined;
-        if (params.message) {
-          const msgTimestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-          resumeMsgFile = join(
-            artifactDir,
-            "subagent-resume",
-            `${name
-              .toLowerCase()
-              .replace(/[^a-z0-9\s-]/g, "")
-              .replace(/\s+/g, "-")
-              .replace(/-+/g, "-")
-              .replace(/^-|-$/g, "") || "resume"}-${msgTimestamp}-${id}.md`,
-          );
-          mkdirSync(dirname(resumeMsgFile), { recursive: true });
-          writeFileSync(resumeMsgFile, params.message, "utf8");
-          parts.push(shellQuote(`@${resumeMsgFile}`));
-        }
-
-        // Build env prefix — propagate PI_CODING_AGENT_DIR for config isolation
-        const resumeEnvParts: string[] = [];
-        if (process.env.PI_CODING_AGENT_DIR) {
-          resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellQuote(process.env.PI_CODING_AGENT_DIR)}`);
-        }
-        resumeEnvParts.push(`PI_SUBAGENT_NAME=${shellQuote(name)}`);
-        resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellQuote(params.sessionPath)}`);
-        resumeEnvParts.push(`PI_SUBAGENT_ID=${shellQuote(id)}`);
-        resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`);
-        if (autoExit) {
-          resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
-        }
-        const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
-
-        const command = `${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_${id}_'$?'__'`;
+        const built = getHarnessDriver("pi").buildCommand(resumeLaunchContext(profile, {
+          id, name, message: params.message, surface, artifactDir,
+          subagentsDir: SUBAGENTS_DIR, shellQuote,
+        }));
         const launchScriptFile = join(
           artifactDir,
           "subagent-scripts",
@@ -1976,15 +1949,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         );
         owner.surface = surface;
         owner.dispatched = true;
-        runScriptInPane(surface, command, {
+        runScriptInPane(surface, built.command, {
           scriptPath: launchScriptFile,
-          scriptPreamble: [
-            `# Subagent resume script for ${name}`,
-            `# Generated: ${new Date().toISOString()}`,
-            `# Session: ${params.sessionPath}`,
-            `# Surface: ${surface}`,
-            ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
-          ].join("\n"),
+          scriptPreamble: built.launchScriptPreamble?.join("\n"),
         });
 
         // Register as a running subagent for widget tracking
@@ -1998,7 +1965,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           launchScriptFile,
           activityFile,
           interactive,
-          runtimePlan: undefined,
+          agent: profile.role ?? undefined,
+          cli: "pi",
+          runtimePlan: profile.runtimePlan,
           completionRunId: id,
           lifecycle: createLifecycle(startTime),
         };
