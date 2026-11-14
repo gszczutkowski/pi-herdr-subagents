@@ -19,6 +19,7 @@ test("spawn and closed-session resume durably record intent before terminal disp
   let closes = 0;
   mock.method(childProcess, "execSync", () => "herdr");
   mock.method(childProcess, "execFileSync", (_command: any, args: string[]) => {
+    if (_command === "powershell.exe") return "[]";
     if (args[0] === "tab" && args[1] === "create") return JSON.stringify({ result: { root_pane: { pane_id: `pane-${++serial}` } } });
     if (args[1] === "close") closes++;
     if (args[1] === "run") {

@@ -24,6 +24,7 @@ mock.method(fs, "writeFileSync", (path: any, ...args: any[]) => {
 });
 mock.method(childProcess, "execSync", () => "herdr");
 mock.method(childProcess, "execFileSync", (_command: any, args: any) => {
+  if (_command === "powershell.exe") return "[]";
   if (args[0] === "tab" && args[1] === "create") {
     return JSON.stringify({ result: { root_pane: { pane_id: `child-${++serial}` } } });
   }
@@ -92,7 +93,7 @@ async function fixture(run: (f: any) => Promise<void>) {
   };
   const resume = (params = {}) => tools.get("subagent_resume").execute("call", { sessionPath: session, ...params }, undefined, undefined, ctx);
   const interrupt = (id: string) => tools.get("subagent_interrupt").execute("interrupt", { id }, undefined, undefined, ctx);
-  try { await run({ dir, session, ctx, resume, interrupt, handoffs,
+  try { await run({ dir, session, ctx, tools, resume, interrupt, handoffs,
     start: () => handlers.get("session_start")({ reason: "reload" }, ctx),
     shutdown: () => handlers.get("session_shutdown")({ reason: "reload" }, ctx),
     reload: () => { extension(api); handlers.get("session_start")({ reason: "reload" }, ctx); },
@@ -113,6 +114,18 @@ async function until(predicate: () => boolean) {
   const deadline = Date.now() + 4000;
   while (!predicate()) { assert.ok(Date.now() < deadline, "condition timed out"); await pause(); }
 }
+
+test("registered audit is read only and accepts a path or an owned selector", async () => fixture(async ({ tools, ctx, session, resume }: any) => {
+  const audit = tools.get("subagent_audit");
+  assert.ok(audit);
+  const before = serial;
+  const result = await audit.execute("audit", { sessionPath: session }, undefined, undefined, ctx);
+  assert.equal(result.details.status, "clear");
+  assert.equal(serial, before);
+  await assert.rejects(audit.execute("audit", { sessionPath: session, id: "other" }, undefined, undefined, ctx), /OR/);
+  const started = await resume();
+  assert.equal((await audit.execute("audit", { id: started.details.id }, undefined, undefined, ctx)).details.sessionPath, session);
+}));
 
 test("registered interrupt/resume preserves the live run and watcher; concurrent continuation has one winner", async () => fixture(async ({ session, resume, interrupt }: any) => {
   const started = await resume();

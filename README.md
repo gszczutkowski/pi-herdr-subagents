@@ -560,6 +560,12 @@ For an owned, tracked Pi child interrupted with Escape, resume continues the **s
 
 A durable claim, separate from the immutable acceptance/rejection acknowledgement, deduplicates requests across reloads. These artifacts share the local OS/filesystem trust boundary; they do not authenticate against a malicious same-user process. A transport timeout or ambiguous dispatch returns `pending`, retains the in-flight reservation and never starts a replacement process; do not retry that continuation. This is a conservative synchronous API-dispatch acknowledgement, not proof that the provider processed the prompt. Unowned closed Pi sessions still use the saved-profile launch path. The same guarded transport supports tracked keep-open children after their completed turn and settled-idle acknowledgement.
 
+### Read-only session process audit
+
+`subagent_audit({sessionPath: "/absolute/path/child.jsonl"})` reports OS-visible Pi CLI owners of the canonical file, including symlink aliases. Alternatively supply an owned `id` or exact `name` (not both selectors). Output is bounded to 32 PID + process-birth identities; command lines and credentials are never returned. Multiple owners report `duplicate`; denied enumeration, unresolved relative paths/UUID selectors and unsupported platforms report uncertainty, never an empty safe result. Windows and Linux are supported. This is a point-in-time CLI audit, not a global lock: manual session switches inside Pi and writers that do not explicitly select `--session` are outside its coverage.
+
+Resume audits before terminal/task writes and again after asynchronous inspection. A sole matching tracked live owner may continue; untracked/duplicate or unverified writers block relaunch with manual cleanup guidance. Three legacy Pi instances may legitimately be found sharing a file after old resumes: audit does **not** close them automatically. Completion is not process exit, and `close:false` remains intentional. No stale PID, idle state or model claim authorizes termination.
+
 ### Nonclosing question/progress channel: considered and deferred
 
 A dedicated nonclosing question channel could preserve a worker's pane while the parent decides, but it is **not implemented**. `caller_ping` still exits; it must not be advertised as a pause-and-wait tool. Ordinary progress belongs in the existing panel, not a new tool or wakeup protocol.

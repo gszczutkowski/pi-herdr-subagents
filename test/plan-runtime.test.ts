@@ -42,6 +42,7 @@ test("registered task-bound spawn, live/closed resume, failure isolation and res
   let savedContract: any;
   mock.method(childProcess, "execSync", () => "herdr");
   mock.method(childProcess, "execFileSync", (_command: any, args: string[]) => {
+    if (_command === "powershell.exe") return "[]";
     if (args[0] === "tab" && args[1] === "create") return JSON.stringify({ result: { root_pane: { pane_id: `pane-${++serial}` } } });
     if (args[1] === "run" && !args.some(a => a.includes("/_subagent_continue"))) {
       dispatches++;

@@ -8,6 +8,8 @@ import { randomUUID } from "node:crypto";
 import { resolveSubagentCwd } from "./paths.ts";
 import { persistLaunchProfile, persistProfileBinding, readPiLaunchProfile, resolveLaunchProfile, resumeLaunchContext } from "./launch-profile.ts";
 import { continueLiveChild } from "./live-continuation.ts";
+import { auditSession, assertSessionWriters } from "./session-audit.ts";
+import { readChildIdentity } from "./recovery-identity.ts";
 import { prepareLaunchRun, registerLaunchedRun } from "./launch-registration.ts";
 import { createLineage, type Lineage } from "./lineage.ts";
 import { recordHistory, registerPlanHistory } from "./history.ts";
@@ -1916,6 +1918,31 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
 
 
+  if (shouldRegister("subagent_audit")) pi.registerTool({
+    name: "subagent_audit", label: "Audit Subagent Session",
+    description: "Read-only OS audit of Pi CLI processes explicitly selecting one canonical session. Supply sessionPath OR owned id/name. Returns at most 32 PID/birth identities, never command lines. Uncertain is not safe; no automatic cleanup.",
+    parameters: Type.Object({ sessionPath: Type.Optional(Type.String()), id: Type.Optional(Type.String()), name: Type.Optional(Type.String()) }),
+    async execute(_id, params, _signal, _update, ctx) {
+      if (params.sessionPath && (params.id || params.name)) throw new Error("Supply sessionPath OR owned id/name");
+      let path = params.sessionPath;
+      if (!path) {
+        const target = resolveInterruptTarget(params);
+        if ("error" in target) throw new Error(target.error);
+        path = target.running.sessionFile;
+      }
+      const audit = auditSession(canonicalSessionPath(path, ctx.cwd));
+      return { content: [{ type: "text", text: JSON.stringify(audit) }], details: audit };
+    },
+  });
+
+  function assertResumeWriters(path: string): void {
+    const owner = sessionOwners.get(path);
+    const child = owner && runningSubagents.get(owner.runId);
+    const identity = child && child.cli === "pi" && child.lifecycle.process.kind === "running"
+      ? readChildIdentity(path, child.id)?.process : undefined;
+    assertSessionWriters(auditSession(path), identity);
+  }
+
   // ── subagent_resume tool ──
   if (shouldRegister("subagent_resume"))
     pi.registerTool({
@@ -1993,6 +2020,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
         if (runtime.recoveryError) throw new Error(runtime.recoveryError);
         runtime.store?.assertCustody();
+        assertResumeWriters(params.sessionPath);
         const previousOwner = sessionOwners.get(params.sessionPath);
         if (previousOwner?.surface) {
           const inspection = await inspectPane(previousOwner.surface);
@@ -2001,6 +2029,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             releaseSession(params.sessionPath, previousOwner.runId);
           }
         }
+        assertResumeWriters(params.sessionPath);
         const liveOwner = sessionOwners.get(params.sessionPath);
         if (liveOwner && runningSubagents.has(liveOwner.runId)) {
           const child = runningSubagents.get(liveOwner.runId)!;
@@ -2011,6 +2040,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           const result = await continueLiveChild(liveOwner, child, continuationParams, { inspect: inspectPane, beforeSend: () => {
             if (runtime.treeSuspension || child.terminalActionsAllowed === false) throw new Error("Terminal custody was detached during continuation");
             child.durableStore?.assertCustody();
+            assertResumeWriters(params.sessionPath);
             // Validate after async inspection, immediately before dispatch.
             child.planTask = bindPlanRun(runtime.plans!, ctx, child.id, params.planTask, child.planTask);
             if (child.planTask) {
@@ -2068,6 +2098,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           setPaneTask(surface, params.message);
         }
         await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+        store?.assertCustody();
+        if (sessionOwners.get(params.sessionPath) !== owner) throw new Error("Session ownership changed during launch preparation");
+        assertResumeWriters(params.sessionPath);
 
         const sessionId = ctx.sessionManager.getSessionId();
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
@@ -2092,6 +2125,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           launchScriptFile, profile: resumeProfile, lineage: resumeProfile.lineage, entryCountBefore });
         runScriptInPane(surface, built.command, {
           onDispatch: () => {
+            assertResumeWriters(params.sessionPath);
             if (planTask) bindPlanRun(runtime.plans!, ctx, id, undefined, planTask);
             store?.phase(id, "dispatch-intent"); owner.dispatched = true;
           },

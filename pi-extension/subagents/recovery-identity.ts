@@ -67,6 +67,17 @@ export function registerRecoveryIdentity(pi: ExtensionAPI): void {
   pi.on("session_shutdown", stop);
 }
 
+export function readChildIdentity(sessionFile: string, runId: string): ChildIdentity | undefined {
+  try {
+    const identity: ChildIdentity = read(`${runCompletionFile(sessionFile, runId)}.identity.json`);
+    const header = JSON.parse(readFileSync(sessionFile, "utf8").split(/\r?\n/)[0]);
+    if (identity.schema !== 1 || identity.runId !== runId || identity.sessionFile !== canonicalSessionPath(sessionFile) ||
+        header.type !== "session" || header.id !== identity.headerId || !identity.nonce ||
+        !Number.isSafeInteger(identity.process?.pid) || !identity.process.birth) return undefined;
+    return identity;
+  } catch { return undefined; }
+}
+
 export type ChildVerification = "verified-live" | "exited" | "unverified";
 export async function verifyRecoveryChild(
   sessionFile: string, runId: string, generation: string, stillCurrent: () => boolean,
