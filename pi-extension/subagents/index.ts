@@ -4,6 +4,7 @@ import { Type, type Static } from "@sinclair/typebox";
 import { Box, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { ACTIVE_ACCENT, OPEN_ACCENT, borderLine, borderTop, borderBottom, framedMessage } from "./frame.ts";
 import { dirname, join } from "node:path";
+import { randomUUID } from "node:crypto";
 import { resolveSubagentCwd } from "./paths.ts";
 import { fileURLToPath } from "node:url";
 import {
@@ -1061,7 +1062,7 @@ async function launchSubagent(
   options?: { surface?: string },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
-  const id = Math.random().toString(16).slice(2, 10);
+  const id = randomUUID();
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
   if (!ctx.model) throw new Error("Subagent launch requires a resolved parent model");
@@ -1862,7 +1863,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const name = params.name ?? "Resume";
         const { autoExit, interactive } = resolveResumeLaunchBehavior(params);
         const startTime = Date.now();
-        const id = Math.random().toString(16).slice(2, 10);
+        const id = randomUUID();
 
         if (!isTerminalAvailable()) {
           return muxUnavailableResult();
@@ -1909,7 +1910,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               .replace(/[^a-z0-9\s-]/g, "")
               .replace(/\s+/g, "-")
               .replace(/-+/g, "-")
-              .replace(/^-|-$/g, "") || "resume"}-${msgTimestamp}.md`,
+              .replace(/^-|-$/g, "") || "resume"}-${msgTimestamp}-${id}.md`,
           );
           mkdirSync(dirname(resumeMsgFile), { recursive: true });
           writeFileSync(resumeMsgFile, params.message, "utf8");
@@ -1939,7 +1940,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             .replace(/[^a-z0-9\s-]/g, "")
             .replace(/\s+/g, "-")
             .replace(/-+/g, "-")
-            .replace(/^-|-$/g, "") || "resume"}-resume-${Date.now()}.sh`,
+            .replace(/^-|-$/g, "") || "resume"}-resume-${id}.sh`,
         );
         runScriptInPane(surface, command, {
           scriptPath: launchScriptFile,

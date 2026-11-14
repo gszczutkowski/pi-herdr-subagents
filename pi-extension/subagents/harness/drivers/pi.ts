@@ -103,7 +103,7 @@ export class PiHarnessDriver implements HarnessDriver {
         .replace(/\s+/g, "-")
         .replace(/-+/g, "-")
         .replace(/^-|-$/g, "");
-      const syspromptPath = join(artifactDir, `context/${spSafeName || "subagent"}-sysprompt-${spTimestamp}.md`);
+      const syspromptPath = join(artifactDir, `context/${spSafeName || "subagent"}-sysprompt-${spTimestamp}-${params.id}.md`);
       mkdirSync(dirname(syspromptPath), { recursive: true });
       writeFileSync(syspromptPath, identity, "utf8");
       parts.push(flag, shellQuote(syspromptPath));
@@ -153,7 +153,7 @@ export class PiHarnessDriver implements HarnessDriver {
         .replace(/\s+/g, "-")
         .replace(/-+/g, "-")
         .replace(/^-|-$/g, "");
-      const artifactName = `context/${safeName || "subagent"}-${timestamp}.md`;
+      const artifactName = `context/${safeName || "subagent"}-${timestamp}-${params.id}.md`;
       const artifactPath = join(artifactDir, artifactName);
       mkdirSync(dirname(artifactPath), { recursive: true });
       writeFileSync(artifactPath, fullTask, "utf8");
