@@ -294,7 +294,9 @@ Weryfikacja: wspólne `prepareLaunchRun`/`registerLaunchedRun` w obu produkcyjny
 - [x] Określić jedno miejsce zatwierdzania zmian zadania; dzieci zgłaszają wyniki zamiast niezależnie nadpisywać wspólny stan.
 
 Weryfikacja: audyt `plan-tools`/`plan-runtime` → ta sama instancja `PlanPersistence.mutate`, prywatny append snapshotów; nie znaleziono luki wymagającej drugiego store. `architecture-authority.test.ts` obserwuje rzeczywistą granicę narzędzi/importów, sprawdza odrzucenie child tool/import, stale revision, historical branch i starego authority z niezmienionymi bajtami pliku; wynik → review, nie accept. Focused authority/persistence/branches/runtime: 14/14, zero skip, w tym rzeczywisty lifecycle Pi z kontrolowanym providerem; lint exit 0. Granice i brak cross-process CAS/OS sandbox opisuje `ARCHITECTURE.md`.
-- [ ] Użyć natywnych mechanizmów Pi do widgetów i zapisów sesji tam, gdzie wystarczą; trwały transport wyników traktować oddzielnie od prezentacji.
+- [x] Użyć natywnych mechanizmów Pi do widgetów i zapisów sesji tam, gdzie wystarczą; trwały transport wyników traktować oddzielnie od prezentacji.
+
+Weryfikacja: `ARCHITECTURE.md` opisuje native custom plan entries/getBranch, widget oraz request-time context oddzielnie od RuntimeStore/outbox. Nowy integration regression `architecture-presentation.test.ts` łączy native storage, zarejestrowane UI/context, runtime import i trwałą dostawę: wyjątek send zachowuje accepted; refresh/render/reload/tree nie zmieniają bajtów obu store, outbox, append ani powiadomień; widget można odrzucić i odtworzyć z aktywnej gałęzi po reopen. Focused presentation/view/context/delivery/execute/capabilities: 36/36, zero skip; lint exit 0. Pełna enumeracja npm sekwencyjnie: 420/439, zero skip, wyłącznie 19 błędów bazowych (18 Python/Claude, 1 CRLF release). Bez live herdr; brak obietnic exactly-once, cross-process CAS czy OS sandbox.
 
 ## 8. Kolejność i mierzalne efekty
 

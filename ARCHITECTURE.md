@@ -58,3 +58,39 @@ storage after stale revision, child tool/import, historical branch and original
 binding rejection. Native detach/reopen verifies the selected branch, not the
 physical JSONL tail. Existing lifecycle tests use model-issued tools through Pi's
 real session bindings with a controlled provider (no live herdr/provider claim).
+
+## Native Pi persistence and presentation, separate delivery
+
+The active native `SessionManager.getBranch()` selects plan snapshots appended as
+custom `pi-subagents-plan/v1` session entries. Custom entries are state, not model
+messages. Widget factories (`ctx.ui.setWidget`) and `/plan-view` are disposable
+projections of `PlanPersistence`; neither the widget cache nor the JSONL physical
+tail is authoritative. `plan-context.ts` separately projects the same selected
+snapshot at the request-time `context` hook, including after compaction. It does
+not append entries or send messages to refresh context.
+
+`delivery.ts` and `RuntimeStore` retain immutable result envelopes, event cursors,
+retry/uncertain handoff state and tombstones outside presentation. Transport can
+fail while task acceptance remains durable, and widget/context refresh must not
+retry transport, enqueue events, append snapshots, notify or wake the model.
+A normal return from Pi's void `sendMessage` means synchronous handoff only, not
+exactly-once delivery or an acknowledgement of durable model consumption.
+
+`test/architecture-presentation.test.ts` composes registered native UI/context,
+real SessionManager storage, parent commands, runtime import and durable outbox.
+It injects a handoff failure, proves accepted state survives, byte-checks both
+stores across refresh/render/reload/tree, discards the widget, reopens storage and
+selects an earlier native branch. Transport retry changes only outbox state.
+The Pi host UI/transport boundary is mocked; no live terminal/model is claimed.
+Installed Pi references: `docs/extensions.md`, `docs/session-format.md` and
+`examples/extensions/widget-placement.ts` (read before this boundary work).
+
+## Verification limits
+
+Section 7 boundary work: discovery + existing tests 185/185; launch/ownership/
+profile/continuation/keep-open 31/31; authority/persistence/branches/runtime 14/14;
+presentation/view/context/delivery/execute/capabilities 36/36. Lint passes with no
+warnings. Final sequential execution of every file explicitly enumerated by
+`npm test`: 420/439 pass, zero skip; 18 existing missing-Python/Claude-hook failures
+and one existing CRLF release-workflow regex failure. No live herdr, external
+provider, OS isolation or cross-process storage-CAS verification was performed.

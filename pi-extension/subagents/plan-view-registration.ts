@@ -4,7 +4,9 @@ import { renderPlan } from "./plan-view.ts";
 
 export const PLAN_WIDGET = "subagent-plan";
 
-/** Presentation only; never appends entries, sends messages, or starts a model turn. */
+/** Native Pi presentation only; active-branch PlanPersistence is authoritative.
+ * Clearing/rebuilding this widget cannot change task or durable outbox state.
+ * Never appends entries, sends messages, or starts a model turn. */
 export function registerPlanView(pi: ExtensionAPI, persistence: PlanPersistence) {
   let latest: ExtensionContext | undefined;
   let expanded = false;
