@@ -8,6 +8,7 @@ import { randomUUID } from "node:crypto";
 import { resolveSubagentCwd } from "./paths.ts";
 import { persistLaunchProfile, readPiLaunchProfile, resolveLaunchProfile, resumeLaunchContext } from "./launch-profile.ts";
 import { continueLiveChild } from "./live-continuation.ts";
+import { RuntimeStore } from "./runtime-store.ts";
 import type { SubagentLaunchContext } from "./harness/types.ts";
 import { fileURLToPath } from "node:url";
 import {
@@ -571,6 +572,7 @@ interface SubagentResult {
  * State for a launched (but not yet completed) subagent.
  */
 interface RunningSubagent {
+  durableStore?: RuntimeStore;
   id: string;
   name: string;
   task: string;
@@ -611,6 +613,7 @@ interface RunningSubagent {
 }
 
 interface SubagentRuntime {
+  store?: RuntimeStore;
   runningSubagents: Map<string, RunningSubagent>;
   pi?: ExtensionAPI;
   latestCtx?: ExtensionContext;
@@ -628,6 +631,36 @@ const runtime: SubagentRuntime =
   (globalThis as any)[RUNTIME_KEY] ??
   ((globalThis as any)[RUNTIME_KEY] = createSubagentRuntime());
 const runningSubagents = runtime.runningSubagents;
+
+/** Lazily establish branch custody before any child dispatch. */
+function durableStoreFor(ctx: ExtensionContext): RuntimeStore | undefined {
+  // Legacy host/test adapters cannot claim durable recovery support.
+  if (typeof ctx.sessionManager.getHeader !== "function" || typeof ctx.sessionManager.getBranch !== "function") return undefined;
+  if (runtime.store) {
+    runtime.store.assertCustody();
+    return runtime.store;
+  }
+  const sessionFile = ctx.sessionManager.getSessionFile();
+  const header = ctx.sessionManager.getHeader();
+  if (!sessionFile || !header?.id) throw new Error("Durable supervision requires a saved parent session");
+  let checkpoint = ctx.sessionManager.getBranch().findLast((entry) => entry.type === "custom" && entry.customType === "subagent-custody");
+  if (!checkpoint) {
+    const branchToken = randomUUID();
+    runtime.pi?.appendEntry("subagent-custody", { branchToken });
+    checkpoint = ctx.sessionManager.getBranch().findLast((entry) => entry.type === "custom" && entry.customType === "subagent-custody");
+  }
+  if (checkpoint?.type !== "custom" || typeof (checkpoint.data as any)?.branchToken !== "string") {
+    throw new Error("Could not persist branch custody checkpoint");
+  }
+  const store = new RuntimeStore(join(getArtifactDir(ctx.sessionManager.getSessionDir(), header.id), "subagent-runtime"), {
+    sessionFile: canonicalSessionPath(sessionFile), headerId: header.id,
+    branchToken: (checkpoint.data as any).branchToken, checkpoint: checkpoint.id,
+  });
+  runtime.store = store;
+  delivery.store = store;
+  return store;
+}
+
 const delivery = runtime.delivery ??= createDeliveryState();
 delivery.handedOff ??= new Set();
 
@@ -1209,6 +1242,7 @@ async function launchSubagent(
   ].join("-");
   const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
 
+  const store = durableStoreFor(ctx);
   const owner = reserveSession(subagentSessionFile, id);
   try {
   const surfacePreCreated = !!options?.surface;
@@ -1292,8 +1326,12 @@ async function launchSubagent(
     .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
 
+  store?.prepare({ id, name: params.name, task: params.task, startTime,
+    sessionFile: canonicalSessionPath(built.sessionFile ?? subagentSessionFile),
+    surface, cli: built.cli, activityFile, sentinelFile: built.sentinelFile,
+    launchScriptFile, profile: launchContext.launchProfile });
   runScriptInPane(surface, built.command, {
-    onDispatch: () => { owner.dispatched = true; },
+    onDispatch: () => { store?.phase(id, "dispatch-intent"); owner.dispatched = true; },
     scriptPath: launchScriptFile,
     scriptPreamble: (built.launchScriptPreamble ?? [
       `# Subagent launch script for ${params.name}`,
@@ -1302,7 +1340,9 @@ async function launchSubagent(
     ]).join("\n"),
   });
 
+  store?.phase(id, "supervised");
   const running: RunningSubagent = {
+    durableStore: store,
     id,
     name: params.name,
     task: params.task,
@@ -1351,6 +1391,8 @@ async function watchSubagent(
       intervalMs: 1000,
       sessionFile,
       runId: running.completionRunId,
+      retainedEventIds: running.durableStore
+        ? () => running.durableStore!.snapshot().runs[running.id].eventCursor : undefined,
       sentinelFile: running.sentinelFile,
       readTerminalTail: () => readPaneAsync(surface, 5),
       inspectPane: async () => inspectPane(surface),
@@ -1515,6 +1557,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   // subagents whose watchers survived a reload.
   pi.on("session_start", (_event, ctx) => {
     runtime.latestCtx = ctx;
+    runtime.pi = pi;
     delivery.api = pi;
     flushDeliveries(delivery);
     runtime.modelCatalog = buildAuthenticatedModelCatalog(
@@ -1557,6 +1600,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     }
 
     cleanupSubagentsForShutdown((event as any).reason, runningSubagents);
+    if (!shouldPreserveSubagentsOnShutdown((event as any).reason) && runtime.store) {
+      runtime.store.close();
+      runtime.store = undefined;
+      delivery.store = undefined;
+    }
     if (!shouldPreserveSubagentsOnShutdown((event as any).reason)) {
       for (const entry of delivery.pending.values()) {
         entry.owner.lifecycle = markDelivery(entry.owner.lifecycle, "suppressed");
@@ -1964,6 +2012,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
+        const store = durableStoreFor(ctx);
         const owner = reserveSession(params.sessionPath, id);
         try {
         // Record entry count before resuming so we can extract new messages
@@ -1994,14 +2043,19 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             .replace(/-+/g, "-")
             .replace(/^-|-$/g, "") || "resume"}-resume-${id}.sh`,
         );
+        store?.prepare({ id, name, task: params.message ?? "resumed session", startTime,
+          sessionFile: params.sessionPath, surface, cli: "pi", activityFile,
+          launchScriptFile, profile, entryCountBefore });
         runScriptInPane(surface, built.command, {
-          onDispatch: () => { owner.dispatched = true; },
+          onDispatch: () => { store?.phase(id, "dispatch-intent"); owner.dispatched = true; },
           scriptPath: launchScriptFile,
           scriptPreamble: built.launchScriptPreamble?.join("\n"),
         });
 
         // Register as a running subagent for widget tracking
+        store?.phase(id, "supervised");
         const running: RunningSubagent = {
+          durableStore: store,
           id,
           name,
           task: params.message ?? "resumed session",

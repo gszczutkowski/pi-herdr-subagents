@@ -28,6 +28,8 @@ export interface CompletionOptions {
   /** Absent only for explicitly legacy runtime entries. */
   runId?: string;
   sentinelFile?: string;
+  /** Durable watchers retain immutable evidence and skip committed outbox IDs. */
+  retainedEventIds?: () => readonly string[];
   onTick?: (elapsedSeconds: number) => void;
 }
 
@@ -77,20 +79,29 @@ export function interpretExitSidecar(data: unknown): CompletionResult {
   };
 }
 
-function consumeExitSidecar(sessionFile: string | undefined, runId?: string): CompletionResult | null {
+function consumeExitSidecar(sessionFile: string | undefined, runId?: string, retainedEventIds?: () => readonly string[]): CompletionResult | null {
   if (!sessionFile) return null;
 
   const base = runId ? runCompletionFile(sessionFile, runId) : `${sessionFile}.exit`;
   const events = `${base}.events`;
-  const next = runId && existsSync(events) ? readdirSync(events).filter((name) => name.endsWith(".json")).sort()[0] : undefined;
+  const committed = retainedEventIds?.();
+  const next = runId && existsSync(events) ? readdirSync(events).filter((name) => {
+    if (!name.endsWith(".json")) return false;
+    if (!committed) return true;
+    try {
+      const payload = JSON.parse(readFileSync(`${events}/${name}`, "utf8"));
+      return !committed.includes(`subagent:${runId}:completion:${payload.eventId}`);
+    } catch { return true; }
+  }).sort()[0] : undefined;
   const exitFile = next ? `${events}/${next}` : base;
   if (!existsSync(exitFile)) return null;
 
   try {
     const payload = JSON.parse(readFileSync(exitFile, "utf8"));
     if (runId && payload.runId !== runId) return null;
+    if (committed?.includes(`subagent:${runId}:completion${payload.eventId ? `:${payload.eventId}` : ""}`)) return null;
     const result = interpretExitSidecar(payload);
-    rmSync(exitFile, { force: true });
+    if (!retainedEventIds) rmSync(exitFile, { force: true });
     return { ...result, ...(typeof payload.eventId === "string" ? { eventId: payload.eventId } : {}),
       ...(typeof payload.summary === "string" ? { summary: payload.summary } : {}) };
   } catch {
@@ -115,7 +126,7 @@ function terminalExitCode(screen: string, runId?: string): number | null {
 }
 
 function completionArtifact(options: CompletionOptions): CompletionResult | null {
-  const sidecar = consumeExitSidecar(options.sessionFile, options.runId);
+  const sidecar = consumeExitSidecar(options.sessionFile, options.runId, options.retainedEventIds);
   if (sidecar) return sidecar;
   if (options.sentinelFile && existsSync(options.sentinelFile)) {
     return { reason: "sentinel", exitCode: 0 };
@@ -166,7 +177,7 @@ export async function waitForCompletion(
   for (;;) {
     if (signal.aborted) throw new Error(ABORT_MESSAGE);
 
-    const sidecarResult = consumeExitSidecar(options.sessionFile, options.runId);
+    const sidecarResult = consumeExitSidecar(options.sessionFile, options.runId, options.retainedEventIds);
     if (sidecarResult) return sidecarResult;
 
     if (options.sentinelFile && existsSync(options.sentinelFile)) {

@@ -22,10 +22,13 @@ interface PendingDelivery {
   attempts: number;
   retryAt: number;
   inFlight: boolean;
+  parked?: boolean;
 }
 
 export interface DeliveryState {
   api?: Pick<ExtensionAPI, "sendMessage">;
+  store?: import("./runtime-store.ts").RuntimeStore;
+  persistenceError?: string;
   pending: Map<string, PendingDelivery>;
   handedOff: Set<string>;
   timer?: ReturnType<typeof setTimeout>;
@@ -59,6 +62,8 @@ export function enqueueDelivery(
     message: { ...snapshot, details: { ...(snapshot.details as Record<string, unknown> | undefined), eventId } },
     options: { triggerTurn: true, deliverAs: "steer" } as Options,
   });
+  // Persist before publication; callbacks and owners are never serialized.
+  state.store?.enqueue(eventId, owner.id, envelope);
   state.pending.set(eventId, { envelope, owner, onHandoff, attempts: 0, retryAt: 0, inFlight: false });
   flushDeliveries(state);
 }
@@ -79,24 +84,42 @@ export function flushDeliveries(state: DeliveryState): void {
       state.pending.delete(id);
       continue;
     }
-    if (entry.inFlight || entry.retryAt > Date.now()) continue;
+    if (entry.parked || entry.inFlight || entry.retryAt > Date.now()) continue;
     entry.inFlight = true;
+    try {
+      state.store?.delivery(id, "dispatching");
+    } catch (error) {
+      entry.parked = true;
+      state.persistenceError = String(error);
+      entry.inFlight = false;
+      continue;
+    }
     try {
       state.api.sendMessage(entry.envelope.message, entry.envelope.options);
     } catch {
-      // Do not let a transport exception become a fabricated watcher error.
+      // A synchronous rejection permits an in-process retry. A crash during
+      // dispatch remains UNKNOWN on disk and must not be blindly replayed.
+      try { state.store?.delivery(id, "pending"); }
+      catch (error) { entry.parked = true; state.persistenceError = String(error); }
       entry.retryAt = Date.now() + Math.min(250 * 2 ** Math.min(entry.attempts++, 7), 30_000);
       continue;
     } finally {
       entry.inFlight = false;
+    }
+    try { state.store?.delivery(id, "handedOff"); }
+    catch (error) {
+      entry.parked = true;
+      state.persistenceError = String(error);
+      continue;
     }
     state.handedOff.add(id);
     entry.owner.lifecycle = markDelivery(entry.owner.lifecycle, "delivered");
     state.pending.delete(id);
     entry.onHandoff();
   }
-  if (state.pending.size > 0 && state.api) {
-    const next = Math.min(...Array.from(state.pending.values(), (entry) => entry.retryAt));
+  const retryable = Array.from(state.pending.values()).filter((entry) => !entry.parked);
+  if (retryable.length > 0 && state.api) {
+    const next = Math.min(...retryable.map((entry) => entry.retryAt));
     state.timer = setTimeout(() => flushDeliveries(state), Math.max(1, next - Date.now()));
     state.timer.unref?.();
   }

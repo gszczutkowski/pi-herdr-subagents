@@ -28,14 +28,21 @@ synchronous handoff to Pi, not persistence, model consumption, or successful
 asynchronous dispatch. Asynchronous dispatch failures are not visible to this
 extension. The lifecycle's `delivered` label means this handoff only.
 
-R3 delivery uses an in-memory outbox for results, help pings, and watcher errors
-from both spawn and resume. Synchronous throws retain the original envelope for
-bounded-backoff retries, independent of status/widget settings. Pending events
-wait for `session_start` after `/reload`; session replacement or exit discards
-session-owned deliveries and suppresses late callbacks. Stable per-run event IDs
-support local pending/handed-off deduplication across reloads, not exactly-once
-processing. There is no process-restart durability guarantee, nor a guarantee
-against duplication if Pi accepts a message and then throws synchronously.
+Spawn and resume persist a versioned manifest and immutable serialized outbox in
+`artifacts/<parent-id>/subagent-runtime/manifest.json`. Run preparation precedes
+terminal dispatch; dispatch intent precedes the uncertain transport call. Results
+and event cursors are committed together before handoff; child event files remain
+intact. Atomic same-directory replacements use restrictive permissions where the
+OS supports them. A writer lease excludes simultaneous parents; corrupt or future
+schemas fail closed rather than resetting state.
+
+Synchronous throws retain the original envelope for bounded-backoff retries.
+Outbox `dispatching` is persisted before `sendMessage`, and `handedOff` afterward.
+A crash between them is UNKNOWN, not permission to resend. Tombstones are retained.
+These records do not promise exactly-once processing or Pi persistence. In-process
+reload retains watchers; session replacement suppresses their late callbacks.
+Restart policy B: never automatically relaunch a task from a manifest. At this
+stage manifests preserve evidence but do not adopt live processes after restart.
 
 **Upgrade boundary:** these guarantees apply only to watchers started with the
 outbox implementation. Before upgrading from a pre-outbox release, let all
