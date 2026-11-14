@@ -12,7 +12,7 @@ import * as store from "../pi-extension/subagents/plan-store.ts";
 import { PlanPersistence, PLAN_ENTRY } from "../pi-extension/subagents/plan-persistence.ts";
 import { bindPlanRun, importPlanEnvelope } from "../pi-extension/subagents/plan-runtime.ts";
 import { RuntimeStore, readRuntimeManifest } from "../pi-extension/subagents/runtime-store.ts";
-import { canonicalSessionPath, releaseSession } from "../pi-extension/subagents/ownership.ts";
+import { releaseSession } from "../pi-extension/subagents/ownership.ts";
 import { registerLiveContinuation } from "../pi-extension/subagents/live-continuation.ts";
 import { contractTask, resolveAssignmentContract } from "../pi-extension/subagents/contracts.ts";
 

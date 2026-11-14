@@ -26,7 +26,6 @@ import {
   createSubagentSurface,
   resolveSubagentLayout,
   runScriptInPane,
-  runInPane,
   closePane,
   interruptPane,
   shellQuote,
