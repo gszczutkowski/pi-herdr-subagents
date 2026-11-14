@@ -71,7 +71,7 @@ Akceptacja: rodzic odczytuje właściwy snapshot i pokazuje szczegóły narzędz
 - [ ] Nie usuwać oczekującego wyniku ani nie oznaczać go jako dostarczonego przed skutecznym przekazaniem.
 - [ ] Zachować wynik podczas wymiany API przy `/reload` i wznowić dostarczanie po gotowości nowej sesji.
 - [ ] Wprowadzić identyfikację zdarzeń i deduplikację ponowień.
-- [ ] Określić granicę potwierdzenia dostarczenia dostępną w API Pi; nie obiecywać exactly-once na podstawie flagi w pamięci.
+- [x] Określić granicę potwierdzenia dostarczenia dostępną w API Pi; nie obiecywać exactly-once na podstawie flagi w pamięci.
 - [ ] Dodać test wyjątku `sendMessage` oraz ukończenia dziecka w trakcie `/reload`.
 
 Problem: obecnie wpis zostaje oznaczony jako dostarczony i usunięty przed `sendMessage`. Wyjątek może pozostawić wynik bez kolejnej próby. Ścieżka błędu została potwierdzona analizą kodu; bez live reprodukcji wyścigu.

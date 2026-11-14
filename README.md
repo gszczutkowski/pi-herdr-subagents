@@ -21,6 +21,22 @@ subagent({ name: "Scout: DB", agent: "scout", task: "Map database schema" });
 // Both return immediately, results steer back independently
 ```
 
+### Result delivery boundary
+
+Pi's extension `sendMessage` returns `void`. A normal return acknowledges only
+synchronous handoff to Pi, not persistence, model consumption, or successful
+asynchronous dispatch. Asynchronous dispatch failures are not visible to this
+extension. The lifecycle's `delivered` label means this handoff only.
+
+R3 delivery uses an in-memory outbox for results, help pings, and watcher errors
+from both spawn and resume. Synchronous throws retain the original envelope for
+bounded-backoff retries, independent of status/widget settings. Pending events
+wait for `session_start` after `/reload`; session replacement or exit discards
+session-owned deliveries and suppresses late callbacks. Stable per-run event IDs
+support local pending/handed-off deduplication across reloads, not exactly-once
+processing. There is no process-restart durability guarantee, nor a guarantee
+against duplication if Pi accepts a message and then throws synchronously.
+
 ## Development
 
 Run unit tests and lint locally:
