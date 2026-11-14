@@ -331,7 +331,9 @@ Przed uznaniem wdrożenia za zakończone:
 
 - [x] Testy jednostkowe przejść stanów, deduplikacji, unikalności artefaktów i kontraktów ścieżek.
 - [x] Testy odtwarzania planu, powtórnych prób, zależności, blokad oraz rozgałęzień sesji.
-- [ ] Testy renderowania dla długich planów, wąskich terminali i historii wyników.
+- [x] Testy renderowania dla długich planów, wąskich terminali i historii wyników.
+
+Weryfikacja: `automated-render-boundary.test.ts` łączy rzeczywiste rejestracje panelu, historii i kart wyników z natywnym magazynem. Sprawdza szerokości 1–160 kolumn, Unicode/combining marks, 36 zadań, skrócenie szczegółów do 120 wierszy, cykle/osierocone węzły historii, zmianę motywu i gałęzi oraz brak zapisów i dodatkowych tur modelu. Rozwinięta karta pokazuje ograniczony podgląd strukturalnej propozycji niezależnie od tekstowej odpowiedzi; nie certyfikuje dowodów. Testy tekstowego renderera nie zastępują screenshotów ani live E2E.
 - [ ] Testy live: równoległy spawn, wynik podczas reloadu, interrupt/kontynuacja/resume, wybrana semantyka keepOpen.
 - [ ] Testy restartu i odtworzenia nadzoru, jeśli taka gwarancja zostanie wdrożona.
 - [x] Testy możliwości wspieranych harnessów; jawne odrzucanie nieobsługiwanych operacji.

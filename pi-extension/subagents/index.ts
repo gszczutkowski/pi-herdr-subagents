@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { keyHint } from "@earendil-works/pi-coding-agent";
+import { keyHint, truncateHead } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
 import { Box, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { ACTIVE_ACCENT, OPEN_ACCENT, borderLine, borderTop, borderBottom, framedMessage } from "./frame.ts";
@@ -2248,6 +2248,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           theme.bold("Response:"),
           response || "(no response)",
         ];
+        if (options.expanded) {
+          const proposal = normalizeStructuredResult(details?.structuredResult).structuredResult;
+          if (proposal) {
+            const preview = truncateHead(JSON.stringify(proposal, null, 2), { maxBytes: 4096, maxLines: 60 });
+            contentLines.push("", theme.bold("Structured proposal (not acceptance):"), preview.content);
+            if (preview.truncated) contentLines.push(theme.fg("dim", "Proposal preview truncated; inspect the recorded result for full details."));
+          }
+          if (typeof details?.resultDiagnostic === "string") {
+            contentLines.push("", theme.fg("warning", details.resultDiagnostic.slice(0, 1024)));
+          }
+        }
         if (details?.keepOpen) {
           contentLines.push("", theme.fg("dim", "Pane stayed open for follow-up conversation."));
         }
