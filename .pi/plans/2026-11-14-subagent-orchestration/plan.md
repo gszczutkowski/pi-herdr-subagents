@@ -1,7 +1,7 @@
 # Plan rozwoju architektury i widoczności podagentów
 
 Data: 2026-11-14
-Status: propozycja — do zatwierdzenia przed implementacją
+Status: zatwierdzony do realizacji — wdrażanie punktami, osobny commit na punkt
 Zakres: pi-herdr-subagents, bieżące drzewo robocze wraz z niezacommitowanymi zmianami
 
 ## 1. Cel i główna rekomendacja
@@ -96,7 +96,9 @@ Weryfikacja R4.5: `test/ownership-execute.test.ts` dodaje regresje na zarejestro
 
 ### R5. Jasna semantyka keepOpen
 
-- [ ] Wybrać i udokumentować jeden model: dalsza śledzona współpraca albo jednorazowe przekazanie terminala użytkownikowi.
+- [x] Wybrać i udokumentować jeden model: dalsza śledzona współpraca albo jednorazowe przekazanie terminala użytkownikowi.
+
+Decyzja użytkownika: dalsza śledzona współpraca. `keepOpen` zachowuje nadzór i właściciela sesji; zakończenie tury publikuje wynik, ale nie kończy obserwacji. Kolejne wyniki wracają do bezpośredniego rodzica. Zakończenie nadzoru wymaga potwierdzonego zamknięcia procesu albo jawnego przekazania terminala. Sam wybór modelu nie oznacza ukończenia implementacji poniżej.
 - [ ] Dostosować rejestr, watcher, publikację kolejnych wyników i komunikaty do wybranego modelu.
 - [ ] Przetestować follow-up po pierwszym zakończeniu.
 

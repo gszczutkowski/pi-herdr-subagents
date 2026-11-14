@@ -363,7 +363,16 @@ The `caller_ping` tool lets a subagent request help from its parent agent. When 
 
 For an owned, tracked Pi child interrupted with Escape, resume continues the **same process, run, pane and watcher** only after the child confirms `agent_settled` with an aborted run and idle state. Active, starting, finalizing or unknown states reject. The launch configuration is unchanged. A run-bound private command transports only a request UUID; exact follow-up text is read from an atomic request artifact and passed to `sendUserMessage` with template/command expansion disabled (not shell input or `@file` expansion).
 
-Acceptance/rejection artifacts deduplicate requests. A transport timeout or ambiguous dispatch returns `pending`, retains the in-flight reservation and never starts a replacement process; do not retry that continuation. This is a conservative synchronous API-dispatch acknowledgement, not proof that the provider processed the prompt. Unowned closed Pi sessions still use the saved-profile launch path. This does not add post-completion tracking or choose keep-open follow-up semantics.
+Acceptance/rejection artifacts deduplicate requests. A transport timeout or ambiguous dispatch returns `pending`, retains the in-flight reservation and never starts a replacement process; do not retry that continuation. This is a conservative synchronous API-dispatch acknowledgement, not proof that the provider processed the prompt. Unowned closed Pi sessions still use the saved-profile launch path. Live interrupted continuation is separate from keep-open follow-up support.
+
+### Chosen keep-open semantics
+
+`keepOpen` is defined as **tracked ongoing collaboration**, not a one-time
+terminal handoff. A completed turn should publish its result while preserving
+session ownership and observation; subsequent results should return to the
+immediate parent. Supervision ends only after confirmed process closure or an
+explicit handoff. This is the selected behavior; the tracking/follow-up
+implementation and its regression coverage are being completed separately.
 
 **Interaction flow:**
 1. Child calls `caller_ping({ message: "Not sure which schema to use" })`
