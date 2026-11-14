@@ -72,11 +72,13 @@ Akceptacja: rodzic odczytuje właściwy snapshot i pokazuje szczegóły narzędz
 - [x] Zachować wynik podczas wymiany API przy `/reload` i wznowić dostarczanie po gotowości nowej sesji.
 - [x] Wprowadzić identyfikację zdarzeń i deduplikację ponowień.
 - [x] Określić granicę potwierdzenia dostarczenia dostępną w API Pi; nie obiecywać exactly-once na podstawie flagi w pamięci.
-- [ ] Dodać test wyjątku `sendMessage` oraz ukończenia dziecka w trakcie `/reload`.
+- [x] Dodać test wyjątku `sendMessage` oraz ukończenia dziecka w trakcie `/reload`.
 
 Problem: obecnie wpis zostaje oznaczony jako dostarczony i usunięty przed `sendMessage`. Wyjątek może pozostawić wynik bez kolejnej próby. Ścieżka błędu została potwierdzona analizą kodu; bez live reprodukcji wyścigu.
 
 Akceptacja: wynik nie znika w oknie reloadu, a ponowienie nie tworzy powtórnej realizacji zadania.
+
+Weryfikacja R3: `test/delivery.test.ts` obejmuje wspólną ścieżkę settlement/dispatch spawn i resume (wynik, ping, błąd providera i watchera), ten sam niezmienny envelope po synchronicznym wyjątku, ograniczony backoff bez statusu i aktywnych dzieci, deduplikację, ponowne załadowanie modułu, oba okna shutdown/factory oraz `session_start`, migrację starego globalnego runtime i tłumienie późnych callbacków po quit/new/resume/fork. `delivered` oznacza tylko normalny synchroniczny powrót `sendMessage: void`; brak potwierdzenia asynchronicznego, exactly-once i trwałości po restarcie (szczegóły: README). Wyniki: focused delivery/rendering 29/29, parent lifecycle 3/3, lint OK; `npm test` 291/310, te same 19 wcześniejszych błędów (18 Python/Claude, 1 regex CRLF release). Bez live herdr E2E — CLI/środowisko niedostępne.
 
 ### R4. Bezpieczne resume i kontynuacja żywej sesji
 

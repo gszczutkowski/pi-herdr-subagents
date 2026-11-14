@@ -704,6 +704,33 @@ export function enqueueSubagentError(running: RunningSubagent, err: unknown, res
   });
 }
 
+/** Attach the same settlement/dispatch path to spawn and resume watchers. */
+export function observeSubagentCompletion(
+  running: RunningSubagent,
+  completion: Promise<SubagentResult>,
+  resume?: { sessionPath: string; entryCountBefore: number },
+): Promise<void> {
+  return completion.then(
+    (result) => {
+      if (!shouldDeliverSubagentCompletion(running)) return;
+      try {
+        if (resume) {
+          const summary = result.ping ? result.summary
+            : findLastAssistantMessage(getNewEntries(resume.sessionPath, resume.entryCountBefore)) ??
+              (result.errorMessage ? `Subagent error: ${result.errorMessage}`
+                : result.exitCode !== 0 ? `Resumed session exited with code ${result.exitCode}`
+                  : "Resumed session exited without new output");
+          result = { ...result, summary, sessionFile: resume.sessionPath };
+        }
+        enqueueSubagentCompletion(running, result);
+      } catch (err) {
+        enqueueSubagentError(running, err, !!resume);
+      }
+    },
+    (err) => enqueueSubagentError(running, err, !!resume),
+  );
+}
+
 // ── Widget management ──
 
 /** Interval timer for widget re-renders. */
@@ -1271,8 +1298,8 @@ async function launchSubagent(
 
 /**
  * Watch a launched subagent until it exits. Polls for completion, extracts
- * the summary from the session file, cleans up the surface,
- * and removes the entry from runningSubagents.
+ * the summary from the session file, and cleans up the surface.
+ * The outbox removes the registry entry only after synchronous handoff.
  */
 async function watchSubagent(
   running: RunningSubagent,
@@ -1579,10 +1606,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         startStatusRefresh(pi);
 
         // Fire-and-forget: start watching in background
-        watchSubagent(running, watcherAbort.signal).then(
-          (result) => enqueueSubagentCompletion(running, result),
-          (err) => enqueueSubagentError(running, err),
-        );
+        void observeSubagentCompletion(running, watchSubagent(running, watcherAbort.signal));
 
         // Return immediately
         return {
@@ -1960,22 +1984,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const watcherAbort = new AbortController();
         running.abortController = watcherAbort;
 
-        watchSubagent(running, watcherAbort.signal).then(
-          (result) => {
-            if (!shouldDeliverSubagentCompletion(running)) return;
-            try {
-              const summary = result.ping ? result.summary
-                : findLastAssistantMessage(getNewEntries(params.sessionPath, entryCountBefore)) ??
-                  (result.errorMessage ? `Subagent error: ${result.errorMessage}`
-                    : result.exitCode !== 0 ? `Resumed session exited with code ${result.exitCode}`
-                      : "Resumed session exited without new output");
-              enqueueSubagentCompletion(running, { ...result, summary, sessionFile: params.sessionPath });
-            } catch (err) {
-              enqueueSubagentError(running, err, true);
-            }
-          },
-          (err) => enqueueSubagentError(running, err, true),
-        );
+        void observeSubagentCompletion(running, watchSubagent(running, watcherAbort.signal), {
+          sessionPath: params.sessionPath, entryCountBefore,
+        });
 
         return {
           content: [{ type: "text", text: `Session "${name}" resumed.` }],

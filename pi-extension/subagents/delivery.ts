@@ -54,7 +54,7 @@ export function enqueueDelivery(
   if (owner.lifecycle.delivery !== "pending" || state.pending.has(eventId) || state.handedOff.has(eventId)) return;
   const snapshot = structuredClone(message);
   const envelope = freeze({
-    message: { ...snapshot, details: { ...snapshot.details, eventId } },
+    message: { ...snapshot, details: { ...(snapshot.details as Record<string, unknown> | undefined), eventId } },
     options: { triggerTurn: true, deliverAs: "steer" } as Options,
   });
   state.pending.set(eventId, { envelope, owner, onHandoff, attempts: 0, retryAt: 0, inFlight: false });
