@@ -22,7 +22,10 @@ function fixture() {
   const widgets = new Map<string, any>();
   const notices: string[] = [];
   let failAppend = false;
+  const modelMessages: unknown[] = [];
   const pi = {
+    sendMessage: (...args: unknown[]) => modelMessages.push(args),
+    sendUserMessage: (...args: unknown[]) => modelMessages.push(args),
     appendEntry: (type: string, data: unknown) => {
       sm.appendCustomEntry(type, data);
       if (failAppend) { failAppend = false; throw new Error("Injected append failure"); }
@@ -42,10 +45,19 @@ function fixture() {
   const p = registerPlanTools(pi);
   if (savedId !== undefined) process.env.PI_SUBAGENT_ID = savedId;
   if (savedSession !== undefined) process.env.PI_SUBAGENT_SESSION = savedSession;
-  const emit = (name: string) => { for (const handler of events.get(name) ?? []) handler({}, ctx); };
+  const emit = (name: string) => {
+    for (const handler of events.get(name) ?? []) handler({}, ctx);
+    assert.deepEqual(modelMessages, [], `${name} must not schedule model work`);
+  };
   emit("session_start");
   const readWidget = (width = 200) => widgets.get(PLAN_WIDGET)?.({}, { fg: (_: string, text: string) => text }).render(width).join("\n") ?? "";
-  const update = async (command: unknown, revision: number) => (await tools.get("plan_update").execute("call", { command, expectedRevision: revision }, undefined, undefined, ctx)).details;
+  const update = async (command: unknown, revision: number) => {
+    try {
+      return (await tools.get("plan_update").execute("call", { command, expectedRevision: revision }, undefined, undefined, ctx)).details;
+    } finally {
+      assert.deepEqual(modelMessages, [], "store/widget refresh must not schedule extra model work");
+    }
+  };
   return { dir, sm, p, ctx, tools, commands, widgets, notices, emit, readWidget, update, failNextAppend: () => { failAppend = true; }, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
 }
 

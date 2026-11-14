@@ -235,7 +235,9 @@ Historia nie obejmuje wewnętrznego toku rozumowania modeli.
 
 ### Polityka komunikatów
 
-- [ ] UI aktualizować bez dodatkowych tur modelu.
+- [x] UI aktualizować bez dodatkowych tur modelu.
+
+Weryfikacja: rzeczywiste registerPlanTools/store/session_start/session_tree i widget w test/plan-view.test.ts; jawne spy sendMessage/sendUserMessage odrzucają dodatkową pracę modelu przy mutacji i odtwarzaniu gałęzi. README rozdziela prezentację od projekcji kontekstu. Testy panelu: 9/9; bez live herdr.
 - [ ] Model budzić dla wyników, blokad, pytań i decyzji wymagających reakcji.
 - [ ] Zwykły postęp udostępniać w panelu lub zbiorczym skrócie zamiast strumienia powiadomień.
 - [ ] Rozważyć niewymuszający zakończenia sesji kanał pytania/postępu dopiero po ustaleniu bezpiecznej kontynuacji żywego dziecka.

@@ -422,6 +422,10 @@ The copyable example is model-neutral, so it works without requiring credentials
 
 ---
 
+## Notification policy
+
+Plan mutations and active-branch restoration refresh the native plan widget directly from the store. Process/activity refresh uses the process widget. Neither UI path sends a model message or schedules an extra model turn; a tool's normal response is not an additional notification. Widgets are presentation, not model context: the existing `context` hook projects the current plan on the next naturally required model request, without starting one.
+
 ## Spawning Subagents
 
 ```typescript
