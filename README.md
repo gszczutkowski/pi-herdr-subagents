@@ -566,6 +566,8 @@ A durable claim, separate from the immutable acceptance/rejection acknowledgemen
 
 `subagent_audit({sessionPath: "/absolute/path/child.jsonl"})` reports OS-visible Pi CLI owners of the canonical file, including symlink aliases. Alternatively supply an owned `id` or exact `name` (not both selectors). Output is bounded to 32 PID + process-birth identities; command lines and credentials are never returned. Multiple owners report `duplicate`; denied enumeration, unresolved relative paths/UUID selectors and unsupported platforms report uncertainty, never an empty safe result. Windows and Linux are supported. This is a point-in-time CLI audit, not a global lock: manual session switches inside Pi and writers that do not explicitly select `--session` are outside its coverage.
 
+Node entrypoints are resolved through real paths and the owning Pi package's declared `pi` bin (including bundled `dist/bundle/cli.js` and its exact shipped `dist/cli.js` companion), not filename substrings. Unrelated scripts with unknown Node VM flags do not contaminate the audit; ambiguous/denied script arguments still fail closed. Pi 1.5 does not parse `--session=path`; that spelling is reported uncertain, not clear.
+
 Resume audits before terminal/task writes and again after asynchronous inspection. A sole matching tracked live owner may continue; untracked/duplicate or unverified writers block relaunch with manual cleanup guidance. Three legacy Pi instances may legitimately be found sharing a file after old resumes: audit does **not** close them automatically. Completion is not process exit, and `close:false` remains intentional. No stale PID, idle state or model claim authorizes termination.
 
 ### Explicit verified close

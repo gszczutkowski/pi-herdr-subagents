@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { readFileSync, readdirSync, readlinkSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, readlinkSync, realpathSync } from "node:fs";
 import { basename, dirname, isAbsolute, resolve } from "node:path";
 import { canonicalSessionPath } from "./ownership.ts";
 import { probeProcess, sameProcess, type ProcessIdentity } from "./process-identity.ts";
@@ -76,32 +76,70 @@ export function enumerateProcesses(): ProcessSnapshot {
 
 const valueOptions = new Set(["--mode", "--provider", "--model", "--api-key", "--system-prompt", "--append-system-prompt", "--name", "-n", "--session-id", "--fork", "--session-dir", "--models", "--tools", "-t", "--exclude-tools", "-xt", "--thinking", "--export", "--extension", "-e", "--skill", "--prompt-template", "--theme", "--use-theme", "--tui-mode"]);
 
+/** Resolve aliases first, then verify the owning package's declared pi bin. */
+function piEntrypoint(entry: string, cwd?: string): "pi" | "other" | "uncertain" {
+  if (!isAbsolute(entry) && !cwd) return "uncertain";
+  try {
+    const file = realpathSync(resolve(cwd ?? ".", entry));
+    let root = dirname(file);
+    for (;;) {
+      let pkg: any;
+      try { pkg = JSON.parse(readFileSync(resolve(root, "package.json"), "utf8")); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") return "uncertain";
+      }
+      if (pkg) {
+        if (!["@earendil-works/pi-coding-agent", "@mariozechner/pi-coding-agent"].includes(pkg.name)) return "other";
+        const bin = typeof pkg.bin === "string" ? pkg.bin : pkg.bin?.pi;
+        if (typeof bin !== "string") return "other";
+        const declared = realpathSync(resolve(root, bin));
+        if (declared === file) return "pi";
+        // Published packages also ship an unbundled SDK CLI. Accept that exact
+        // companion only when the declared bin is the canonical bundled CLI.
+        if (existsSync(resolve(root, "dist/bundle/cli.js")) && existsSync(resolve(root, "dist/cli.js")) &&
+            declared === realpathSync(resolve(root, "dist/bundle/cli.js")) &&
+            file === realpathSync(resolve(root, "dist/cli.js"))) return "pi";
+        return "other";
+      }
+      const parent = dirname(root);
+      if (parent === root) return "other";
+      root = parent;
+    }
+  } catch { return "uncertain"; }
+}
+
 /** Only a real Pi entrypoint in Node's script position qualifies, never -e text or argument mentions. */
 export function piSessionArgument(row: ProcessRow): { kind: "other" | "uncertain" } | { kind: "session"; path: string } {
   const argv = row.argv;
   if (!argv?.length) return { kind: "uncertain" };
   let start = 1;
   if (/^(node|nodejs)(\.exe)?$/i.test(basename(argv[0]))) {
+    let unknownFlag = false;
     while (argv[start]?.startsWith("-")) {
       const flag = argv[start++];
       if (["-e", "--eval", "-p", "--print", "--test"].includes(flag) || /^(--eval|--print)=/.test(flag)) return { kind: "other" };
       if (["--import", "--require", "-r", "--loader", "--experimental-loader"].includes(flag)) start++;
-      else if (!/^(--input-type=(?:module|commonjs)|--experimental-strip-types|--no-warnings|--disable-warning=.*|--inspect(?:-brk)?(?:=.*)?|--enable-source-maps|--no-deprecation)$/.test(flag)) return { kind: "uncertain" };
+      else if (flag === "--") break;
+      else if (!/^(--input-type=(?:module|commonjs)|--experimental-strip-types|--no-warnings|--disable-warning=.*|--inspect(?:-brk)?(?:=.*)?|--enable-source-maps|--no-deprecation)$/.test(flag)) unknownFlag = true;
     }
     const entry = argv[start++];
     if (!entry) return { kind: "other" };
-    if (!isAbsolute(entry) && !row.cwd) return { kind: "uncertain" };
-    try {
-      const file = realpathSync(resolve(row.cwd ?? ".", entry));
-      const pkg = JSON.parse(readFileSync(resolve(dirname(file), "..", "package.json"), "utf8"));
-      if (basename(file) !== "cli.js" || !["@earendil-works/pi-coding-agent", "@mariozechner/pi-coding-agent"].includes(pkg.name)) return { kind: "other" };
-    } catch { return { kind: "other" }; }
+    const kind = piEntrypoint(entry, row.cwd);
+    if (kind !== "pi") {
+      // Unknown VM options may consume a value. Do not mistake that value for
+      // an unrelated script if a later argument could actually be Pi's bin.
+      if (unknownFlag && argv.slice(start).some(arg => !arg.startsWith("-") && piEntrypoint(arg, row.cwd) === "pi")) return { kind: "uncertain" };
+      return { kind };
+    }
+    if (unknownFlag) return { kind: "uncertain" };
   } else if (!/^pi(\.exe)?$/i.test(basename(argv[0]))) return { kind: "other" };
   let session: string | undefined;
   for (let i = start; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === "--") break;
     if (arg === "--session") { session = argv[++i]; if (!session) return { kind: "uncertain" }; }
+    // Current Pi CLI does not parse this spelling; never report it as clear.
+    else if (arg.startsWith("--session=")) return { kind: "uncertain" };
     else if (valueOptions.has(arg)) i++;
     else if (arg === "-p" || arg === "--print") { if (argv[i + 1] && !argv[i + 1].startsWith("-")) i++; }
   }
