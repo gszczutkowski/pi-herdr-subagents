@@ -974,6 +974,52 @@ describe("model configuration", () => {
 describe("subagent discovery", () => {
   const testApi = (subagentsModule as any).__test__;
 
+  for (const lineEnding of ["LF", "CRLF", "mixed"]) {
+    it(`discovers and loads agents with ${lineEnding} line endings`, async () => {
+      await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+        const name = "line-ending-test-agent";
+        const lines = [
+          "---",
+          `name: ${name}`,
+          "description: Line ending regression fixture",
+          "model: openai/test-model",
+          "thinking: low",
+          "tools: read, bash",
+          "session-mode: standalone",
+          "system-prompt: append",
+          "spawning: false",
+          "auto-exit: true",
+          "---",
+          "",
+          "First prompt line.",
+          "Second prompt line.",
+          "",
+        ];
+        const content = lines.map((line, index) => {
+          if (index === lines.length - 1) return line;
+          const ending = lineEnding === "CRLF" || (lineEnding === "mixed" && index % 2 === 0)
+            ? "\r\n" : "\n";
+          return line + ending;
+        }).join("");
+        writeFileSync(join(projectAgentsDir, `${name}.md`), content);
+
+        const discovered = testApi.discoverAgentDefinitions().find((agent: any) => agent.name === name);
+        assert.equal(discovered?.source, "project");
+        const loaded = testApi.loadAgentDefaults(name);
+        assert.ok(loaded, "expected agent to load");
+        assert.equal(loaded.description, "Line ending regression fixture");
+        assert.equal(loaded.model, "openai/test-model");
+        assert.equal(loaded.thinking, "low");
+        assert.equal(loaded.tools, "read, bash");
+        assert.equal(loaded.sessionMode, "standalone");
+        assert.equal(loaded.systemPromptMode, "append");
+        assert.equal(loaded.spawning, false);
+        assert.equal(loaded.autoExit, true);
+        assert.equal(loaded.body, "First prompt line.\nSecond prompt line.");
+      });
+    });
+  }
+
   it("loads session-mode from frontmatter", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
       writeAgentFile(
