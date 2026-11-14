@@ -1,7 +1,8 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { keyHint } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
-import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Box, Text, truncateToWidth } from "@earendil-works/pi-tui";
+import { ACTIVE_ACCENT, OPEN_ACCENT, borderLine, borderTop, borderBottom, framedMessage } from "./frame.ts";
 import { dirname, join } from "node:path";
 import { resolveSubagentCwd } from "./paths.ts";
 import { fileURLToPath } from "node:url";
@@ -63,6 +64,7 @@ import {
   type ActivityReadResult,
   type SubagentActivityState,
 } from "./activity.ts";
+import { registerSubagentAssignmentRenderer } from "./assignment.ts";
 import {
   createLifecycle,
   formatLifecycleTransitionLine,
@@ -659,67 +661,6 @@ function formatElapsedMMSS(startTime: number, endTime = Date.now()): string {
   const m = Math.floor(seconds / 60);
   const s = seconds % 60;
   return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
-}
-
-const ACTIVE_ACCENT = "\x1b[38;2;77;163;255m";
-const OPEN_ACCENT = "\x1b[38;2;214;158;46m";
-const RST = "\x1b[0m";
-
-/**
- * Build a bordered content line: │left          right│
- * Left content is truncated if needed, right is preserved, padded to fill width.
- */
-function borderLine(left: string, right: string, width: number, accent = ACTIVE_ACCENT): string {
-  if (width <= 0) return "";
-  if (width === 1) return `${accent}│${RST}`;
-
-  // width = total visible chars for the whole line including │ and │
-  const contentWidth = Math.max(0, width - 2); // space inside the two │ chars
-  const rightVis = visibleWidth(right);
-
-  // If the status chunk alone is too wide, prefer preserving it in compact form
-  // rather than overflowing the terminal.
-  if (rightVis >= contentWidth) {
-    const truncRight = truncateToWidth(right, contentWidth);
-    const rightPad = Math.max(0, contentWidth - visibleWidth(truncRight));
-    return `${accent}│${RST}${truncRight}${" ".repeat(rightPad)}${accent}│${RST}`;
-  }
-
-  const maxLeft = Math.max(0, contentWidth - rightVis);
-  const truncLeft = truncateToWidth(left, maxLeft);
-  const leftVis = visibleWidth(truncLeft);
-  const pad = Math.max(0, contentWidth - leftVis - rightVis);
-  return `${accent}│${RST}${truncLeft}${" ".repeat(pad)}${right}${accent}│${RST}`;
-}
-
-/**
- * Build the bordered top line: ╭─ Title ──── info ─╮
- * All chars are accounted for within `width`.
- */
-function borderTop(title: string, info: string, width: number, accent = ACTIVE_ACCENT): string {
-  if (width <= 0) return "";
-  if (width === 1) return `${accent}╭${RST}`;
-
-  // ╭─ Title ───...─── info ─╮
-  // overhead: ╭─ (2) + space around title (2) + space around info (2) + ─╮ (2) = but we simplify
-  const inner = Math.max(0, width - 2); // inside ╭ and ╮
-  const titlePart = `─ ${title} `;
-  const infoPart = ` ${info} ─`;
-  const fillLen = Math.max(0, inner - titlePart.length - infoPart.length);
-  const fill = "─".repeat(fillLen);
-  const content = `${titlePart}${fill}${infoPart}`.slice(0, inner).padEnd(inner, "─");
-  return `${accent}╭${content}╮${RST}`;
-}
-
-/**
- * Build the bordered bottom line: ╰──────────────────╯
- */
-function borderBottom(width: number, accent = ACTIVE_ACCENT): string {
-  if (width <= 0) return "";
-  if (width === 1) return `${accent}╰${RST}`;
-
-  const inner = Math.max(0, width - 2);
-  return `${accent}╰${"─".repeat(inner)}╯${RST}`;
 }
 
 function formatLifecycleWidgetLabel(
@@ -1431,6 +1372,7 @@ async function watchSubagent(
 }
 
 export default function subagentsExtension(pi: ExtensionAPI) {
+  registerSubagentAssignmentRenderer(pi);
   runtime.pi = pi;
 
   // Capture the UI context for widget updates and restore presentation for
@@ -1611,7 +1553,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 display: true,
                 details: {
                   name: running.name,
+                  recipient: "Parent",
                   task: running.task,
+                  response: result.errorMessage ? `Error: ${result.errorMessage}` : result.summary,
+                  keepOpen: result.keepOpen,
                   agent: running.agent,
                   exitCode: result.exitCode,
                   elapsed: result.elapsed,
@@ -1639,7 +1584,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 customType: "subagent_result",
                 content: `Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`,
                 display: true,
-                details: { name: running.name, task: running.task, error: err?.message },
+                details: {
+                  name: running.name,
+                  recipient: "Parent",
+                  task: running.task,
+                  agent: running.agent,
+                  sessionFile: running.sessionFile,
+                  error: err?.message ?? String(err),
+                  response: err?.message ?? String(err),
+                },
               },
               { triggerTurn: true, deliverAs: "steer" },
             );
@@ -2074,7 +2027,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 display: true,
                 details: {
                   name,
+                  recipient: "Parent",
                   task: params.message ?? "resumed session",
+                  response: result.errorMessage ? `Error: ${result.errorMessage}` : summary,
+                  keepOpen: result.keepOpen,
                   exitCode: result.exitCode,
                   elapsed: result.elapsed,
                   sessionFile: params.sessionPath,
@@ -2100,7 +2056,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 customType: "subagent_result",
                 content: `Resume error: ${err?.message ?? String(err)}`,
                 display: true,
-                details: { name, error: err?.message },
+                details: {
+                  name,
+                  recipient: "Parent",
+                  task: params.message ?? "resumed session",
+                  sessionFile: params.sessionPath,
+                  error: err?.message ?? String(err),
+                  response: err?.message ?? String(err),
+                },
               },
               { triggerTurn: true, deliverAs: "steer" },
             );
@@ -2164,15 +2127,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   // ── subagent_result message renderer ──
   pi.registerMessageRenderer("subagent_result", (message, options, theme) => {
     const details = message.details as any;
-    if (!details) return undefined;
 
     return {
+      invalidate() {},
       render(width: number): string[] {
-        const name = details.name ?? "subagent";
-        const exitCode = details.exitCode ?? 0;
-        const errorMessage = typeof details.errorMessage === "string" ? details.errorMessage : "";
-        const failed = exitCode !== 0 || !!errorMessage;
-        const elapsed = details.elapsed != null ? formatElapsed(details.elapsed) : "?";
+        const name = details?.name ?? "subagent";
+        const exitCode = details?.exitCode ?? 0;
+        const errorMessage = typeof details?.errorMessage === "string" ? details.errorMessage : "";
+        const failed = exitCode !== 0 || !!errorMessage || details?.error != null;
+        const elapsed = details?.elapsed != null ? formatElapsed(details.elapsed) : "?";
         const bgFn = failed
           ? (text: string) => theme.bg("toolErrorBg", text)
           : (text: string) => theme.bg("toolSuccessBg", text);
@@ -2181,10 +2144,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           : theme.fg("success", "✓");
         const status = errorMessage
           ? "failed (provider/agent error)"
-          : failed
-            ? `failed (exit ${exitCode})`
-            : "completed";
-        const agentTag = details.agent ? theme.fg("dim", ` (${details.agent})`) : "";
+          : details?.error != null
+            ? "failed"
+            : failed
+              ? `failed (exit ${exitCode})`
+              : "completed";
+        const sender = `${name}${details?.agent ? ` (${details.agent})` : ""}`;
+        const agentTag = details?.agent ? theme.fg("dim", ` (${details.agent})`) : "";
 
         const header = `${icon} ${theme.fg("toolTitle", theme.bold(name))}${agentTag} ${theme.fg("dim", "—")} ${status} ${theme.fg("dim", `(${elapsed})`)}`;
         const rawContent = typeof message.content === "string" ? message.content : "";
@@ -2201,40 +2167,32 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             "",
           );
 
-        // Build content for the box
-        const contentLines = [header];
-
-        if (options.expanded) {
-          // Full view: complete summary + session info
-          if (summary) {
-            for (const line of summary.split("\n")) {
-              contentLines.push(line.slice(0, width - 6));
-            }
-          }
-          if (details.sessionFile) {
-            contentLines.push("");
-            contentLines.push(theme.fg("dim", `Session: ${details.sessionFile}`));
-            contentLines.push(theme.fg("dim", `Resume:  pi --session ${details.sessionFile}`));
-          }
-        } else {
-          // Collapsed: preview + expand hint
-          if (summary) {
-            const previewLines = summary.split("\n").slice(0, 5);
-            for (const line of previewLines) {
-              contentLines.push(theme.fg("dim", line.slice(0, width - 6)));
-            }
-            const totalLines = summary.split("\n").length;
-            if (totalLines > 5) {
-              contentLines.push(theme.fg("muted", `… ${totalLines - 5} more lines`));
-            }
-          }
-          contentLines.push(theme.fg("muted", keyHint("app.tools.expand", "to expand")));
+        // Older persisted messages have no structured response; retain their content.
+        const response = typeof details?.response === "string" ? details.response : summary;
+        const contentLines = [
+          header,
+          `${theme.bold("From:")} ${name}${agentTag}`,
+          `${theme.bold("To:")} ${details?.recipient ?? "Parent"}`,
+          "",
+          theme.bold("Task:"),
+          typeof details?.task === "string" ? details.task : "(not recorded)",
+          "",
+          theme.bold("Response:"),
+          response || "(no response)",
+        ];
+        if (details?.keepOpen) {
+          contentLines.push("", theme.fg("dim", "Pane stayed open for follow-up conversation."));
+        }
+        if (details?.runtimePlan?.runtimeMismatch && typeof details?.response === "string") {
+          contentLines.push("", theme.fg("warning", `Runtime warning: ${details.runtimePlan.runtimeMismatch}`));
+        }
+        if (options.expanded && details?.sessionFile) {
+          contentLines.push("");
+          contentLines.push(theme.fg("dim", `Session: ${details.sessionFile}`));
+          contentLines.push(theme.fg("dim", `Resume: pi --session ${details.sessionFile}`));
         }
 
-        // Render via Box for background + padding, with blank line above for separation
-        const box = new Box(1, 1, bgFn);
-        box.addChild(new Text(contentLines.join("\n"), 0, 0));
-        return ["", ...box.render(width)];
+        return ["", ...framedMessage(`Message from ${sender}`, contentLines.join("\n"), bgFn).render(width)];
       },
     };
   });

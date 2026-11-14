@@ -6,6 +6,7 @@ import type {
   BuiltHarnessCommand,
 } from "../types.ts";
 import type { ResolvedRuntimePlan } from "../../runtime-routing.ts";
+import { ASSIGNMENT_ENV, type SubagentAssignment } from "../../assignment.ts";
 
 const SUBAGENT_CONTROL_TOOLS = ["caller_ping", "subagent_done"] as const;
 
@@ -160,6 +161,21 @@ export class PiHarnessDriver implements HarnessDriver {
     }
 
     const effectiveSkills = params.skills ?? agentDefs?.skills;
+    const assignment: SubagentAssignment = {
+      version: 1,
+      childId: params.id,
+      sessionFile: subagentSessionFile,
+      sender: process.env.PI_SUBAGENT_NAME || "Parent agent",
+      recipient: params.name,
+      role: params.agent || agentDefs?.name || "Subagent",
+      task: params.task,
+      skills: (effectiveSkills ?? "").split(",").map((skill) => skill.trim()).filter(Boolean),
+    };
+    const assignmentPath = join(artifactDir, `context/subagent-assignment-${params.id}.json`);
+    mkdirSync(dirname(assignmentPath), { recursive: true });
+    writeFileSync(assignmentPath, JSON.stringify(assignment), "utf8");
+    envParts.push(`${ASSIGNMENT_ENV}=${shellQuote(assignmentPath)}`);
+
     const promptArgs = buildPiPromptArgs({
       effectiveSkills,
       taskDelivery,

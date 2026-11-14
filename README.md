@@ -172,7 +172,13 @@ Multiple subagents run concurrently — each steers its result back independentl
 ╰─────────────────────────────────────────────────────────╯
 ```
 
-Completion messages render with a colored background and are expandable with `Ctrl+O` to show the full summary and session file path. Completed rows are removed from the widget as soon as their result is delivered or suppressed.
+### Assignment and response entries
+
+Pi child sessions start with a structured **Message from &lt;sender&gt;** card showing the sender, recipient, role, and full delegated task before the child begins work. This is a persisted display-only record: it does not send the task to the model a second time. In a full-context fork, inherited history stays before this first new entry. Resuming a session does not repeat its original assignment. Other harness CLIs retain their own prompt display.
+
+When a child finishes, the main session receives a structured **Message from &lt;sender&gt;** card (using the same sender name and optional agent role as the **From** field) with sender, recipient, task, status, and the reply visible without expanding the entry. Additional session diagnostics remain expandable with `Ctrl+O`. This uses the existing asynchronous completion notification, not an extra message or model turn. Completed rows are removed from the widget as soon as their result is delivered or suppressed.
+
+Both cards use rounded orange/amber borders matching the subagent status widget's frame, including failed responses. Full multiline content wraps to the terminal width; persisted cards retain this rendering on ordinary session resume.
 
 ### In-progress status updates
 
