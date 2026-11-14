@@ -74,10 +74,10 @@ export function registerPlanTools(pi: ExtensionAPI): PlanPersistence {
     parameters: object({ taskId: Type.Optional(text()), reconcile: Type.Optional(Type.Boolean()) }),
     async execute(_id, params, _signal, _update, ctx) {
       try {
-      const view = params.reconcile ? persistence.reconcile(ctx.sessionManager) : persistence.read(ctx.sessionManager);
-      const plan = view.snapshot;
-      if (params.taskId && !plan?.tasks.some(task => task.taskId === params.taskId)) throw new Error("Unknown task");
-      return response({ ...view, snapshot: plan ? { ...plan, tasks: params.taskId ? plan.tasks.filter(task => task.taskId === params.taskId) : plan.tasks.map(task => ({ taskId: task.taskId, title: task.title, status: task.status, statusReason: task.statusReason })) } : undefined });
+        const view = params.reconcile ? persistence.reconcile(ctx.sessionManager) : persistence.read(ctx.sessionManager);
+        const plan = view.snapshot;
+        if (params.taskId && !plan?.tasks.some(task => task.taskId === params.taskId)) throw new Error("Unknown task");
+        return response({ ...view, snapshot: plan ? { ...plan, tasks: params.taskId ? plan.tasks.filter(task => task.taskId === params.taskId) : plan.tasks.map(task => ({ taskId: task.taskId, title: task.title, status: task.status, statusReason: task.statusReason })) } : undefined });
       } finally { refresh(ctx); }
     },
   });
@@ -87,13 +87,13 @@ export function registerPlanTools(pi: ExtensionAPI): PlanPersistence {
     parameters: PlanUpdateParams,
     async execute(_id, params, signal, _update, ctx) {
       try {
-      signal?.throwIfAborted();
-      if (!Value.Check(PlanUpdateParams, params)) throw new Error("Invalid bounded plan command");
-      const c = params.command;
-      const snapshot = c.action === "create" ? persistence.create(ctx.sessionManager, params.expectedRevision, c.title) :
-        c.action === "detach" ? persistence.detach(ctx.sessionManager, c.planId, params.expectedRevision, c.reason) :
-        persistence.mutate(ctx.sessionManager, c.planId, params.expectedRevision, (plan, context) => apply(plan, context, c), c.action === "result" ? c.origin : undefined);
-      return response({ planId: snapshot.planId, revision: snapshot.revision, authority: snapshot.authority, tasks: snapshot.tasks });
+        signal?.throwIfAborted();
+        if (!Value.Check(PlanUpdateParams, params)) throw new Error("Invalid bounded plan command");
+        const c = params.command;
+        const snapshot = c.action === "create" ? persistence.create(ctx.sessionManager, params.expectedRevision, c.title) :
+          c.action === "detach" ? persistence.detach(ctx.sessionManager, c.planId, params.expectedRevision, c.reason) :
+          persistence.mutate(ctx.sessionManager, c.planId, params.expectedRevision, (plan, context) => apply(plan, context, c), c.action === "result" ? c.origin : undefined);
+        return response({ planId: snapshot.planId, revision: snapshot.revision, authority: snapshot.authority, tasks: snapshot.tasks });
       } finally { refresh(ctx); }
     },
   });

@@ -1,4 +1,4 @@
-import { truncateToWidth } from "@earendil-works/pi-tui";
+import { truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import type { PlanView } from "./plan-persistence.ts";
 import type { TaskStatus } from "./plan-store.ts";
 
@@ -29,13 +29,52 @@ export function planLines(view: PlanView, expanded = false): string[] {
   return lines;
 }
 
+/** References are displayed verbatim as data, never executed or resolved as runtime state. */
+export function taskDetailLines(view: PlanView, taskId: string): string[] {
+  const task = view.snapshot?.tasks.find(t => t.taskId === taskId);
+  if (!task) return ["Task not on the active branch; use /plan-view full"];
+  const lines = [
+    ...(view.error ? [`Read-only: ${view.error}`] : []),
+    ...(view.recoveryUncertain.includes(task.taskId) ? ["Recovery uncertain; runtime presence not verified"] : []),
+    `Task: ${task.title}`, `Task ID: ${task.taskId}`, `Status: ${task.status} — ${task.statusReason}`,
+    `Role/owner: ${task.owner}`, `Scope: ${task.scope}`,
+    `Dependencies: ${task.dependencies.join(", ") || "none"}`,
+    "Criteria:",
+    ...task.criteria.map(c => `  ${task.status === "accepted" ? "✓" : "○"} ${c.criterionId}: ${c.text}`),
+    "Attempts (references, not liveness):",
+  ];
+  for (const attempt of task.attempts) {
+    lines.push(`  Attempt: ${attempt.attemptId}`, `  Runs: ${attempt.runIds.join(", ") || "none"}`);
+    if (attempt.childSession) lines.push(`  Session: ${attempt.childSession}`);
+    if (attempt.origin) lines.push(`  Origin plan ${attempt.origin.planId}; authority ${attempt.origin.authority.sessionId}/${attempt.origin.authority.branchInstanceId}`);
+    for (const result of attempt.results) lines.push(`  Result ${result.eventId} (${result.kind ?? "result"}, run ${result.runId}): ${result.ref}${result.reason ? ` — ${result.reason}` : ""}`);
+  }
+  lines.push("Checks / evidence (recorded references, not independently verified):");
+  for (const evidence of task.evidence) lines.push(`  ${evidence.evidenceId} → criterion ${evidence.criterionId}: ${evidence.ref}${evidence.artifactId ? `; artifact ${evidence.artifactId}` : ""}${evidence.resultEventId ? `; result ${evidence.resultEventId}` : ""}`);
+  lines.push("Decisions:");
+  for (const decision of task.decisions) {
+    lines.push(`  r${decision.revision} ${decision.kind}: ${decision.reason}`);
+    for (const [criterionId, evidenceIds] of Object.entries(decision.criteria)) lines.push(`    ${criterionId} → ${evidenceIds.join(", ")}`);
+  }
+  lines.push("Artifacts:", ...task.artifacts.map(a => `  ${a.artifactId}: ${a.ref}`));
+  lines.push("Status history:", ...task.statusHistory.map(change => `  r${change.revision} ${change.status}: ${change.reason}`));
+  lines.push(`/plan-view full — back; plan_read taskId=${task.taskId} — full structured details`);
+  return lines;
+}
+
 /** No ANSI or terminal controls from persisted user/model text. */
 export function displayText(text: string): string {
   // eslint-disable-next-line no-control-regex -- persisted text must not control the terminal
   return text.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ");
 }
 
-export function renderPlan(view: PlanView, width: number, style: (text: string) => string = text => text, expanded = false): string[] {
+export function renderPlan(view: PlanView, width: number, style: (text: string) => string = text => text, expanded = false, taskId?: string): string[] {
   if (width <= 0) return [];
+  if (taskId && view.snapshot) {
+    const lines = taskDetailLines(view, taskId).flatMap(line => wrapTextWithAnsi(displayText(line), width));
+    // Keep a widget bounded even for the maximum-size persisted history.
+    const visible = lines.length > 120 ? [...lines.slice(0, 119), `Details truncated; use plan_read with taskId=${taskId}`] : lines;
+    return visible.map(line => truncateToWidth(style(line), width));
+  }
   return planLines(view, expanded).map(line => truncateToWidth(style(displayText(line)), width));
 }

@@ -21,8 +21,12 @@ function fixture() {
   const events = new Map<string, any[]>();
   const widgets = new Map<string, any>();
   const notices: string[] = [];
+  let failAppend = false;
   const pi = {
-    appendEntry: (type: string, data: unknown) => { sm.appendCustomEntry(type, data); },
+    appendEntry: (type: string, data: unknown) => {
+      sm.appendCustomEntry(type, data);
+      if (failAppend) { failAppend = false; throw new Error("Injected append failure"); }
+    },
     registerTool: (tool: any) => tools.set(tool.name, tool),
     registerCommand: (name: string, command: any) => commands.set(name, command),
     on: (name: string, handler: any) => events.set(name, [...(events.get(name) ?? []), handler]),
@@ -42,7 +46,7 @@ function fixture() {
   emit("session_start");
   const readWidget = (width = 200) => widgets.get(PLAN_WIDGET)?.({}, { fg: (_: string, text: string) => text }).render(width).join("\n") ?? "";
   const update = async (command: unknown, revision: number) => (await tools.get("plan_update").execute("call", { command, expectedRevision: revision }, undefined, undefined, ctx)).details;
-  return { dir, sm, p, ctx, tools, commands, widgets, notices, emit, readWidget, update, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+  return { dir, sm, p, ctx, tools, commands, widgets, notices, emit, readWidget, update, failNextAppend: () => { failAppend = true; }, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
 }
 
 test("registered tools and native store update the widget without model messages; all statuses and acceptance count", async () => {
@@ -109,6 +113,85 @@ test("registered plan-view command expands long plans without checklist state or
   } finally { f.cleanup(); }
 });
 
+test("details command exposes criteria, attempts, results, checks, decisions and links; text tool works without TUI", async () => {
+  const f = fixture();
+  try {
+    let plan = f.p.create(f.sm, 0, "Details");
+    const beforeTask = f.sm.getLeafId()!;
+    const criterionId = randomUUID();
+    const artifactId = randomUUID();
+    const mutate = (fn: (p: store.PlanSnapshot, c: store.CommandContext) => store.PlanSnapshot) => { plan = f.p.mutate(f.sm, plan.planId, plan.revision, fn); };
+    mutate((p, c) => store.addTask(p, c, "Detailed task", { owner: "reviewer", scope: "Small scope", criteria: [{ criterionId, text: "All checks pass" }], artifacts: [{ artifactId, ref: "file:///tmp/report.md" }] }));
+    const id = plan.tasks[0].taskId;
+    mutate((p, c) => store.startAttempt(p, c, id, "file:///tmp/child-one.jsonl"));
+    mutate((p, c) => store.attachRun(p, c, id, p.tasks[0].attempts[0].attemptId, "run-one"));
+    mutate((p, c) => store.recordResult(p, c, id, p.tasks[0].attempts[0].attemptId, { eventId: "result-one", runId: "run-one", ref: "file:///tmp/result-one.md" }));
+    mutate((p, c) => store.retry(p, c, id, "file:///tmp/child-two.jsonl"));
+    mutate((p, c) => store.attachRun(p, c, id, p.tasks[0].attempts[1].attemptId, "run-two"));
+    mutate((p, c) => store.recordResult(p, c, id, p.tasks[0].attempts[1].attemptId, { eventId: "result-two", runId: "run-two", ref: "https://example.com/result" }));
+    mutate((p, c) => store.addEvidence(p, c, id, { criterionId, artifactId, resultEventId: "result-two", ref: "node --test: 2 passed" }));
+    mutate((p, c) => store.accept(p, c, id, { [criterionId]: p.tasks[0].evidence.map(e => e.evidenceId) }, "Parent verified"));
+    await f.commands.get("plan-view").handler("details T1", f.ctx);
+    const text = f.readWidget();
+    for (const expected of ["All checks pass", "Small scope", "run-one", "run-two", "child-one.jsonl", "child-two.jsonl", "result-one.md", "https://example.com/result", "2 passed", "Parent verified", "report.md", "Status history:", "✓"]) assert.ok(text.includes(expected), expected);
+    const leaf = f.sm.getLeafId();
+    await f.commands.get("plan-view").handler(`details ${id}`, f.ctx);
+    assert.equal(f.readWidget(), text);
+    assert.equal(f.sm.getLeafId(), leaf);
+    mutate((p, c) => store.editTask(p, c, id, { scope: "Changed scope" }));
+    assert.match(f.readWidget(), /invalidate/);
+    assert.match(f.readWidget(), /Status: in_review/);
+    assert.match(f.readWidget(), /○.*All checks pass/);
+    const noUI = { ...f.ctx, mode: "print", hasUI: false, ui: new Proxy({}, { get() { throw new Error("No UI access allowed"); } }) };
+    const result = await f.tools.get("plan_read").execute("read", { taskId: id }, undefined, undefined, noUI);
+    assert.deepEqual(result.details.snapshot.tasks, plan.tasks);
+    assert.match(result.content[0].text, /node --test: 2 passed/);
+    await f.commands.get("plan-view").handler(`details ${id}`, noUI);
+    const component = f.widgets.get(PLAN_WIDGET)({}, { fg: (_: string, text: string) => text });
+    for (const width of [1, 12, 30, 80]) for (const line of component.render(width)) assert.ok(visibleWidth(line) <= width);
+    f.sm.branch(beforeTask);
+    f.emit("session_tree");
+    assert.match(f.readWidget(), /Task not on the active branch/);
+    assert.doesNotMatch(f.readWidget(), /Detailed task/);
+    await f.commands.get("plan-view").handler("details T1", f.ctx);
+    assert.match(f.notices.at(-1)!, /Unknown task/);
+    await f.commands.get("plan-view").handler("full", f.ctx);
+    assert.match(f.readWidget(), /0\/0 accepted/);
+  } finally { f.cleanup(); }
+});
+
+test("append failure immediately marks the widget read-only; reconciliation and observer errors cannot alter commands", async () => {
+  const f = fixture();
+  try {
+    const plan = f.p.create(f.sm, 0, "Errors");
+    const unsubscribe = f.p.subscribe(() => { throw new Error("Broken observer"); });
+    f.failNextAppend();
+    await assert.rejects(() => f.update({ action: "add", planId: plan.planId, title: "Durable task" }, plan.revision), /append failed/);
+    assert.match(f.readWidget(), /Read-only: Plan append failed/);
+    assert.match(f.readWidget(), /Durable task/);
+    const read = await f.tools.get("plan_read").execute("read", { reconcile: true }, undefined, undefined, f.ctx);
+    assert.equal(read.details.writable, true);
+    assert.doesNotMatch(f.readWidget(), /Read-only/);
+    const next = await f.update({ action: "add", planId: plan.planId, title: "Next task" }, read.details.snapshot.revision);
+    assert.equal(next.tasks.length, 2);
+    unsubscribe();
+  } finally { f.cleanup(); }
+});
+
+test("details previews are explicitly bounded with the full structured task available", async () => {
+  const f = fixture();
+  try {
+    let plan = f.p.create(f.sm, 0, "Long details");
+    plan = f.p.mutate(f.sm, plan.planId, plan.revision, (p, c) => store.addTask(p, c, "Long task", { scope: "界".repeat(8000) }));
+    await f.commands.get("plan-view").handler("details T1", f.ctx);
+    const lines = f.readWidget(80).split("\n");
+    assert.equal(lines.length, 120);
+    assert.match(lines.at(-1)!, /Details truncated; use plan_read/);
+    const result = await f.tools.get("plan_read").execute("read", { taskId: plan.tasks[0].taskId }, undefined, undefined, { ...f.ctx, hasUI: false, mode: "json" });
+    assert.equal(result.details.snapshot.tasks[0].scope, plan.tasks[0].scope);
+  } finally { f.cleanup(); }
+});
+
 test("completed task rows survive actual runtime removal and disk reopen with zero agents", async () => {
   const f = fixture();
   const { observeSubagentCompletion } = await import("../pi-extension/subagents/index.ts");
@@ -165,6 +248,25 @@ test("Unicode, controls, zero width, resize and theme invalidation respect termi
     theme.fg = (_, text) => `new:${text}`;
     component.invalidate();
     assert.match(component.render(100)[0], /^new:/);
+  } finally { f.cleanup(); }
+});
+
+test("unaccepted dependencies and restored uncertainty are explicit, including RPC string widgets", async () => {
+  const f = fixture();
+  try {
+    let plan = f.p.create(f.sm, 0, "Dependencies");
+    plan = f.p.mutate(f.sm, plan.planId, plan.revision, (p, c) => store.addTask(p, c, "Prerequisite"));
+    const prerequisite = plan.tasks[0].taskId;
+    plan = f.p.mutate(f.sm, plan.planId, plan.revision, (p, c) => store.addTask(p, c, "Dependent", { dependencies: [prerequisite] }));
+    plan = f.p.mutate(f.sm, plan.planId, plan.revision, (p, c) => store.startAttempt(p, c, p.tasks[1].taskId));
+    assert.match(f.readWidget(), /Waiting on: T1/);
+    assert.doesNotMatch(f.readWidget(), /Recovery uncertain/);
+    f.emit("session_start");
+    assert.match(f.readWidget(), /Recovery uncertain; runtime presence not verified/);
+    await f.commands.get("plan-view").handler("full", { ...f.ctx, mode: "rpc" });
+    assert.ok(Array.isArray(f.widgets.get(PLAN_WIDGET)));
+    assert.match(f.widgets.get(PLAN_WIDGET).join("\n"), /Waiting on: T1/);
+    assert.equal(f.p.read(f.sm).snapshot?.tasks[1].status, "in_progress");
   } finally { f.cleanup(); }
 });
 

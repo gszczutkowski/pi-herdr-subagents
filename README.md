@@ -100,9 +100,33 @@ Unknown future plan schemas fail closed, never silently create an empty plan.
 
 Restored `in_progress` tasks stay unchanged and are reported as
 `recoveryUncertain`: persistence is not process-liveness or completion proof.
-There is no automatic launch, acceptance, runtime result adapter, task panel or
+There is no automatic launch, acceptance, runtime result adapter or
 context injection here. Read/update commands do not restore runtime supervision.
 This is single-parent serialization, not multi-process CAS or an OS sandbox.
+
+### Task panel
+
+A separate native widget displays persisted tasks even after the process widget
+removes its agents. Only `accepted` tasks count as checked; result submission,
+process exit, skipped and cancelled tasks do not. Role/owner is the explicit
+stored `owner` value, not an inferred runtime role. Block reasons, unmet task
+dependencies, read-only errors and recovery uncertainty remain visible.
+
+- `/plan-view` toggles the compact/full list; compact shows six tasks.
+- `/plan-view expand` or `/plan-view full` shows all tasks.
+- `/plan-view compact` collapses the list.
+- `/plan-view details T1` (or a stable task UUID) shows scope, criteria, attempts,
+  run/result references, checks/evidence, acceptance/invalidation decisions,
+  status history, artifact and child-session references. These are recorded
+  references, not independently verified tests or proof that a process is live.
+  Details wrap to terminal width; previews over 120 lines are explicitly clipped.
+- `plan_read({ taskId: "..." })` provides full structured task data in non-TUI
+  modes too (existing 40KB text limit; no new mutation tool).
+
+Commands change presentation only and do not start model turns or create another
+checklist. Store changes and session restore/navigation refresh the widget without
+model polling. `/plan` still starts the existing planner workflow. Runtime task
+binding and automatic `caller_ping` projection are not implemented by this panel.
 
 ### Branch and plan-change semantics
 

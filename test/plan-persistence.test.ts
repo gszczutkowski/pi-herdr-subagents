@@ -109,7 +109,9 @@ test("registered tools execute bounded command API, not snapshot replacement", a
     conversation(sm);
     const tools = new Map<string, any>();
     const events = new Map<string, Function>();
-    registerPlanTools({ registerTool: tool => tools.set(tool.name, tool), on: (name, fn) => events.set(name, fn), appendEntry: (type, data) => sm.appendCustomEntry(type, data) } as any);
+    const commands = new Map<string, any>();
+    registerPlanTools({ registerTool: tool => tools.set(tool.name, tool), registerCommand: (name, command) => commands.set(name, command), on: (name, fn) => events.set(name, fn), appendEntry: (type, data) => sm.appendCustomEntry(type, data) } as any);
+    assert.ok(commands.has("plan-view"));
     const ctx = { sessionManager: sm };
     const invoke = async (command: any, expectedRevision: number) => (await tools.get("plan_update").execute("call", { command, expectedRevision }, undefined, undefined, ctx)).details;
     const created = await invoke({ action: "create", title: "Plan" }, 0);

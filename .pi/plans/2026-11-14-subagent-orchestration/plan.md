@@ -167,7 +167,9 @@ Weryfikacja Panel 2: osobny klucz widgetu `subagent-plan`, wiersze wyłącznie z
 - [x] Dla długich planów udostępnić skrót oraz rozwijaną pełną listę.
 
 Weryfikacja Panel 4: domyślnie sześć zadań i liczba ukrytych, licznik accepted zawsze dla całego planu. `/plan-view expand|full|compact` oraz przełączanie bez argumentu zmieniają tylko prezentację; istniejący `/plan` pozostaje bez zmian. Test z 30 zadaniami, rzeczywiste komendy, brak nowych wpisów sesji/rewizji, resize 1–120 kolumn. Panel 5/5, lint OK; bez live herdr.
-- [ ] Udostępnić szczegóły zadania: kryteria, próby, wyniki, testy, decyzje i odnośniki do sesji.
+- [x] Udostępnić szczegóły zadania: kryteria, próby, wyniki, testy, decyzje i odnośniki do sesji.
+
+Weryfikacja Panel 5: `/plan-view details Tn|taskId` pokazuje definicję, kryteria, wszystkie próby/run/result refs, checks/evidence z powiązaniami, decyzje accept/invalidate i historię statusów, artefakty i sesje potomne. Dane referencyjne nie są dowodem liveness ani niezależnie wykonanych testów; brak nowych pól autorytetu. Szczegóły zawijane, preview ograniczone do 120 linii z jawnym fallbackiem `plan_read(taskId)` (istniejący limit tekstu 40KB); fallback sprawdzony także bez jakiegokolwiek UI. Wybrany taskId nie przeskakuje na inne zadanie po zmianie gałęzi. Focused panel/store/persistence/branches/history 27/27, natywny lifecycle Pi z kontrolowanym providerem włącznie; lint OK. Pełne `npm test`: 380/399, tylko te same 19 błędów bazowych (18 Python/Claude hook, 1 CRLF release). Bez live herdr. Pominięto caller_ping/runtime task binding/context projection/workflow guidance zgodnie z zakresem.
 
 Przykład:
 
