@@ -151,10 +151,16 @@ test("actual Pi lifecycle bindings and model-issued plan tools persist through a
   try {
     const errors: unknown[] = [];
     let requests = 0;
+    const projected: string[] = [];
     const settingsManager = SettingsManager.inMemory({});
     const loader = new DefaultResourceLoader({
       cwd: dir, agentDir: dir, settingsManager, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
       extensionFactories: [registerPlanTools, pi => {
+        pi.on("context_with_system", event => {
+          const summary = event.messages.filter(message => message.role === "custom" && message.customType === "pi-subagents-plan-context/v1");
+          assert.equal(summary.length, 1);
+          projected.push(String((summary[0] as any).content));
+        });
         pi.registerProvider("plan-test", {
           baseUrl: "https://example.invalid", apiKey: "test", api: "plan-test-api",
           models: [{ id: "model", name: "model", reasoning: false, input: ["text"], contextWindow: 128000, maxTokens: 1000, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }],
@@ -182,6 +188,10 @@ test("actual Pi lifecycle bindings and model-issued plan tools persist through a
     await session.bindExtensions({ onError: error => errors.push(error) });
     await session.prompt("Create a durable plan");
     assert.equal(requests, 2);
+    assert.match(projected[0], /No readable active plan/);
+    assert.match(projected[1], /Runtime plan/);
+    assert.match(projected[1], /revision=0/);
+    assert.equal(sm.getEntries().filter(entry => entry.type === "custom_message" && entry.customType === "pi-subagents-plan-context/v1").length, 0);
     assert.deepEqual(errors, []);
     const reopened = SessionManager.open(sm.getSessionFile()!);
     const view = new PlanPersistence(() => {}, false).restore(reopened);

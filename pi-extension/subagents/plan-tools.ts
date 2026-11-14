@@ -3,6 +3,7 @@ import { Type, type Static, type TProperties } from "@sinclair/typebox";
 import { Value } from "@sinclair/typebox/value";
 import * as store from "./plan-store.ts";
 import { PlanPersistence } from "./plan-persistence.ts";
+import { registerPlanContext } from "./plan-context.ts";
 
 const text = () => Type.String({ minLength: 1, maxLength: 8192 });
 const list = <T extends ReturnType<typeof text>>(item: T) => Type.Array(item, { maxItems: 1000 });
@@ -59,7 +60,7 @@ function response(details: unknown) {
   return { content: [{ type: "text" as const, text: output.content + (output.truncated ? "\n[Truncated; use plan_read with taskId for details]" : "") }], details };
 }
 
-/** Single registration boundary; no launches, runtime result adapters, or UI/context hooks. */
+/** Single persistence boundary shared by tools and the request-time context projection. */
 export function registerPlanTools(pi: ExtensionAPI): PlanPersistence {
   const persistence = new PlanPersistence((type, data) => pi.appendEntry(type, data), Boolean(process.env.PI_SUBAGENT_ID || process.env.PI_SUBAGENT_SESSION));
   const restore = (_event: unknown, ctx: ExtensionContext) => { persistence.restore(ctx.sessionManager); };
@@ -90,5 +91,6 @@ export function registerPlanTools(pi: ExtensionAPI): PlanPersistence {
       return response({ planId: snapshot.planId, revision: snapshot.revision, authority: snapshot.authority, tasks: snapshot.tasks });
     },
   });
+  registerPlanContext(pi, persistence);
   return persistence;
 }

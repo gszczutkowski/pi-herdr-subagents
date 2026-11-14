@@ -187,7 +187,9 @@ Weryfikacja: instrukcje planner/worker/plan używają wyłącznie rodzicielskieg
 - [x] Sprawdzać dostępność wymaganych narzędzi i umiejętności przed obietnicą pełnego workflow.
 
 Weryfikacja: `/plan` wykonuje command-time preflight aktywnych narzędzi, odkrytych ról, wymaganych przez role umiejętności i ich plików, terminala oraz rzeczywistego pliku instrukcji. Błędy wskazują naprawę; opcjonalne helpery mają opisany manualny fallback. Zarejestrowana komenda: `test/plan-preflight.test.ts`; focused preflight/role-guidance 6/6, lint exit 0. Bez live herdr.
-- [ ] Zapewnić dostęp modelu do aktualnego skrótu planu także po kompakcji; sam widget i wpisy display-only nie stanowią kontekstu modelu.
+- [x] Zapewnić dostęp modelu do aktualnego skrótu planu także po kompakcji; sam widget i wpisy display-only nie stanowią kontekstu modelu.
+
+Weryfikacja: `plan-context.ts` projektuje jeden skrót ≤8192 bajtów UTF-8 (maks. 24 zadania, blokady najpierw) w hooku `context` przed każdym wywołaniem, czytając aktywną gałąź z tej samej instancji persistence co narzędzia. Id/revision, licznik accepted, stany i blokady, prawa dostępu, recovery uncertainty i odsyłacze `plan_read`; usuwa wyłącznie własną wcześniejszą projekcję, bez append/send/nowych tur. Testy: natywna retain-none compaction → mutation → świeży skrót, historyczna/nowa gałąź, child read-only, Unicode, bounds, brak duplikatów i niezmieniona reszta kontekstu. Rzeczywisty lifecycle Pi z kontrolowanym providerem dowodzi aktualizacji między wywołaniami narzędzi w tej samej turze i braku utrwalania skrótu. Focused plan/preflight/guidance 27/27; lint exit 0; pełne npm test 375/394, te same 19 błędów bazowych (18 Claude/Python, 1 CRLF release). Bez live herdr.
 
 Akceptacja etapu: użytkownik i agent główny potrafią jednoznacznie wskazać, co jest zaakceptowane, co jest wykonywane, co jest zablokowane i dlaczego.
 
