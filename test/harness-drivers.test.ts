@@ -10,6 +10,7 @@ import { __test__ as parentHarness } from "../pi-extension/subagents/index.ts";
 import {
   getHarnessDriver,
   registerHarnessDriver,
+  validateHarnessLaunch,
   PiHarnessDriver,
   ClaudeHarnessDriver,
   OpenCodeHarnessDriver,
@@ -109,6 +110,16 @@ describe("Harness Drivers Registry", () => {
     const resolved = getHarnessDriver("custom-agent");
     assert.equal(resolved.id, "custom-agent");
     assert.equal(resolved.name, "Custom Agent Engine");
+  });
+});
+
+describe("harness launch validation", () => {
+  it("rejects unsupported transfers and ignored native resume requests", () => {
+    assert.throws(() => validateHarnessLaunch(getHarnessDriver("claude"), "fork"), /does not support session mode "fork"/);
+    assert.throws(() => validateHarnessLaunch(getHarnessDriver("codex"), "lineage-only"), /does not support session mode "lineage-only"/);
+    assert.throws(() => validateHarnessLaunch(getHarnessDriver("pi"), "standalone", "native-id"), /does not support resumeSessionId/);
+    assert.doesNotThrow(() => validateHarnessLaunch(getHarnessDriver("pi"), "fork"));
+    assert.doesNotThrow(() => validateHarnessLaunch(getHarnessDriver("claude"), "standalone", "native-id"));
   });
 });
 

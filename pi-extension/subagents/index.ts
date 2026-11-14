@@ -40,6 +40,7 @@ import {
 } from "./runtime-routing.ts";
 import {
   getHarnessDriver,
+  validateHarnessLaunch,
   buildSubagentToolAllowlist,
   buildPiPromptArgs,
 } from "./harness/index.ts";
@@ -158,7 +159,7 @@ const SubagentParams = Type.Object({
   fork: Type.Optional(
     Type.Boolean({
       description:
-        "Force the full-context fork mode for this spawn. The sub-agent inherits the current session conversation, overriding any agent frontmatter session-mode.",
+        "Force full-context fork mode (Pi-backed agents only). Inherit the current conversation, overriding agent frontmatter session-mode; unsupported harnesses reject before launch.",
     }),
   ),
   interactive: Type.Optional(
@@ -1108,6 +1109,7 @@ export const __test__ = {
   handleSubagentInterrupt,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
+  launchSubagent,
   runningSubagents,
   formatElapsed,
 };
@@ -1161,6 +1163,11 @@ async function launchSubagent(
   const effectiveAutoExit = resolveEffectiveAutoExit(params, agentDefs);
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
 
+  const driver = getHarnessDriver(agentDefs?.cli ?? "pi");
+  const launchBehavior = resolveLaunchBehavior(params, agentDefs);
+  validateHarnessLaunch(driver, launchBehavior.sessionMode, params.resumeSessionId);
+  driver.validateRuntimePlan?.(runtimePlan, parentThinking);
+
   const sessionFile = ctx.sessionManager.getSessionFile();
   if (!sessionFile) throw new Error("No session file");
   const sessionId = ctx.sessionManager.getSessionId();
@@ -1182,10 +1189,6 @@ async function launchSubagent(
   ].join("-");
   const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
 
-  const cliId = agentDefs?.cli ?? "pi";
-  const driver = getHarnessDriver(cliId);
-  driver.validateRuntimePlan?.(runtimePlan, parentThinking);
-
   const surfacePreCreated = !!options?.surface;
   const surface = options?.surface ?? createSubagentSurface(params.name, resolveSubagentLayout());
   if (params.task) {
@@ -1194,8 +1197,6 @@ async function launchSubagent(
   if (!surfacePreCreated) {
     await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
   }
-
-  const launchBehavior = resolveLaunchBehavior(params, agentDefs);
 
   if (launchBehavior.seededSessionMode) {
     seedSubagentSessionFile({
