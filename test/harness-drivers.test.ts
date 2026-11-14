@@ -3,6 +3,10 @@ import { describe, it } from "node:test";
 import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { createAgentSession, DefaultResourceLoader, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
+import subagentDoneExtension from "../pi-extension/subagents/subagent-done.ts";
+import { getSubagentActivityFile } from "../pi-extension/subagents/activity.ts";
+import { __test__ as parentHarness } from "../pi-extension/subagents/index.ts";
 import {
   getHarnessDriver,
   registerHarnessDriver,
@@ -135,6 +139,64 @@ describe("Pi Harness Driver", () => {
     assert.ok(built.command.includes("--model 'anthropic/claude-sonnet-4-5'"));
     assert.ok(built.command.includes("--thinking 'high'"));
     assert.ok(built.command.includes("echo '__SUBAGENT_DONE_'$?'__'"));
+  });
+});
+
+describe("Pi activity path contract", () => {
+  it("boots the child writer at the generated path and exposes its tool snapshot to the parent", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-activity-contract-"));
+    const envNames = ["PI_SUBAGENT_ID", "PI_SUBAGENT_ACTIVITY_FILE", "PI_SUBAGENT_AUTO_EXIT", "PI_SUBAGENT_ASSIGNMENT_FILE"];
+    const previous = envNames.map((name) => process.env[name]);
+    let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
+    try {
+      const context = createMockLaunchContext({ artifactDir: join(dir, "artifacts with spaces") });
+      const built = new PiHarnessDriver().buildCommand(context);
+      const childActivityFile = /PI_SUBAGENT_ACTIVITY_FILE='([^']+)'/.exec(built.command)?.[1];
+      const childId = /PI_SUBAGENT_ID='([^']+)'/.exec(built.command)?.[1];
+      const parentActivityFile = getSubagentActivityFile(context.artifactDir, context.params.id);
+      assert.equal(childActivityFile, parentActivityFile);
+      assert.equal(childId, context.params.id);
+      // Use the launch environment, not the parent's expected path, for the child.
+      process.env.PI_SUBAGENT_ID = childId;
+      process.env.PI_SUBAGENT_ACTIVITY_FILE = childActivityFile;
+      process.env.PI_SUBAGENT_AUTO_EXIT = "0";
+      delete process.env.PI_SUBAGENT_ASSIGNMENT_FILE;
+      const settingsManager = SettingsManager.inMemory({});
+      const loader = new DefaultResourceLoader({
+        cwd: dir, agentDir: dir, settingsManager, noSkills: true, noPromptTemplates: true,
+        noThemes: true, noContextFiles: true, extensionFactories: [subagentDoneExtension],
+      });
+      await loader.reload();
+      ({ session } = await createAgentSession({
+        cwd: dir, agentDir: dir, resourceLoader: loader, settingsManager,
+        sessionManager: SessionManager.create(dir, dir),
+      }));
+      const errors: unknown[] = [];
+      await session.bindExtensions({ onError: (error) => errors.push(error) });
+      await session.extensionRunner!.emit({
+        type: "tool_execution_start", toolCallId: "contract-tool-call", toolName: "read", args: { path: "README.md" },
+      });
+      const running: any = {
+        id: context.params.id, name: "worker", task: context.params.task, cli: "pi",
+        surface: "unused", startTime: Date.now(), sessionFile: context.subagentSessionFile,
+        interactive: false, activityFile: parentActivityFile,
+      };
+      parentHarness.observeRunningSubagent(running);
+      assert.deepEqual(running.activityRead, { ok: true });
+      assert.equal(running.activity.latestEvent, "tool_execution_start");
+      assert.equal(running.activity.activeScope, "tool");
+      assert.equal(running.activity.toolName, "read");
+      assert.equal(running.activity.toolCallId, "contract-tool-call");
+      assert.equal(running.lifecycle.turn.kind, "active");
+      assert.deepEqual(errors, []);
+    } finally {
+      session?.dispose();
+      envNames.forEach((name, index) => {
+        if (previous[index] === undefined) delete process.env[name];
+        else process.env[name] = previous[index];
+      });
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

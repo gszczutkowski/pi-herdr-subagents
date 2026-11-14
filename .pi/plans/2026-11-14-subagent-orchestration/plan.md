@@ -60,7 +60,7 @@ Akceptacja: każde uruchomienie otrzymuje własną, niezmienną treść zadania 
 ### R2. Jedna ścieżka aktywności
 
 - [x] Ujednolicić wyznaczanie pliku aktywności między rodzicem a sterownikiem Pi.
-- [ ] Dodać test kontraktu sprawdzający zgodność ścieżki zapisu dziecka i odczytu rodzica.
+- [x] Dodać test kontraktu sprawdzający zgodność ścieżki zapisu dziecka i odczytu rodzica.
 
 Problem: rodzic oczekuje `subagent-activity/<id>.json`, a sterownik Pi przekazuje `subagent-activity-<id>.json`.
 
