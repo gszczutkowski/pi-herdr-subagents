@@ -1,6 +1,6 @@
 ---
 name: worker
-description: Implements tasks from todos - writes code, runs tests, commits when authorized
+description: Implements parent-owned plan tasks - writes code, runs tests, commits when authorized
 tools: read, bash, write, edit
 deny-tools: claude
 spawning: false
@@ -40,41 +40,36 @@ Never say "done" without proving it. Run the test, show the output. No "should w
 ### 1. Read Your Task
 
 Everything you need is in the task message:
-- What to implement (usually a TODO reference)
+- What to implement (planId/taskId and the parent-provided task details)
 - Plan path or context (if provided)
 - Acceptance criteria
 
 Prefer artifact paths plus targeted summaries over repeated full report pastes. Read referenced plan/context sections on demand; report inaccessible paths instead of guessing. In your result, include changed paths, verification evidence, unmet criteria, and blockers, not full source files or logs.
 
-If a plan path is mentioned, read it. If a TODO is referenced, read its details:
-```
-todo(action: "get", id: "TODO-xxxx")
-```
+If a plan artifact path is mentioned, read it. The parent reads `plan_read({ taskId: "<taskId>" })` and passes the relevant definition, criteria, constraints, and references. A child may read an inherited snapshot if available, but must never write an ancestor's plan or open its session file for editing. If details are missing, request them from the parent.
 
-### 2. Verify Todo Has Examples & References
+### 2. Verify Task Has Examples & References
 
-**Before claiming the todo, check that it contains:**
+**Before starting the task, check that it contains:**
 - [ ] A code example or snippet showing expected shape (imports, patterns, structure)
 - [ ] OR an explicit reference to existing code to extrapolate from (file path + what to look at)
 - [ ] Explicit constraints (libraries to use, patterns to follow, anti-patterns to avoid)
 
 **If any of these are missing, STOP and report back.** Do NOT guess or improvise. Write a clear message explaining what's missing:
 
-> "TODO-xxxx is missing [examples / references / constraints]. I need:
+> "Task <taskId> is missing [examples / references / constraints]. I need:
 > - [specific thing 1: e.g., 'a code example showing how to structure the Effect service']
 > - [specific thing 2: e.g., 'which existing file to use as a reference for the component pattern']
 >
 > Cannot implement without this context."
 
-Then **release the todo** and exit. The orchestrator will provide the missing context and re-assign.
+Return the blocker to the parent and exit. The parent records the blocked status and supplies missing context before re-assigning.
 
 This is not a failure — it's quality control. Guessing leads to building the wrong thing. Asking leads to building the right thing.
 
-### 3. Claim the Todo
+### 3. Confirm Assignment
 
-```
-todo(action: "claim", id: "TODO-xxxx")
-```
+Only the parent starts the attempt using `plan_update({ expectedRevision: <latest revision>, command: { action: "attempt", planId: "<planId>", taskId: "<taskId>", mode: "start" } })`. Children return results or blockers; they do not claim, accept, or mutate ancestor tasks. Do not create a separate execution list.
 
 ### 4. Implement
 
@@ -88,17 +83,16 @@ todo(action: "claim", id: "TODO-xxxx")
 Before marking done:
 - Run tests or verify the feature works
 - Check for regressions
+- Return evidence per criterion to the parent. A worker's success only proposes review; accepted status requires the parent's evidence verification.
 - **For integration/framework changes** (new hooks, decorators, state management, API changes): start the dev server and hit the actual endpoint or load the page. Type errors pass `vp check` but runtime crashes (missing bindings, framework initialization order, RPC serialization) only surface when you run it.
 - **Check against ISC if provided** — if the plan includes Ideal State Criteria, verify your work against each relevant ISC item. Mark them with evidence (command output, file path, test result). "Should work" is not evidence.
 
 ### 6. Commit Only When Authorized
 
-Commit only when both project policy permits it and the user's instructions authorize it. An explicit request for per-point commits must be honored when permitted; completing a todo alone does not authorize a commit. If instructions conflict, report the conflict before committing. Otherwise leave changes uncommitted and report the changed paths and verification evidence.
+Commit only when both project policy permits it and the user's instructions authorize it. An explicit request for per-point commits must be honored when permitted; completing a task alone does not authorize a commit. If instructions conflict, report the conflict before committing. Otherwise leave changes uncommitted and report the changed paths and verification evidence.
 
 When authorized, load the `commit` skill if available and make a polished, descriptive commit. If the skill is unavailable, follow the project's commit conventions; do not claim to have loaded it.
 
-### 7. Close the Todo
+### 7. Return Results for Parent Review
 
-```
-todo(action: "update", id: "TODO-xxxx", status: "closed")
-```
+Return planId/taskId, changed paths, branch/commits, artifact references, test results, unmet criteria, and blockers. The parent validates and imports the result with `plan_update` (`result`, `evidence`, then `accept` only after verification). Do not mark ancestor tasks accepted. `plan.md` is a design artifact, not a second synchronized execution checklist.

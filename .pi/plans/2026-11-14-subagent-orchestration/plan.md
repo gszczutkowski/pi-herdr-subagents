@@ -181,7 +181,9 @@ Plan: Przebudowa logowania                2/6 zaakceptowanych
 - [x] Ustalić, czy rozszerzenie ma własny minimalny magazyn zadań, czy adapter do istniejącego zewnętrznego `todo`.
 
 Decyzja użytkownika: własny minimalny magazyn planów i zadań w rozszerzeniu, bez zależności od zewnętrznego `todo`. Panel i narzędzia modelu korzystają z tego samego stanu; ewentualny przyszły adapter nie tworzy niezależnej listy.
-- [ ] Nie utrzymywać dwóch niezależnych list wymagających ręcznej synchronizacji.
+- [x] Nie utrzymywać dwóch niezależnych list wymagających ręcznej synchronizacji.
+
+Weryfikacja: instrukcje planner/worker/plan używają wyłącznie rodzicielskiego `plan_read`/`plan_update`; dzieci zwracają propozycje i dowody, rodzic importuje i weryfikuje akceptację. `plan.md` pozostaje artefaktem projektu, nie drugą listą statusów. Przykłady komend odpowiadają schematowi `plan-tools.ts`; jawne attach `run` bez nieistniejącego adaptera.
 - [ ] Sprawdzać dostępność wymaganych narzędzi i umiejętności przed obietnicą pełnego workflow.
 - [ ] Zapewnić dostęp modelu do aktualnego skrótu planu także po kompakcji; sam widget i wpisy display-only nie stanowią kontekstu modelu.
 
