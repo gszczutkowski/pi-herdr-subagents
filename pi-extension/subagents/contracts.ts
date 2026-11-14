@@ -49,6 +49,20 @@ export function normalizeStructuredResult(value: unknown): { structuredResult?: 
   return { structuredResult: structuredClone(value) };
 }
 
+/** Semantic checks are diagnostics, not certification or evidence import. */
+export function resultClaimDiagnostics(result: StructuredResult, task: Pick<PlanTask, "criteria">): string[] {
+  const known = new Set(task.criteria.map(c => c.criterionId));
+  const claimed = [...result.checks.flatMap(c => c.criterionIds), ...result.unmetCriterionIds];
+  const unknown = [...new Set(claimed.filter(id => !known.has(id)))];
+  const diagnostics = unknown.length ? [`Unknown criterion references: ${unknown.join(", ")}`] : [];
+  if (result.status === "complete") {
+    const missing = task.criteria.filter(c => result.unmetCriterionIds.includes(c.criterionId)
+      || !result.checks.some(check => check.outcome === "passed" && check.criterionIds.includes(c.criterionId)));
+    if (missing.length) diagnostics.push(`Complete claim lacks passing evidence proposals for criteria: ${missing.map(c => c.criterionId).join(", ")}`);
+  }
+  return diagnostics;
+}
+
 export function contractTask(task: string, contract?: AssignmentContract): string {
   if (!contract) return task;
   return `${task}\n\nAssignment contract (worker claims are proposals; parent verifies all criteria):\n${JSON.stringify(contract, null, 2)}`;

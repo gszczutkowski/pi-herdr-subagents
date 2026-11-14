@@ -3,6 +3,7 @@ import { Value } from "@sinclair/typebox/value";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { PlanPersistence } from "./plan-persistence.ts";
 import { attachRun, recordResult, type Authority, type ResultReference } from "./plan-store.ts";
+import { isStructuredResult, resultClaimDiagnostics } from "./contracts.ts";
 import type { DeliveryEnvelope } from "./delivery.ts";
 import type { RuntimeStore, DurableRun } from "./runtime-store.ts";
 
@@ -61,8 +62,11 @@ export function importPlanEnvelope(persistence: PlanPersistence, ctx: ExtensionC
     kind: ping ? "ping" : failure ? "failure" : "result", ...((ping || failure) ? { reason } : {}) };
   const plan = persistence.read(ctx.sessionManager).snapshot;
   if (!plan) throw new Error("Original plan branch is not selected");
+  const task = plan.tasks.find(t => t.taskId === binding.taskId);
+  const diagnostics = task && isStructuredResult(d.structuredResult) ? resultClaimDiagnostics(d.structuredResult, task) : [];
+  const proposal = diagnostics.length && result.kind === "result" ? { ...result, reason: `Worker proposal requires parent review: ${diagnostics.join("; ")}`.slice(0, 8192) } : result;
   persistence.mutate(ctx.sessionManager, binding.planId, plan.revision,
-    (p, c) => recordResult(p, c, binding.taskId, binding.attemptId, result), binding.authority);
+    (p, c) => recordResult(p, c, binding.taskId, binding.attemptId, proposal), binding.authority);
 }
 
 export function recordDispatchFailure(persistence: PlanPersistence, ctx: ExtensionContext,
