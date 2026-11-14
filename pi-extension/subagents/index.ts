@@ -1903,6 +1903,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         if (params.autoExit !== undefined && params.autoExit !== profile.autoExit) {
           throw new Error("Resume must preserve the saved autoExit/interactivity profile. Start a new subagent to change it.");
         }
+        const previousOwner = sessionOwners.get(params.sessionPath);
+        if (previousOwner?.surface) {
+          const inspection = await inspectPane(previousOwner.surface);
+          // Inspection yielded: never release a replacement owner's reservation.
+          if (inspection.kind === "missing" && sessionOwners.get(params.sessionPath) === previousOwner) {
+            releaseSession(params.sessionPath, previousOwner.runId);
+          }
+        }
         const liveOwner = sessionOwners.get(params.sessionPath);
         if (liveOwner && runningSubagents.has(liveOwner.runId)) {
           const child = runningSubagents.get(liveOwner.runId)!;
@@ -1932,14 +1940,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
-        const previousOwner = sessionOwners.get(params.sessionPath);
-        if (previousOwner?.surface) {
-          const inspection = await inspectPane(previousOwner.surface);
-          // Inspection yielded: never release a replacement owner's reservation.
-          if (inspection.kind === "missing" && sessionOwners.get(params.sessionPath) === previousOwner) {
-            releaseSession(params.sessionPath, previousOwner.runId);
-          }
-        }
         const owner = reserveSession(params.sessionPath, id);
         try {
         // Record entry count before resuming so we can extract new messages
