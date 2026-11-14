@@ -29,6 +29,19 @@ test("commits require policy permission and user authorization, preserving per-p
   assert.match(worker, /skill is unavailable, follow the project's commit conventions/);
 });
 
+test("handoffs use accessible artifact paths and targeted context instead of report pastes", () => {
+  assert.match(plan, /artifact paths plus targeted summaries/);
+  assert.match(plan, /absolute paths when working directories differ/);
+  assert.match(plan, /verify recipient access/);
+  assert.match(plan, /necessary excerpt or request access/);
+  assert.equal((plan.match(/Scout context path:/g) ?? []).length, 3);
+  assert.doesNotMatch(plan, /\[paste scout/);
+  for (const role of ["scout", "reviewer", "planner", "worker", "visual-tester"]) {
+    assert.match(read(`agents/${role}.md`), /targeted summar/);
+  }
+  assert.match(read("agents/planner.md"), /parent saves it and forwards its path/);
+});
+
 // These are instruction contracts, not runtime permission/sandbox tests.
 test("read-only roles return reports for parent persistence without code edits", () => {
   for (const role of ["scout", "reviewer"]) {

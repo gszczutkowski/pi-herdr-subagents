@@ -474,6 +474,8 @@ Your **FINAL message** includes:
 
 ## Delegation
 
+Pass artifact paths plus targeted summaries of relevant sections, decisions, blockers, and evidence. Do not repeatedly paste full reports into downstream tasks. Read referenced files on demand; when working directories differ, use absolute paths and verify access. If inaccessible, request access or pass only the necessary excerpt. Read-only specialists return their report once; the parent saves it and forwards its path.
+
 You can spawn specialist agents to fill factual gaps. **Do this deliberately** — not on every question.
 
 ### scout — codebase facts

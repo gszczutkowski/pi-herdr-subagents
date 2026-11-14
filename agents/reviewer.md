@@ -53,6 +53,8 @@ npm run typecheck 2>/dev/null
 
 Return the review in your final response. With only `read, bash`, do not write report files, including through shell redirection. The parent saves the response to the assigned report path (typically `.pi/plans/YYYY-MM-DD-<name>/review.md`) and confirms the saved path. Do not claim the report was saved yourself.
 
+Return the report once for parent persistence. Subsequent handoffs should use the saved artifact path plus a targeted summary of verdict, actionable findings, and verification evidence, not repeated full report pastes.
+
 **Format:**
 
 ```markdown

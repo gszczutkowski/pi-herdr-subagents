@@ -54,6 +54,8 @@ Spend ~30 seconds. Tech stack, project shape, and the area relevant to the user'
 
 For a planning run, pick a short `<name>` (e.g. `auth-redesign`) and use a shared directory under `.pi/plans/YYYY-MM-DD-<name>/` for every deliverable. Pass explicit paths in each subagent's task. For read-only scout/reviewer roles, save their final response at the assigned path using the parent's `write` tool, then confirm the file exists with `read`. Roles with `write` may save their own assigned artifacts. Never ask a read-only role to bypass its tool policy through bash.
 
+Handoffs carry artifact paths plus targeted summaries, not repeated full report pastes. Include relevant sections or line ranges, decisions, blockers, and evidence needed for the next task. Recipients read the referenced artifacts on demand. Use absolute paths when working directories differ; verify recipient access and, if unavailable, provide only the necessary excerpt or request access.
+
 Standard filenames:
 
 - `.pi/plans/YYYY-MM-DD-<name>/scout-context.md`
@@ -93,8 +95,8 @@ subagent({
   interactive: true,
   task: `Plan: [what the user wants to build]
 
-Scout context:
-[paste scout findings here — file structure, conventions, patterns, relevant code]
+Scout context path: [absolute scout-context.md path; read relevant sections]
+Targeted summary: [only findings and decisions relevant to this plan]
 
 Save the final plan to: .pi/plans/YYYY-MM-DD-<name>/plan.md
 Create todos tagged with: <name>`,
@@ -125,7 +127,7 @@ subagent({
 });
 ```
 
-Fold the new context into the worker tasks.
+Pass the updated context path and a targeted summary of new findings to worker tasks.
 
 ---
 
@@ -152,14 +154,14 @@ Use coherent, verifiable units of work, not a fixed time limit. Each unit needs 
 subagent({
   name: "🔨 Worker 1/N",
   agent: "worker",
-  task: "Implement TODO-xxxx. Mark the todo as done. Plan: [plan path]\n\nScout context: [paste scout summary from Phase 2, plus any re-scout from Phase 3]",
+  task: "Implement TODO-xxxx. Mark the todo as done. Plan: [plan path]\n\nScout context path: [absolute scout-context.md path]. Read [relevant sections]. Targeted summary: [relevant findings, including re-scout paths if any]",
 });
 
 // Check result, then next todo
 subagent({
   name: "🔨 Worker 2/N",
   agent: "worker",
-  task: "Implement TODO-yyyy. Mark the todo as done. Plan: [plan path]\n\nScout context: [paste scout summary]",
+  task: "Implement TODO-yyyy. Mark the todo as done. Plan: [plan path]\n\nScout context path: [absolute scout-context.md path]. Read [relevant sections]. Targeted summary: [findings relevant to this task]",
 });
 ```
 

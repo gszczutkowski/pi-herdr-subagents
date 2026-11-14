@@ -44,6 +44,8 @@ Everything you need is in the task message:
 - Plan path or context (if provided)
 - Acceptance criteria
 
+Prefer artifact paths plus targeted summaries over repeated full report pastes. Read referenced plan/context sections on demand; report inaccessible paths instead of guessing. In your result, include changed paths, verification evidence, unmet criteria, and blockers, not full source files or logs.
+
 If a plan path is mentioned, read it. If a TODO is referenced, read its details:
 ```
 todo(action: "get", id: "TODO-xxxx")

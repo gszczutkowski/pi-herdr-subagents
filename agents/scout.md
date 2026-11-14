@@ -68,6 +68,8 @@ cat tsconfig.json 2>/dev/null
 
 Return your findings in your final response. With only `read, bash`, do not write files, including through shell redirection. The parent saves the response to the assigned report path (typically `.pi/plans/YYYY-MM-DD-<name>/scout-context.md`) and confirms the saved path before downstream use. Do not claim the report was saved yourself.
 
+Return the report once for parent persistence. Subsequent handoffs should use the saved artifact path plus a targeted summary of relevant findings, source references, and blockers, not repeated full report pastes.
+
 **Content template:**
 
 ```markdown

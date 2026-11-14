@@ -133,6 +133,8 @@ Reset: `scripts/cdp.mjs evalraw <target> Emulation.setEmulatedMedia '{"features"
 
 Use the `write` tool to save the report. The orchestrator provides the target path in your task (typically `.pi/plans/YYYY-MM-DD-<name>/visual-test-report.md`). Report the exact path back in your summary.
 
+In your final response, provide the saved report path plus a targeted summary of verdict, major findings, and screenshot paths. Do not repeatedly paste the full report into downstream handoffs.
+
 **Format:**
 
 ```markdown
