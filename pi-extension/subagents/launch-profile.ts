@@ -69,7 +69,7 @@ export function readPiLaunchProfile(sessionFile: string): LaunchProfile {
   }
   const nullableString = (value: unknown) => value === null || typeof value === "string";
   const plan = p?.runtimePlan;
-  if ((p?.lineage !== undefined && !isLineage(p.lineage)) || p?.version !== 1 || p.harness !== "pi" || p.sessionFile !== canonicalSessionPath(sessionFile) ||
+  if ((p?.lineage !== undefined && (!isLineage(p.lineage) || p.lineage.child.sessionFile !== p.sessionFile)) || p?.version !== 1 || p.harness !== "pi" || p.sessionFile !== canonicalSessionPath(sessionFile) ||
     (p.planTask !== undefined && !isPlanTaskBinding(p.planTask)) ||
     typeof p.cwd !== "string" || !isAbsolute(p.cwd) ||
     typeof p.agentDir !== "string" || !isAbsolute(p.agentDir) ||

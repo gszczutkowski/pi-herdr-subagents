@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, fsyncSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, fsyncSync, linkSync, mkdirSync, openSync, opendirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Type, type Static } from "@sinclair/typebox";
 import { Value } from "@sinclair/typebox/value";
@@ -36,7 +36,7 @@ export function recordHistory(lineage: Lineage | undefined, runId: string, kind:
   const id = createHash("sha256").update(JSON.stringify([lineage, runId, kind, sourceId])).digest("hex");
   const event: HistoryEvent = { version: 1, id, timestamp: new Date().toISOString(), lineage,
     runId, kind, summary: boundedSummary(summary), refs: refs.slice(0, 4).map(ref => ref.slice(0, 4096)) };
-  if (!isHistoryEvent(event)) return false;
+  if (!isHistoryEvent(event) || Buffer.byteLength(JSON.stringify(event), "utf8") > 24576) return false;
   const temporary = join(lineage.eventDirectory, `${randomUUID()}.tmp`);
   let fd: number | undefined;
   try {
@@ -65,8 +65,16 @@ export function readHistory(anchors: Lineage[], limit = 2000): HistoryEvent[] {
   // Bounded even on hostile/corrupt directories. Omitted records stay on disk.
   for (const directory of new Set(anchors.map(a => a.eventDirectory))) {
     try {
-      const names = readdirSync(directory).filter(n => /^[a-f0-9]{64}\.json$/.test(n)).sort().slice(0, 10000);
-      for (const name of names) {
+      const names: string[] = [];
+      const directoryHandle = opendirSync(directory);
+      try {
+        for (let count = 0; count < 10000; count++) {
+          const entry = directoryHandle.readSync();
+          if (!entry) break;
+          if (entry.isFile() && /^[a-f0-9]{64}\.json$/.test(entry.name)) names.push(entry.name);
+        }
+      } finally { directoryHandle.closeSync(); }
+      for (const name of names.sort()) {
         try {
           const path = join(directory, name);
           if (statSync(path).size > 24576) continue;

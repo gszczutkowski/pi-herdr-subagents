@@ -51,6 +51,18 @@ Reads cap directory enumeration at 10,000 records and retain at most 2,000 event
 older omitted records remain on disk. File fsync does not promise directory fsync
 or survival of every event after power loss.
 
+`/subagents-tree` toggles a separate native provenance widget, even with no active
+processes. Use `expand`, `compact`, `toggle <sessionId>` or `refresh`. Expanded
+nodes show the last three bounded explicit events. The tree caps sessions at 200,
+depth at 16 and output at 120 width-aware lines; malformed cycles/disconnected
+components cannot recurse indefinitely. It is a history view, not liveness or
+terminal controls. Root file observation starts only after `session_start`, is
+cleaned up on shutdown, and updates UI without a model turn. Unsupported/missing
+filesystem watch support falls back to command/tool refresh. The interactive TUI
+renders the widget; other UI modes receive command summaries, while print mode
+has no visible widget. No live herdr/provider E2E is claimed by the unit/native
+session tests.
+
 ### Result delivery boundary
 
 Pi's extension `sendMessage` returns `void`. A normal return acknowledges only

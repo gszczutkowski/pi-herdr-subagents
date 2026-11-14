@@ -216,7 +216,9 @@ Weryfikacja: opcjonalne strict-schema lineage zawiera rzeczywiste header IDs i c
 - [x] Dodać krótką historię jawnych komunikatów, decyzji i zmian stanu.
 
 Weryfikacja: root-owned subagent-history zawiera atomowe, immutable unique-event records (320 bajtów skrótu, maks. cztery refs), assignment/ping/result/failure/continuation oraz diff autorytatywnego PlanPersistence (status/accept/invalidate). Root odczytuje tylko zgodne aktywne natywne assignment/custody checkpoints, canonical root ID/file/token; bez pełnych rozmów, raportów ani reasoning i bez sendMessage/model wake dla descendant history. Focused lineage/history/runtime-execute/profile 13/13, lint OK; bez live herdr. Same-user fs trust, ograniczony odczyt, brak sandbox i gwarancji trwałości katalogu po awarii zasilania.
-- [ ] Dodać zwijane drzewo zagnieżdżonych podagentów bez kopiowania ich całych rozmów do rodzica głównego.
+- [x] Dodać zwijane drzewo zagnieżdżonych podagentów bez kopiowania ich całych rozmów do rodzica głównego.
+
+Weryfikacja: /subagents-tree toggle/expand/compact/toggle sessionId/refresh steruje osobnym natywnym widgetem opartym wyłącznie na autoryzowanych lineage/history, także bez procesów. Max 200 sesji/16 poziomów/120 linii, Unicode/narrow/cycles/missing parents. fs.watch uruchamiany dopiero session_start, shutdown zamyka watchery i timeout; zmiany potomków odświeżają wyłącznie UI, bez budzenia modelu. Test używa prawdziwego SessionManager, prawdziwych atomowych eventfiles i fs.watch oraz mockowanej granicy widget/komenda; testy command metadata obejmują fork/nested/closed resume. Nowe testy 6/6, focused wcześniejszy run 57/57; final pełny sequential 402/421, zero skip, wyłącznie 19 błędów bazowych (18 Claude/Python, 1 CRLF release), lint exit 0. Bez live herdr/provider E2E. Brak wsparcia fs.watch → ręczny/tool refresh; limity i zakres platform opisane w README.
 
 Przykład:
 

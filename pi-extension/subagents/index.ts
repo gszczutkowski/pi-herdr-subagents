@@ -10,6 +10,7 @@ import { persistLaunchProfile, persistProfileBinding, readPiLaunchProfile, resol
 import { continueLiveChild } from "./live-continuation.ts";
 import { createLineage, type Lineage } from "./lineage.ts";
 import { recordHistory, registerPlanHistory } from "./history.ts";
+import { registerHistoryView } from "./history-view.ts";
 import { RuntimeStore, readRuntimeManifest, type RuntimeParent } from "./runtime-store.ts";
 import { reconcileRuntime } from "./runtime-recovery.ts";
 import type { SubagentLaunchContext } from "./harness/types.ts";
@@ -1667,6 +1668,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     for (const event of Object.values(runtime.store?.snapshot().outbox ?? {})) delivery.onEnvelope?.(event.runId, event.envelope);
   };
   pi.on("context", () => { retryPlanImports(); });
+  registerHistoryView(pi, ctx => join(getArtifactDir(ctx.sessionManager.getSessionDir(), ctx.sessionManager.getSessionId()), "subagent-history"));
   // A factory API is not bound yet. Never fall back to a captured pre-reload API.
   runtime.pi = undefined; // Also invalidate the legacy global runtime field.
   pauseDeliveries(delivery);
@@ -1913,6 +1915,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             task: params.task,
             agent: params.agent,
             sessionFile: running.sessionFile,
+            lineage: running.lineage,
             launchScriptFile: running.launchScriptFile,
             model: running.runtimePlan?.model,
             thinking: running.runtimePlan?.thinking,
@@ -2310,6 +2313,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             id,
             name,
             sessionPath: params.sessionPath,
+            lineage: profile.lineage,
             launchScriptFile,
             status: "started",
           },
