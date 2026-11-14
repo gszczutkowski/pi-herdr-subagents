@@ -134,7 +134,9 @@ Weryfikacja: `plan-store.ts` tworzy UUID planu/zadania, referencjonuje istnieją
 - [x] Oddzielić zadanie od prób jego realizacji; resume i retry nie tworzą nowego zadania.
 
 Weryfikacja: osobne attemptId, jawne attachRun dla resume, retry zachowuje taskId; wiele wyników keepOpen pozostaje w tej samej próbie. Testy obejmują deduplikację i konflikt eventId, referencje sesji i roundtrip.
-- [ ] Przechowywać tytuł, zakres, kryteria akceptacji, zależności, właściciela, powiązane uruchomienia, artefakty i dowody.
+- [x] Przechowywać tytuł, zakres, kryteria akceptacji, zależności, właściciela, powiązane uruchomienia, artefakty i dowody.
+
+Weryfikacja: stabilne criterionId, graf zależności (brakujące/self/cykle odrzucane), ograniczone referencje artefaktów/wyników/dowodów. Akceptacja mapuje wszystkie kryteria do dowodów; edycja definicji unieważnia akceptację do review z zachowaniem historii decyzji. Pokrycie: `test/plan-store.test.ts`.
 - [ ] Rozróżniać stany: oczekuje, realizowane, zablokowane, do weryfikacji, zaakceptowane, nieudane oraz pominięte/anulowane.
 - [ ] Zachować stan zadań po zamknięciu terminala, reloadzie i wznowieniu sesji.
 - [ ] Jawnie określić semantykę rozgałęziania sesji i zmian planu.

@@ -9,7 +9,26 @@ export interface Attempt {
   readonly results: readonly ResultReference[];
 }
 export interface ResultReference { readonly eventId: string; readonly runId: string; readonly ref: string }
-export interface PlanTask { readonly taskId: string; readonly title: string; readonly attempts: readonly Attempt[] }
+export type TaskStatus = "pending" | "in_progress" | "blocked" | "in_review" | "accepted" | "failed" | "skipped" | "cancelled";
+export interface Criterion { readonly criterionId: string; readonly text: string }
+export interface Artifact { readonly artifactId: string; readonly ref: string }
+export interface Evidence { readonly evidenceId: string; readonly criterionId: string; readonly ref: string; readonly artifactId?: string; readonly resultEventId?: string }
+export interface Decision { readonly revision: number; readonly kind: "accept" | "invalidate"; readonly reason: string; readonly criteria: Readonly<Record<string, readonly string[]>> }
+export interface TaskDetails {
+  readonly scope: string;
+  readonly criteria: readonly Criterion[];
+  readonly dependencies: readonly string[];
+  readonly owner: string;
+  readonly artifacts: readonly Artifact[];
+}
+export interface PlanTask extends TaskDetails {
+  readonly taskId: string;
+  readonly title: string;
+  readonly attempts: readonly Attempt[];
+  readonly evidence: readonly Evidence[];
+  readonly decisions: readonly Decision[];
+  readonly status: TaskStatus;
+}
 export interface PlanSnapshot {
   readonly schemaVersion: 1;
   readonly revision: number;
@@ -42,7 +61,36 @@ function validate(plan: PlanSnapshot): void {
   requireValue(Array.isArray(plan.tasks) && plan.tasks.length <= 1000, "Invalid tasks");
   const ids = new Set<string>();
   for (const task of plan.tasks) {
-    uuid(task.taskId); text(task.title);
+    uuid(task.taskId); text(task.title); text(task.scope); text(task.owner);
+    requireValue(["pending", "in_progress", "blocked", "in_review", "accepted", "failed", "skipped", "cancelled"].includes(task.status), "Invalid status");
+    for (const list of [task.criteria, task.dependencies, task.artifacts, task.evidence, task.decisions]) requireValue(Array.isArray(list) && list.length <= 1000, "Invalid bounded list");
+    const criteria = new Set<string>();
+    for (const criterion of task.criteria) {
+      uuid(criterion.criterionId); text(criterion.text);
+      requireValue(!criteria.has(criterion.criterionId), "Duplicate criterion"); criteria.add(criterion.criterionId);
+    }
+    const artifacts = new Set<string>();
+    for (const artifact of task.artifacts) {
+      uuid(artifact.artifactId); text(artifact.ref);
+      requireValue(!artifacts.has(artifact.artifactId), "Duplicate artifact"); artifacts.add(artifact.artifactId);
+    }
+    const evidenceIds = new Set<string>();
+    for (const evidence of task.evidence) {
+      uuid(evidence.evidenceId); uuid(evidence.criterionId); text(evidence.ref);
+      requireValue(!evidenceIds.has(evidence.evidenceId), "Duplicate evidence"); evidenceIds.add(evidence.evidenceId);
+      if (evidence.artifactId !== undefined) requireValue(artifacts.has(evidence.artifactId), "Unknown artifact");
+      if (evidence.resultEventId !== undefined) requireValue(task.attempts.some(a => a.results.some(r => r.eventId === evidence.resultEventId)), "Unknown result reference");
+    }
+    for (const decision of task.decisions) {
+      text(decision.reason);
+      requireValue(["accept", "invalidate"].includes(decision.kind) && Number.isSafeInteger(decision.revision) && decision.revision <= plan.revision, "Invalid decision");
+      for (const refs of Object.values(decision.criteria)) requireValue(Array.isArray(refs) && refs.length <= 1000 && refs.every(id => evidenceIds.has(id)), "Unknown decision evidence");
+    }
+    if (task.status === "accepted") {
+      const decision = task.decisions.at(-1);
+      requireValue(decision?.kind === "accept", "Missing acceptance decision");
+      validateAcceptance(task, decision.criteria);
+    }
     requireValue(!ids.has(task.taskId), "Duplicate task ID"); ids.add(task.taskId);
     requireValue(Array.isArray(task.attempts) && task.attempts.length <= 1000, "Invalid attempts");
     const attemptIds = new Set<string>();
@@ -64,6 +112,28 @@ function validate(plan: PlanSnapshot): void {
       }
     }
   }
+  const visiting = new Set<string>();
+  const visited = new Set<string>();
+  function visit(task: PlanTask): void {
+    requireValue(!visiting.has(task.taskId), "Cyclic dependencies");
+    if (visited.has(task.taskId)) return;
+    visiting.add(task.taskId);
+    requireValue(new Set(task.dependencies).size === task.dependencies.length, "Duplicate dependency");
+    for (const id of task.dependencies) {
+      requireValue(id !== task.taskId, "Self dependency");
+      const dependency = plan.tasks.find(t => t.taskId === id);
+      requireValue(dependency, "Missing dependency"); visit(dependency);
+    }
+    visiting.delete(task.taskId); visited.add(task.taskId);
+  }
+  plan.tasks.forEach(visit);
+}
+function validateAcceptance(task: PlanTask, mapping: Readonly<Record<string, readonly string[]>>): void {
+  requireValue(task.criteria.length > 0 && Object.keys(mapping).length === task.criteria.length, "Map ALL criteria");
+  for (const criterion of task.criteria) {
+    const refs = mapping[criterion.criterionId];
+    requireValue(Array.isArray(refs) && refs.length > 0 && refs.every(id => task.evidence.some(e => e.evidenceId === id && e.criterionId === criterion.criterionId)), "Missing valid criterion evidence");
+  }
 }
 function snapshot(plan: PlanSnapshot): PlanSnapshot {
   const copy = structuredClone(plan); validate(copy); return freeze(copy);
@@ -79,8 +149,28 @@ function update(plan: PlanSnapshot, context: CommandContext, tasks: readonly Pla
 export function createPlan(title: string, authority: Authority): PlanSnapshot {
   return snapshot({ schemaVersion: 1, revision: 0, planId: randomUUID(), title, authority, tasks: [] });
 }
-export function addTask(plan: PlanSnapshot, context: CommandContext, title: string): PlanSnapshot {
-  return update(plan, context, [...plan.tasks, { taskId: randomUUID(), title, attempts: [] }]);
+export function addTask(plan: PlanSnapshot, context: CommandContext, title: string, details: Partial<TaskDetails> = {}): PlanSnapshot {
+  return update(plan, context, [...plan.tasks, { taskId: randomUUID(), title, scope: title, owner: plan.authority.sessionId, criteria: [], dependencies: [], artifacts: [], ...details, attempts: [], evidence: [], decisions: [], status: "pending" }]);
+}
+export function createCriterion(textValue: string): Criterion { text(textValue); return freeze({ criterionId: randomUUID(), text: textValue }); }
+export function createArtifact(ref: string): Artifact { text(ref); return freeze({ artifactId: randomUUID(), ref }); }
+export function editTask(plan: PlanSnapshot, context: CommandContext, taskId: string, patch: Partial<TaskDetails & { title: string }>): PlanSnapshot {
+  const allowed = ["title", "scope", "criteria", "dependencies", "owner", "artifacts"];
+  requireValue(Object.keys(patch).every(key => allowed.includes(key)), "Unsupported task edit");
+  return changeTask(plan, context, taskId, task => ({ ...task, ...patch, ...(task.status === "accepted" ? { status: "in_review" as const, decisions: [...task.decisions, { revision: plan.revision + 1, kind: "invalidate" as const, reason: "Task definition edited", criteria: {} }] } : {}) }));
+}
+export function addEvidence(plan: PlanSnapshot, context: CommandContext, taskId: string, evidence: Omit<Evidence, "evidenceId">): PlanSnapshot {
+  return changeTask(plan, context, taskId, task => {
+    requireValue(task.criteria.some(c => c.criterionId === evidence.criterionId), "Unknown criterion");
+    return { ...task, evidence: [...task.evidence, { ...evidence, evidenceId: randomUUID() }] };
+  });
+}
+export function accept(plan: PlanSnapshot, context: CommandContext, taskId: string, criteria: Readonly<Record<string, readonly string[]>>, reason: string): PlanSnapshot {
+  text(reason);
+  return changeTask(plan, context, taskId, task => {
+    validateAcceptance(task, criteria);
+    return { ...task, status: "accepted", decisions: [...task.decisions, { revision: plan.revision + 1, kind: "accept", reason, criteria }] };
+  });
 }
 /** References an existing runtime ID; this module never creates a second runtime identity. */
 export function attachRun(plan: PlanSnapshot, context: CommandContext, taskId: string, attemptId: string, runId: string): PlanSnapshot {

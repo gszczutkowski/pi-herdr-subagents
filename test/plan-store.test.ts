@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createPlan, addTask, attachRun, startAttempt, retry, recordResult, serializePlan, deserializePlan } from "../pi-extension/subagents/plan-store.ts";
+import { createPlan, addTask, createCriterion, createArtifact, editTask, addEvidence, accept, attachRun, startAttempt, retry, recordResult, serializePlan, deserializePlan } from "../pi-extension/subagents/plan-store.ts";
 
 test("retry and explicit closed resume preserve task identity; live results share an attempt", () => {
   let plan = createPlan("Plan", authority);
@@ -21,6 +21,32 @@ test("retry and explicit closed resume preserve task identity; live results shar
   assert.notEqual(plan.tasks[0].attempts[1].attemptId, attemptId);
   assert.equal(plan.tasks[0].attempts[0].results.length, 2);
   assert.throws(() => attachRun(plan, context(plan), taskId, attemptId, "run-a"), /Duplicate/);
+  assert.deepEqual(deserializePlan(serializePlan(plan)), plan);
+});
+
+test("task definitions validate dependency graphs and evidence-backed acceptance with history", () => {
+  const criterion = createCriterion("Tests pass");
+  const artifact = createArtifact("report.txt");
+  let plan = createPlan("Plan", authority);
+  plan = addTask(plan, context(plan), "A", { scope: "Only model", owner: "worker", criteria: [criterion], artifacts: [artifact] });
+  const id = plan.tasks[0].taskId;
+  assert.throws(() => editTask(plan, context(plan), id, { dependencies: [id] }), /Self/);
+  assert.throws(() => editTask(plan, context(plan), id, { dependencies: ["missing"] }), /Missing/);
+  plan = addTask(plan, context(plan), "B", { dependencies: [id] });
+  assert.throws(() => editTask(plan, context(plan), id, { dependencies: [plan.tasks[1].taskId] }), /Cyclic/);
+  assert.throws(() => accept(plan, context(plan), id, {}, "reviewed"), /ALL/);
+  assert.throws(() => addEvidence(plan, context(plan), id, { criterionId: criterion.criterionId, ref: "x", artifactId: "missing" }), /artifact/);
+  assert.throws(() => addEvidence(plan, context(plan), id, { criterionId: criterion.criterionId, ref: "x".repeat(8193) }), /bounded/);
+  plan = addEvidence(plan, context(plan), id, { criterionId: criterion.criterionId, ref: "Test output", artifactId: artifact.artifactId });
+  const mapping = { [criterion.criterionId]: [plan.tasks[0].evidence[0].evidenceId] };
+  assert.throws(() => accept(plan, context(plan), id, { [criterion.criterionId]: ["missing"] }, "reviewed"), /evidence/);
+  plan = accept(plan, context(plan), id, mapping, "Verified test output");
+  assert.equal(plan.tasks[0].status, "accepted");
+  plan = editTask(plan, context(plan), id, { scope: "Changed scope" });
+  assert.equal(plan.tasks[0].status, "in_review");
+  assert.equal(plan.tasks[0].decisions.length, 2);
+  assert.deepEqual(plan.tasks[0].decisions[0].criteria, mapping);
+  assert.equal(plan.tasks[0].criteria[0].criterionId, criterion.criterionId);
   assert.deepEqual(deserializePlan(serializePlan(plan)), plan);
 });
 
