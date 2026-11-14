@@ -17,7 +17,11 @@ export const HistorySchema = Type.Object({
 export type HistoryEvent = Static<typeof HistorySchema>;
 export function boundedSummary(text: string): string {
   let result = "";
-  for (const char of text.replace(/[\x00-\x1f\x7f-\x9f]/g, " ").replace(/\s+/g, " ").trim()) {
+  const printable = Array.from(text, char => {
+    const point = char.codePointAt(0)!;
+    return point < 32 || (point >= 127 && point <= 159) ? " " : char;
+  }).join("").replace(/\s+/g, " ").trim();
+  for (const char of printable) {
     if (Buffer.byteLength(result + char, "utf8") > 320) break;
     result += char;
   }
