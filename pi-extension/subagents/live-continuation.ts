@@ -95,7 +95,9 @@ export async function continueLiveChild(owner: SessionOwner, child: LiveChild | 
   let dispatched = false;
   try {
     const pane = await transport.inspect(child.surface);
-    if (pane.kind !== "present" || pane.agentStatus !== "idle") throw new Error("Live child pane is not confirmed idle.");
+    // HC reports a completed turn as done even while the Pi process remains open.
+    // Neither coarse status authorizes dispatch without the child-issued idle token below.
+    if (pane.kind !== "present" || !["idle", "done"].includes(pane.agentStatus ?? "")) throw new Error("Live child pane is not confirmed idle.");
     if (child.lifecycle.process.kind !== "running" || !(child.lifecycle.turn.kind === "interrupted" || (child.hasTurnResult && child.lifecycle.turn.kind === "waiting"))) {
       throw new Error("Live child changed state during continuation inspection.");
     }

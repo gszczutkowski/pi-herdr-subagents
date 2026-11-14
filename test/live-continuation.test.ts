@@ -71,6 +71,19 @@ test("interrupted settled child receives exact hostile text via API, reusing all
   } finally { f.cleanup(); }
 });
 
+test("HC done requires a fresh child settled token, never coarse done alone", async () => {
+  const f = fixture();
+  try {
+    const transport = { ...f.transport, inspect: async () => ({ kind: "present", agentStatus: "done", observedAt: Date.now() } as const) };
+    await assert.rejects(continueLiveChild(f.owner, f.child, { message: "x" }, transport), /not confirmed settled/);
+    f.settle();
+    assert.equal((await continueLiveChild(f.owner, f.child, { message: "x" }, transport)).status, "accepted");
+    assert.equal(f.sent.length, 1);
+    await assert.rejects(continueLiveChild(f.owner, f.child, { message: "x" }, transport), /not confirmed settled/);
+    assert.equal(f.sent.length, 1);
+  } finally { f.cleanup(); }
+});
+
 test("reservation happens before asynchronous inspection; concurrent resumes cannot duplicate", async () => {
   const f = fixture();
   try {
