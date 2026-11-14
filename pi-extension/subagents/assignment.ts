@@ -2,12 +2,14 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
+import { isPlanTaskBinding, type PlanTaskBinding } from "./plan-runtime.ts";
 import { framedMessage } from "./frame.ts";
 
 export const ASSIGNMENT_ENTRY_TYPE = "subagent-assignment";
 export const ASSIGNMENT_ENV = "PI_SUBAGENT_ASSIGNMENT_FILE";
 
 export interface SubagentAssignment {
+  planTask?: PlanTaskBinding;
   version: 1;
   childId: string;
   sessionFile: string;
@@ -22,6 +24,7 @@ export function isSubagentAssignment(value: unknown): value is SubagentAssignmen
   if (!value || typeof value !== "object") return false;
   const data = value as SubagentAssignment;
   return data.version === 1
+    && (data.planTask === undefined || isPlanTaskBinding(data.planTask))
     && [data.childId, data.sessionFile, data.sender, data.recipient, data.role, data.task]
       .every((field) => typeof field === "string")
     && Array.isArray(data.skills) && data.skills.every((skill) => typeof skill === "string");
@@ -40,6 +43,7 @@ export function registerSubagentAssignmentRenderer(pi: ExtensionAPI): void {
       `Sender: ${data.sender}`,
       `Recipient: ${data.recipient}`,
       `Role: ${data.role}`,
+      ...(data.planTask ? [`Plan: ${data.planTask.planId} / Task: ${data.planTask.taskId} / Attempt: ${data.planTask.attemptId} / Run: ${data.childId}`] : []),
       ...(data.skills.length ? [`Skills: ${data.skills.join(", ")}`] : []),
       "",
       "Task:",

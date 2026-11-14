@@ -1,6 +1,7 @@
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { isPlanTaskBinding, type PlanTaskBinding } from "./plan-runtime.ts";
 import type { DeliveryEnvelope } from "./delivery.ts";
 import { probeProcess, sameProcess } from "./process-identity.ts";
 
@@ -11,6 +12,7 @@ export interface RuntimeParent {
   checkpoint: string;
 }
 export interface DurableRun {
+  planTask?: PlanTaskBinding;
   id: string;
   sessionFile: string;
   name: string;
@@ -69,7 +71,7 @@ function validate(value: any): asserts value is RuntimeManifest {
     throw new Error("Invalid or unsupported runtime manifest; explicit reconciliation required");
   }
   for (const [id, run] of Object.entries(value.runs) as [string, any][]) {
-    if (run.id !== id || typeof run.sessionFile !== "string" || typeof run.name !== "string" || typeof run.task !== "string" ||
+    if ((run.planTask !== undefined && !isPlanTaskBinding(run.planTask)) || run.id !== id || typeof run.sessionFile !== "string" || typeof run.name !== "string" || typeof run.task !== "string" ||
         !Number.isFinite(run.startTime) || !["prepared", "dispatch-intent", "supervised"].includes(run.phase) ||
         !Array.isArray(run.eventCursor) || !run.eventCursor.every((event: unknown) => typeof event === "string")) {
       throw new Error("Invalid durable run");
@@ -171,6 +173,18 @@ export class RuntimeStore {
     const next = this.snapshot();
     if (next.runs[run.id]) throw new Error("Run already recorded");
     next.runs[run.id] = { ...structuredClone(run), phase: "prepared", eventCursor: [] };
+    this.commit(next);
+  }
+
+  bindRun(id: string, binding: PlanTaskBinding): void {
+    const next = this.snapshot();
+    const run = next.runs[id];
+    if (!run || !isPlanTaskBinding(binding)) throw new Error("Invalid run binding");
+    if (run.planTask) {
+      if (JSON.stringify(run.planTask) !== JSON.stringify(binding)) throw new Error("Run binding conflict");
+      return;
+    }
+    run.planTask = structuredClone(binding);
     this.commit(next);
   }
 

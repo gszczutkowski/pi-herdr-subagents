@@ -26,6 +26,7 @@ interface PendingDelivery {
 }
 
 export interface DeliveryState {
+  onEnvelope?: (runId: string, envelope: DeliveryEnvelope) => void;
   api?: Pick<ExtensionAPI, "sendMessage">;
   store?: import("./runtime-store.ts").RuntimeStore;
   persistenceError?: string;
@@ -65,6 +66,8 @@ export function enqueueDelivery(
   // Persist before publication; callbacks and owners are never serialized.
   state.store?.enqueue(eventId, owner.id, envelope);
   state.pending.set(eventId, { envelope, owner, onHandoff, attempts: 0, retryAt: 0, inFlight: false });
+  // Plan import is a separate projection: its failure must never suppress delivery.
+  try { state.onEnvelope?.(owner.id, envelope); } catch { /* Retained in durable outbox for import retry. */ }
   flushDeliveries(state);
 }
 

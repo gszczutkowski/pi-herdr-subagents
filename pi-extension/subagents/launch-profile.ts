@@ -3,11 +3,14 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { SubagentLaunchContext } from "./harness/types.ts";
 import { canonicalSessionPath } from "./ownership.ts";
+import { atomicRuntimeWrite } from "./runtime-store.ts";
+import { isPlanTaskBinding, type PlanTaskBinding } from "./plan-runtime.ts";
 import type { ResolvedRuntimePlan } from "./runtime-routing.ts";
 
 /** Resolved, noncredential launch inputs only; never snapshot process.env or auth/config contents. */
 export interface LaunchProfile {
   version: 1;
+  planTask?: PlanTaskBinding;
   harness: string;
   sessionFile: string;
   role: string | null;
@@ -64,6 +67,7 @@ export function readPiLaunchProfile(sessionFile: string): LaunchProfile {
   const nullableString = (value: unknown) => value === null || typeof value === "string";
   const plan = p?.runtimePlan;
   if (p?.version !== 1 || p.harness !== "pi" || p.sessionFile !== canonicalSessionPath(sessionFile) ||
+    (p.planTask !== undefined && !isPlanTaskBinding(p.planTask)) ||
     typeof p.cwd !== "string" || !isAbsolute(p.cwd) ||
     typeof p.agentDir !== "string" || !isAbsolute(p.agentDir) ||
     ![p.role, p.identity, p.tools, p.skills].every(nullableString) ||
@@ -76,6 +80,13 @@ export function readPiLaunchProfile(sessionFile: string): LaunchProfile {
     throw new Error(`Invalid or unsupported launch profile. ${guidance}`);
   }
   return p;
+}
+
+/** Persist an optional first binding; an existing original authority is immutable. */
+export function persistProfileBinding(sessionFile: string, binding: PlanTaskBinding): void {
+  const profile = readPiLaunchProfile(sessionFile);
+  if (profile.planTask && JSON.stringify(profile.planTask) !== JSON.stringify(binding)) throw new Error("Launch profile task binding conflict");
+  if (!profile.planTask) atomicRuntimeWrite(launchProfilePath(sessionFile), { ...profile, planTask: binding });
 }
 
 /** Reconstruct exclusively from the saved profile, never current role defaults or parent runtime. */

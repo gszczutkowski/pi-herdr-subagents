@@ -133,9 +133,11 @@ export class PiHarnessDriver implements HarnessDriver {
     envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`);
     envParts.push(`PI_SUBAGENT_SURFACE=${shellQuote(surface)}`);
 
-    const fullTask = context.resume || taskDelivery === "direct"
+    const correlation = profile.planTask
+      ? `\n\nCorrelation (report only; do not mutate the parent plan): planId=${profile.planTask.planId}, taskId=${profile.planTask.taskId}, attemptId=${profile.planTask.attemptId}, runId=${params.id}` : "";
+    const fullTask = (context.resume || taskDelivery === "direct"
       ? params.task
-      : `${roleBlock ?? ""}\n\n${modeHint ?? ""}\n\n${params.task}\n\n${summaryInstruction ?? ""}`;
+      : `${roleBlock ?? ""}\n\n${modeHint ?? ""}\n\n${params.task}\n\n${summaryInstruction ?? ""}`) + correlation;
 
     let taskArg: string;
     if (taskDelivery === "direct") {
@@ -158,6 +160,7 @@ export class PiHarnessDriver implements HarnessDriver {
     const effectiveSkills = params.skills ?? agentDefs?.skills;
     const assignment: SubagentAssignment = {
       version: 1,
+      ...(profile.planTask ? { planTask: profile.planTask } : {}),
       childId: params.id,
       sessionFile: subagentSessionFile,
       sender: process.env.PI_SUBAGENT_NAME || "Parent agent",

@@ -205,7 +205,9 @@ Akceptacja etapu: użytkownik i agent główny potrafią jednoznacznie wskazać,
 
 ### Pochodzenie i historia przekazań
 
-- [ ] Powiązać plan → zadanie → zlecenie → próba → wynik → dowód → weryfikacja.
+- [x] Powiązać plan → zadanie → zlecenie → próba → wynik → dowód → weryfikacja.
+
+Weryfikacja Provenance: opcjonalne `planTask` na zarejestrowanych spawn/resume wiąże istniejącą próbę z runtime runId przez tę samą instancję PlanPersistence co narzędzia/panel/kontekst; append i ponowna walidacja przed transportem. Live zachowuje run/próbę, closed resume dodaje run; retry jest jawną komendą rodzica. Profil, manifest i display-only assignment zachowują oryginalny autorytet i korelację. `plan-runtime.ts` importuje kanoniczny eventId outbox idempotentnie; wynik → review, nigdy accept. Dowód resultEventId i decyzja rodzica zamykają istniejący łańcuch kryteriów. Błąd importu nie zatrzymuje dostawy; także handedOff envelope jest źródłem retry, obca gałąź pozostaje pending. Błąd dispatch po attach zapisuje failed/uncertain. Testy natywnego SessionManager + zarejestrowane execute: spawn, alias/live/closed resume, append/transport failure, duplicate/late/accepted i wrong-branch, świeża persistence oraz reopen manifest binding. Focused 81/81, lint exit 0; pełne npm test 398/417, te same 19 błędów bazowych (18 Python/Claude hook, 1 CRLF release); rzeczywisty lifecycle Pi z kontrolowanym providerem w zestawie persistence/branches/context. Granice OS/Pi transportu mockowane, bez live herdr i bez automatycznego relaunch/accept. Retencja caller_ping w panelu pozostaje osobnym punktem.
 - [ ] Zachować identyfikator bezpośredniego rodzica i sesji głównej.
 - [ ] Dodać krótką historię jawnych komunikatów, decyzji i zmian stanu.
 - [ ] Dodać zwijane drzewo zagnieżdżonych podagentów bez kopiowania ich całych rozmów do rodzica głównego.

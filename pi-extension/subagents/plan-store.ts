@@ -276,6 +276,12 @@ export function accept(plan: PlanSnapshot, context: CommandContext, taskId: stri
 }
 /** References an existing runtime ID; this module never creates a second runtime identity. */
 export function attachRun(plan: PlanSnapshot, context: CommandContext, taskId: string, attemptId: string, runId: string): PlanSnapshot {
+  authorize(plan, context);
+  const existing = plan.tasks.find(t => t.taskId === taskId)?.attempts.find(a => a.attemptId === attemptId);
+  if (existing?.runIds.includes(runId)) {
+    requireAttemptAuthority(plan, existing);
+    return plan;
+  }
   return changeTask(plan, context, taskId, task => {
     requireValue(task.status === "in_progress" || task.status === "blocked" || task.status === "in_review", "Cannot attach run in terminal/pending state");
     requireValue(task.attempts.at(-1)?.attemptId === attemptId, "Attach requires current attempt");

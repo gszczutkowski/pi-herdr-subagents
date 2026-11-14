@@ -100,9 +100,37 @@ Unknown future plan schemas fail closed, never silently create an empty plan.
 
 Restored `in_progress` tasks stay unchanged and are reported as
 `recoveryUncertain`: persistence is not process-liveness or completion proof.
-There is no automatic launch, acceptance, runtime result adapter or
-context injection here. Read/update commands do not restore runtime supervision.
+Read/update commands never launch work, accept it automatically or restore
+runtime supervision. A request-time context projection reads this same store.
 This is single-parent serialization, not multi-process CAS or an OS sandbox.
+
+### Optional runtime provenance
+
+To bind `subagent` or `subagent_resume`, first create/start the task attempt with
+`plan_update`, then pass `planTask: { planId, taskId, attemptId, expectedRevision }`.
+The parent derives authority from its active plan, validates the current attempt
+and appends the existing runtime run ID **before terminal dispatch**. An append
+or validation failure prevents dispatch. A subsequent launch/transport failure is
+recorded as failed/uncertain, not successful work. Native append and terminal send
+are not a transaction.
+
+Ordinary unbound subagents are unchanged. Bound live continuation retains its
+run/attempt; closed resume adds a run to the same attempt and preserves original
+parent authority. Retry is an explicit parent-created attempt on the existing
+task, not an implicit new task. Saved launch profiles, assignments and runtime
+manifests retain correlation IDs. Assignment cards remain display-only.
+
+The shared completion adapter imports the exact canonical delivery event ID.
+Successful completion enters review, never acceptance; parent evidence can cite
+that result ID and acceptance still requires criterion evidence and a parent
+decision. Duplicate imports are idempotent; late events cannot reopen terminal
+tasks. Import failure never suppresses the original result handoff: immutable
+outbox envelopes (including handed-off ones) remain retry sources after reload
+or recovery. Wrong-branch/origin imports are deferred, not redirected; select the
+original branch and reconcile any plan storage fault. `/subagents-recovery`
+reports pending import errors and retries them; context requests also retry.
+Existing runtime writer leases, branch custody and recovery identity gates still
+apply. Recovery never relaunches work.
 
 ### Task panel
 
@@ -125,8 +153,8 @@ dependencies, read-only errors and recovery uncertainty remain visible.
 
 Commands change presentation only and do not start model turns or create another
 checklist. Store changes and session restore/navigation refresh the widget without
-model polling. `/plan` still starts the existing planner workflow. Runtime task
-binding and automatic `caller_ping` projection are not implemented by this panel.
+model polling. `/plan` still starts the existing planner workflow. The panel
+reads only persisted task state, independently of the runtime process registry.
 
 ### Branch and plan-change semantics
 

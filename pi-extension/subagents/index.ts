@@ -6,7 +6,7 @@ import { ACTIVE_ACCENT, OPEN_ACCENT, borderLine, borderTop, borderBottom, framed
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { resolveSubagentCwd } from "./paths.ts";
-import { persistLaunchProfile, readPiLaunchProfile, resolveLaunchProfile, resumeLaunchContext } from "./launch-profile.ts";
+import { persistLaunchProfile, persistProfileBinding, readPiLaunchProfile, resolveLaunchProfile, resumeLaunchContext } from "./launch-profile.ts";
 import { continueLiveChild } from "./live-continuation.ts";
 import { RuntimeStore, readRuntimeManifest, type RuntimeParent } from "./runtime-store.ts";
 import { reconcileRuntime } from "./runtime-recovery.ts";
@@ -74,6 +74,8 @@ import {
 } from "./activity.ts";
 import { registerSubagentAssignmentRenderer } from "./assignment.ts";
 import { registerPlanTools } from "./plan-tools.ts";
+import type { PlanPersistence } from "./plan-persistence.ts";
+import { PlanTaskParams, bindPlanRun, importPlanEnvelope, recordDispatchFailure, type PlanTaskBinding } from "./plan-runtime.ts";
 import { registerPlanCommand } from "./plan-preflight.ts";
 import { createDeliveryState, enqueueDelivery, flushDeliveries, pauseDeliveries, restoreDurableDeliveries, type DeliveryState } from "./delivery.ts";
 import {
@@ -134,6 +136,7 @@ const ThinkingLevelSchema = Type.Union(
 );
 
 const SubagentParams = Type.Object({
+  planTask: Type.Optional(PlanTaskParams),
   name: Type.String({ description: "Display name for the subagent" }),
   task: Type.String({ description: "Task/prompt for the sub-agent" }),
   agent: Type.Optional(
@@ -575,6 +578,7 @@ interface SubagentResult {
  * State for a launched (but not yet completed) subagent.
  */
 interface RunningSubagent {
+  planTask?: PlanTaskBinding;
   durableStore?: RuntimeStore;
   terminalActionsAllowed?: boolean;
   id: string;
@@ -617,6 +621,8 @@ interface RunningSubagent {
 }
 
 interface SubagentRuntime {
+  plans?: PlanPersistence;
+  planImportErrors?: Map<string, string>;
   store?: RuntimeStore;
   stopRecovery?: () => void;
   recoveryError?: string;
@@ -1318,7 +1324,10 @@ async function launchSubagent(
 
   const store = durableStoreFor(ctx);
   const owner = reserveSession(subagentSessionFile, id);
+  let planTask: PlanTaskBinding | undefined;
   try {
+  if (params.planTask && !store) throw new Error("Task-bound runs require durable runtime custody");
+  planTask = bindPlanRun(runtime.plans!, ctx as ExtensionContext, id, params.planTask);
   const surfacePreCreated = !!options?.surface;
   const surface = options?.surface ?? createSubagentSurface(params.name, resolveSubagentLayout());
   owner.surface = surface;
@@ -1389,6 +1398,7 @@ async function launchSubagent(
   };
   launchContext.launchProfile = resolveLaunchProfile(launchContext, driver.id,
     buildSubagentToolAllowlist(params.tools ?? agentDefs?.tools));
+  if (planTask) launchContext.launchProfile.planTask = planTask;
   persistLaunchProfile(launchContext.launchProfile);
   const built = driver.buildCommand(launchContext);
 
@@ -1400,12 +1410,15 @@ async function launchSubagent(
     .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
 
-  store?.prepare({ id, name: params.name, task: params.task, startTime,
+  store?.prepare({ id, planTask, name: params.name, task: params.task, startTime,
     sessionFile: canonicalSessionPath(built.sessionFile ?? subagentSessionFile),
     surface, cli: built.cli, activityFile, sentinelFile: built.sentinelFile,
     launchScriptFile, profile: launchContext.launchProfile });
   runScriptInPane(surface, built.command, {
-    onDispatch: () => { store?.phase(id, "dispatch-intent"); owner.dispatched = true; },
+    onDispatch: () => {
+      if (planTask) bindPlanRun(runtime.plans!, ctx as ExtensionContext, id, undefined, planTask);
+      store?.phase(id, "dispatch-intent"); owner.dispatched = true;
+    },
     scriptPath: launchScriptFile,
     scriptPreamble: (built.launchScriptPreamble ?? [
       `# Subagent launch script for ${params.name}`,
@@ -1416,6 +1429,7 @@ async function launchSubagent(
 
   store?.phase(id, "supervised");
   const running: RunningSubagent = {
+    planTask,
     durableStore: store,
     id,
     name: params.name,
@@ -1439,6 +1453,8 @@ async function launchSubagent(
   runningSubagents.set(id, running);
   return running;
   } catch (error) {
+    try { recordDispatchFailure(runtime.plans!, runtime.latestCtx ?? ctx as ExtensionContext, planTask, id, error); }
+    catch (importError) { (runtime.planImportErrors ??= new Map()).set(id, `Dispatch failed/uncertain; task import pending: ${String(importError)}`); }
     if (!owner.dispatched) {
       releaseSession(subagentSessionFile, id);
       if (owner.surface && !options?.surface) {
@@ -1628,7 +1644,23 @@ async function watchSubagent(
 
 export default function subagentsExtension(pi: ExtensionAPI) {
   registerSubagentAssignmentRenderer(pi);
-  registerPlanTools(pi);
+  runtime.plans = registerPlanTools(pi);
+  runtime.planImportErrors ??= new Map();
+  delivery.onEnvelope = (runId, envelope) => {
+    const binding = runtime.store?.snapshot().runs[runId]?.planTask ?? runningSubagents.get(runId)?.planTask;
+    if (!binding) return;
+    const eventId = String((envelope.message.details as any)?.eventId ?? runId);
+    try {
+      if (!runtime.latestCtx) throw new Error("Parent context unavailable during reload");
+      runtime.store?.assertCustody();
+      importPlanEnvelope(runtime.plans!, runtime.latestCtx, binding, runId, envelope);
+      runtime.planImportErrors!.delete(eventId);
+    } catch (error) { runtime.planImportErrors!.set(eventId, `Task import pending: ${String(error)}`); }
+  };
+  const retryPlanImports = () => {
+    for (const event of Object.values(runtime.store?.snapshot().outbox ?? {})) delivery.onEnvelope?.(event.runId, event.envelope);
+  };
+  pi.on("context", () => { retryPlanImports(); });
   // A factory API is not bound yet. Never fall back to a captured pre-reload API.
   runtime.pi = undefined; // Also invalidate the legacy global runtime field.
   pauseDeliveries(delivery);
@@ -1640,6 +1672,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     runtime.pi = pi;
     if (typeof ctx.sessionManager?.getHeader === "function") await recoverParentRuntime(ctx);
     if (runtime.latestCtx !== ctx) return;
+    retryPlanImports();
     if (!runtime.recoveryError) {
       delivery.api = pi;
       flushDeliveries(delivery);
@@ -1691,7 +1724,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       const manifest = runtime.store?.snapshot();
       const runs = Object.values(manifest?.runs ?? {}).map((run) => `${run.id}: ${run.reconciliation ?? run.phase}`);
       const unknown = Object.entries(manifest?.outbox ?? {}).filter(([, event]) => event.status === "dispatching").map(([id]) => `${id}: UNKNOWN handoff; no automatic resend`);
-      ctx.ui.notify([runtime.recoveryError, ...runs, ...unknown, delivery.persistenceError].filter(Boolean).join("\n") || "No durable recovery state", "info");
+      retryPlanImports();
+      ctx.ui.notify([runtime.recoveryError, ...runs, ...unknown, ...runtime.planImportErrors!.values(), delivery.persistenceError].filter(Boolean).join("\n") || "No durable recovery state", "info");
     },
   });
 
@@ -2043,6 +2077,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "DO NOT fabricate or assume results. After resuming, either end your turn or work on other independent tasks; the harness will wake you when the result is ready. " +
         "Use when a sub-agent was cancelled or needs follow-up work.",
       parameters: Type.Object({
+        planTask: Type.Optional(PlanTaskParams),
         sessionPath: Type.String({ description: "Path to the session .jsonl file to resume" }),
         name: Type.Optional(
           Type.String({ description: "Display name for the terminal tab. Default: 'Resume'" }),
@@ -2114,8 +2149,21 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           const result = await continueLiveChild(liveOwner, child, params, { inspect: inspectPane, send: (surface, command) => {
             if (child.terminalActionsAllowed === false) throw new Error("Terminal custody was detached during continuation");
             child.durableStore?.assertCustody();
-            if (liveOwner.continuationRequestId) child.durableStore?.continuation(child.id, liveOwner.continuationRequestId);
-            runInPane(surface, command);
+            // Validate after async inspection, immediately before dispatch.
+            try {
+              child.planTask = bindPlanRun(runtime.plans!, ctx, child.id, params.planTask, child.planTask);
+              if (child.planTask) {
+                if (!child.durableStore) throw new Error("Task-bound continuation requires durable custody");
+                child.durableStore.bindRun(child.id, child.planTask);
+                persistProfileBinding(child.sessionFile, child.planTask);
+              }
+              if (liveOwner.continuationRequestId) child.durableStore?.continuation(child.id, liveOwner.continuationRequestId);
+              runInPane(surface, command);
+            } catch (error) {
+              try { recordDispatchFailure(runtime.plans!, ctx, child.planTask, child.id, error, liveOwner.continuationRequestId); }
+              catch (importError) { runtime.planImportErrors!.set(child.id, `Continuation failed/uncertain; task import pending: ${String(importError)}`); }
+              throw error;
+            }
           } });
           return {
             content: [{ type: "text", text: result.status === "accepted"
@@ -2144,7 +2192,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         const store = durableStoreFor(ctx);
         const owner = reserveSession(params.sessionPath, id);
+        let planTask: PlanTaskBinding | undefined;
         try {
+        if ((params.planTask || profile.planTask) && !store) throw new Error("Task-bound runs require durable runtime custody");
+        planTask = bindPlanRun(runtime.plans!, ctx, id, params.planTask, profile.planTask);
+        // Preserve the original binding, never infer authority from the selected branch.
+        const resumeProfile = { ...profile, ...(planTask ? { planTask } : {}) };
+        if (planTask) persistProfileBinding(params.sessionPath, planTask);
         // Record entry count before resuming so we can extract new messages
         const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
 
@@ -2159,7 +2213,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
         const activityFile = getSubagentActivityFile(artifactDir, id);
         mkdirSync(dirname(activityFile), { recursive: true });
-        const built = getHarnessDriver("pi").buildCommand(resumeLaunchContext(profile, {
+        const built = getHarnessDriver("pi").buildCommand(resumeLaunchContext(resumeProfile, {
           id, name, message: params.message, surface, artifactDir,
           subagentsDir: SUBAGENTS_DIR, shellQuote,
         }));
@@ -2173,11 +2227,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             .replace(/-+/g, "-")
             .replace(/^-|-$/g, "") || "resume"}-resume-${id}.sh`,
         );
-        store?.prepare({ id, name, task: params.message ?? "resumed session", startTime,
+        store?.prepare({ id, planTask, name, task: params.message ?? "resumed session", startTime,
           sessionFile: params.sessionPath, surface, cli: "pi", activityFile,
-          launchScriptFile, profile, entryCountBefore });
+          launchScriptFile, profile: resumeProfile, entryCountBefore });
         runScriptInPane(surface, built.command, {
-          onDispatch: () => { store?.phase(id, "dispatch-intent"); owner.dispatched = true; },
+          onDispatch: () => {
+            if (planTask) bindPlanRun(runtime.plans!, ctx, id, undefined, planTask);
+            store?.phase(id, "dispatch-intent"); owner.dispatched = true;
+          },
           scriptPath: launchScriptFile,
           scriptPreamble: built.launchScriptPreamble?.join("\n"),
         });
@@ -2185,6 +2242,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Register as a running subagent for widget tracking
         store?.phase(id, "supervised");
         const running: RunningSubagent = {
+          planTask,
           durableStore: store,
           id,
           name,
@@ -2224,6 +2282,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           },
         };
         } catch (error) {
+          try { recordDispatchFailure(runtime.plans!, ctx, planTask, id, error); }
+          catch (importError) { runtime.planImportErrors!.set(id, `Dispatch failed/uncertain; task import pending: ${String(importError)}`); }
           if (!owner.dispatched) {
             releaseSession(params.sessionPath, id);
             if (owner.surface) {

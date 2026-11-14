@@ -1,0 +1,208 @@
+import { test, mock } from "node:test";
+import assert from "node:assert/strict";
+import childProcess from "node:child_process";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { promisify } from "node:util";
+import { tmpdir } from "node:os";
+import { join, dirname, basename } from "node:path";
+import { randomUUID } from "node:crypto";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
+import * as store from "../pi-extension/subagents/plan-store.ts";
+import { PlanPersistence, PLAN_ENTRY } from "../pi-extension/subagents/plan-persistence.ts";
+import { bindPlanRun, importPlanEnvelope } from "../pi-extension/subagents/plan-runtime.ts";
+import { RuntimeStore, readRuntimeManifest } from "../pi-extension/subagents/runtime-store.ts";
+import { canonicalSessionPath, releaseSession } from "../pi-extension/subagents/ownership.ts";
+import { continuationDir } from "../pi-extension/subagents/live-continuation.ts";
+
+// Real native persistence, registered execute, launch builder, completion adapter
+// and durable outbox. Only the Pi API host and terminal transport are mocked.
+test("registered task-bound spawn, live/closed resume, failure isolation and restored canonical imports", async () => {
+  const dir = fs.mkdtempSync(join(tmpdir(), "plan-runtime-"));
+  const savedEnv = { ...process.env };
+  const originalExec = childProcess.execFile;
+  let serial = 0; let dispatches = 0; let failAppend = false; let failSend = false;
+  const sm = SessionManager.create(dir, dir);
+  sm.appendMessage({ role: "user", content: "Start", timestamp: Date.now() });
+  const tools = new Map<string, any>(); const events = new Map<string, any[]>();
+  const sent: any[] = []; const widgets = new Map<string, any>();
+  const manifestDir = join(dir, "artifacts", sm.getSessionId(), "subagent-runtime");
+  let continuationChild: any;
+  const children: any[] = [];
+  mock.method(childProcess, "execSync", () => "herdr");
+  mock.method(childProcess, "execFileSync", (_command: any, args: string[]) => {
+    if (args[0] === "tab" && args[1] === "create") return JSON.stringify({ result: { root_pane: { pane_id: `pane-${++serial}` } } });
+    if (args[1] === "run" && !args.some(a => a.includes("/_subagent_continue"))) {
+      dispatches++;
+      const manifest = readRuntimeManifest(manifestDir)!;
+      const run = Object.values(manifest.runs).findLast(r => r.surface === args[2])!;
+      assert.ok(run.planTask);
+      assert.ok(read().tasks[0].attempts.some(a => a.runIds.includes(run.id)), "native append precedes dispatch");
+      assert.equal(run.phase, "dispatch-intent");
+      if (failSend) throw new Error("ambiguous transport");
+    }
+    if (continuationChild && args.some(a => a.includes("/_subagent_continue"))) {
+      const requestId = args.join(" ").match(/\/_subagent_continue ([0-9a-f-]+)/)![1];
+      const cdir = continuationDir(continuationChild.activityFile);
+      fs.writeFileSync(join(cdir, `${requestId}.result.json`), JSON.stringify({ runId: continuationChild.id, requestId, status: "accepted" }));
+    }
+    return "";
+  });
+  childProcess.execFile = Object.assign(() => { throw new Error("unexpected transport"); }, {
+    [promisify.custom]: async (_command: string, args: string[]) => ({ stdout: args[1] === "get" ? JSON.stringify({ result: { pane: { pane_id: args[2], agent_status: "idle" } } }) : "" }),
+  }) as any;
+  syncBuiltinESMExports();
+  process.env.HERDR_ENV = "1"; process.env.HERDR_WORKSPACE_ID = "test";
+  process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
+  for (const key of ["HC_TERMINAL_ID", "HC_TERMINAL_SOCKET", "PI_SUBAGENT_ID", "PI_SUBAGENT_SESSION", "PI_DENY_TOOLS", "PI_SUBAGENT_LAYOUT"]) delete process.env[key];
+  const pi: any = new Proxy({}, { get: (_, key) => key === "registerTool" ? (t: any) => tools.set(t.name, t)
+    : key === "on" ? (name: string, fn: any) => events.set(name, [...(events.get(name) ?? []), fn])
+    : key === "getAllTools" ? () => [] : key === "getThinkingLevel" ? () => "off"
+    : key === "appendEntry" ? (type: string, data: any) => { if (type === PLAN_ENTRY && failAppend) { failAppend = false; throw new Error("injected append"); } sm.appendCustomEntry(type, data); }
+    : key === "sendMessage" ? (message: any) => sent.push(message) : () => {} });
+  const ctx: any = { hasUI: true, mode: "tui", scopedModels: [], cwd: dir, model: { provider: "test", id: "model" },
+    ui: { setWidget: (name: string, value: any) => widgets.set(name, value), notify: () => {} },
+    modelRegistry: { find: () => ({ provider: "test", id: "model", reasoning: true }), getAvailable: () => [{ provider: "test", id: "model" }], hasConfiguredAuth: () => true }, sessionManager: sm };
+  const { default: extension, __test__, enqueueSubagentCompletion } = await import("../pi-extension/subagents/index.ts");
+  const emit = async (name: string, event = {}) => { for (const fn of events.get(name) ?? []) await fn(event, ctx); };
+  const execute = (name: string, params: any) => tools.get(name).execute("call", params, undefined, undefined, ctx);
+  const p = new PlanPersistence((type, data) => pi.appendEntry(type, data), false);
+  const read = () => p.read(sm).snapshot!;
+  const mutate = (fn: any) => p.mutate(sm, read().planId, read().revision, fn);
+  const selection = () => ({ planId: read().planId, taskId: read().tasks[0].taskId, attemptId: read().tasks[0].attempts.at(-1)!.attemptId, expectedRevision: read().revision });
+  const result = (child: any, eventId: string) => ({ eventId, name: child.name, task: child.task, sessionFile: child.sessionFile, summary: "Tests reported", exitCode: 0, elapsed: 1 });
+  extension(pi);
+  try {
+    await emit("session_start", { reason: "startup" });
+    p.create(sm, 0, "Bound work");
+    const criterionId = randomUUID();
+    mutate((p: any, c: any) => store.addTask(p, c, "Implement", { criteria: [{ criterionId, text: "Verified" }] }));
+    mutate((p: any, c: any) => store.startAttempt(p, c, p.tasks[0].taskId));
+    await assert.rejects(execute("subagent", { name: "Stale", task: "one", cwd: dir, planTask: { ...selection(), expectedRevision: 0 } }), /Revision conflict/);
+    assert.equal(dispatches, 0);
+    const spawned = await execute("subagent", { name: "Bound", task: "one", cwd: dir, planTask: selection() });
+    const child = __test__.runningSubagents.get(spawned.details.id)!;
+    children.push(child);
+    assert.deepEqual(child.planTask.authority, read().authority);
+    const assignmentFile = join(dir, "artifacts", sm.getSessionId(), "context", `subagent-assignment-${child.id}.json`);
+    assert.deepEqual(JSON.parse(fs.readFileSync(assignmentFile, "utf8")).planTask, child.planTask);
+    const beforeLive = read().revision;
+    child.lifecycle.process = { kind: "running", since: Date.now() } as any;
+    child.lifecycle.turn = { kind: "interrupted", since: Date.now() } as any;
+    continuationChild = child;
+    const cdir = continuationDir(child.activityFile!);
+    fs.mkdirSync(cdir, { recursive: true });
+    fs.writeFileSync(join(cdir, "state.json"), JSON.stringify({ runId: child.id, sessionFile: canonicalSessionPath(child.sessionFile), state: "interrupted-idle", idleToken: randomUUID() }));
+    const continued = await execute("subagent_resume", { sessionPath: `${dirname(child.sessionFile)}/./${basename(child.sessionFile)}`, message: "follow-up", planTask: selection() });
+    assert.equal(continued.details.id, child.id);
+    assert.equal(continued.details.status, "continued");
+    assert.equal(read().revision, beforeLive, "idempotent attach does not append");
+    continuationChild = undefined;
+    enqueueSubagentCompletion(child, { ...result(child, "turn-a"), keepOpen: true });
+    assert.equal(read().tasks[0].status, "in_review");
+    assert.equal(read().tasks[0].attempts[0].results[0].eventId, sent[0].details.eventId);
+    const rev = read().revision;
+    enqueueSubagentCompletion(child, { ...result(child, "turn-a"), keepOpen: true });
+    assert.equal(read().revision, rev);
+    // A plan append fault must not suppress the actual dispatched task's result.
+    failAppend = true;
+    enqueueSubagentCompletion(child, { ...result(child, "turn-b"), keepOpen: true });
+    assert.equal(sent.length, 2);
+    assert.equal(readRuntimeManifest(manifestDir)!.outbox[sent[1].details.eventId].status, "handedOff");
+    assert.equal(read().tasks[0].attempts[0].results.length, 1);
+    p.reconcile(sm);
+    await emit("context", { messages: [] });
+    assert.equal(read().tasks[0].attempts[0].results.length, 2, "handed-off outbox retries task import");
+    // Closed resume canonical aliases add a run, not a task/attempt.
+    child.lifecycle.delivery = "suppressed";
+    child.abortController?.abort();
+    await new Promise(r => setTimeout(r, 50));
+    child.lifecycle.delivery = "pending";
+    releaseSession(child.sessionFile, child.id);
+    __test__.runningSubagents.delete(child.id);
+    fs.writeFileSync(child.sessionFile, JSON.stringify({ type: "session", version: 3, id: "child", cwd: dir }) + "\n");
+    const resumed = await execute("subagent_resume", { sessionPath: child.sessionFile, message: "again" });
+    const resumedChild = __test__.runningSubagents.get(resumed.details.id)!;
+    children.push(resumedChild);
+    assert.notEqual(resumedChild.id, child.id);
+    assert.equal(read().tasks.length, 1); assert.equal(read().tasks[0].attempts.length, 1);
+    assert.equal(read().tasks[0].attempts[0].runIds.length, 2);
+    enqueueSubagentCompletion(resumedChild, result(resumedChild, "closed-result"));
+    const eventId = sent.at(-1).details.eventId;
+    mutate((p: any, c: any) => store.addEvidence(p, c, p.tasks[0].taskId, { criterionId, ref: "Parent checked test report", resultEventId: eventId }));
+    mutate((p: any, c: any) => store.accept(p, c, p.tasks[0].taskId, { [criterionId]: [p.tasks[0].evidence[0].evidenceId] }, "Verified by parent"));
+    enqueueSubagentCompletion(child, { ...result(child, "late"), keepOpen: true });
+    assert.equal(read().tasks[0].status, "accepted");
+    const binding = child.planTask!;
+    const originalLeaf = sm.getLeafId()!;
+    const sourcePlan = read();
+    p.detach(sm, sourcePlan.planId, sourcePlan.revision, "Wrong branch");
+    const wrong = read();
+    enqueueSubagentCompletion(child, { ...result(child, "wrong-branch"), keepOpen: true });
+    assert.deepEqual(read(), wrong, "original authority cannot mutate detached task");
+    const deferredEvent = sent.at(-1).details.eventId;
+    assert.ok(readRuntimeManifest(manifestDir)!.outbox[deferredEvent]);
+    sm.branch(originalLeaf);
+    await emit("context", { messages: [] });
+    assert.ok(read().tasks[0].attempts[0].results.some(r => r.eventId === deferredEvent));
+    // Fresh persistence plus a reopened manifest retains original authority, no launch.
+    const snapshot = readRuntimeManifest(manifestDir)!;
+    assert.deepEqual(snapshot.runs[child.id].planTask, binding);
+    const fresh = new PlanPersistence((type, data) => sm.appendCustomEntry(type, data), false);
+    const beforeRestore = read().revision;
+    importPlanEnvelope(fresh, ctx, snapshot.runs[child.id].planTask, child.id, snapshot.outbox[deferredEvent].envelope);
+    assert.equal(read().revision, beforeRestore);
+    assert.equal(dispatches, 2);
+    await assert.rejects(execute("subagent_resume", { sessionPath: child.sessionFile, planTask: selection() }), /nonterminal|already owned|tracked/);
+    // Failed append means no terminal dispatch. Explicit retry is parent-owned.
+    mutate((p: any, c: any) => store.reopen(p, c, p.tasks[0].taskId, "Retry failure test"));
+    mutate((p: any, c: any) => store.startAttempt(p, c, p.tasks[0].taskId));
+    failAppend = true;
+    await assert.rejects(execute("subagent", { name: "No append", task: "three", cwd: dir, planTask: selection() }), /append failed/);
+    assert.equal(dispatches, 2);
+    p.reconcile(sm);
+    failSend = true;
+    await assert.rejects(execute("subagent", { name: "Send fails", task: "four", cwd: dir, planTask: selection() }), /ambiguous transport/);
+    assert.equal(read().tasks[0].status, "failed");
+    assert.match(read().tasks[0].statusReason, /Dispatch failed\/uncertain/);
+  } finally {
+    for (const child of children) { child.lifecycle.delivery = "suppressed"; child.abortController?.abort(); releaseSession(child.sessionFile, child.id); }
+    await emit("session_shutdown", { reason: "quit" });
+    for (const child of __test__.runningSubagents.values()) releaseSession(child.sessionFile, child.id);
+    await new Promise(r => setTimeout(r, 50));
+    childProcess.execFile = originalExec; mock.restoreAll(); syncBuiltinESMExports();
+    for (const key of Object.keys(process.env)) if (!(key in savedEnv)) delete process.env[key];
+    Object.assign(process.env, savedEnv);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("native binding rejects wrong attempt/origin and attach is idempotent across disk restore", () => {
+  const dir = fs.mkdtempSync(join(tmpdir(), "binding-restore-"));
+  try {
+    const sm = SessionManager.create(dir, dir);
+    sm.appendMessage({ role: "user", content: "Start", timestamp: Date.now() });
+    const p = new PlanPersistence((t, d) => sm.appendCustomEntry(t, d), false);
+    let plan = p.create(sm, 0, "Native");
+    plan = p.mutate(sm, plan.planId, plan.revision, (p, c) => store.addTask(p, c, "Task"));
+    plan = p.mutate(sm, plan.planId, plan.revision, (p, c) => store.startAttempt(p, c, p.tasks[0].taskId));
+    const selection = { planId: plan.planId, taskId: plan.tasks[0].taskId, attemptId: plan.tasks[0].attempts[0].attemptId, expectedRevision: plan.revision };
+    const binding = bindPlanRun(p, { sessionManager: sm } as any, "existing-runtime-id", selection)!;
+    const disk = SessionManager.open(sm.getSessionFile()!);
+    const fresh = new PlanPersistence((t, d) => disk.appendCustomEntry(t, d), false);
+    const revision = fresh.read(disk).snapshot!.revision;
+    assert.deepEqual(bindPlanRun(fresh, { sessionManager: disk } as any, "existing-runtime-id", undefined, binding), binding);
+    assert.equal(fresh.read(disk).snapshot!.revision, revision);
+    assert.throws(() => bindPlanRun(fresh, { sessionManager: disk } as any, "other", undefined, { ...binding, authority: { ...binding.authority, branchInstanceId: randomUUID() } }), /origin authority/);
+    assert.throws(() => bindPlanRun(fresh, { sessionManager: disk } as any, "other", { ...selection, expectedRevision: revision, attemptId: randomUUID() }), /current nonterminal attempt/);
+    // Runtime manifest survives writer close/reopen with original binding unchanged.
+    const runtimeDir = join(dir, "runtime");
+    const parent = { sessionFile: sm.getSessionFile()!, headerId: sm.getSessionId(), branchToken: randomUUID(), checkpoint: "test" };
+    const runtime = new RuntimeStore(runtimeDir, parent);
+    runtime.prepare({ id: "existing-runtime-id", sessionFile: join(dir, "child.jsonl"), name: "Child", task: "Task", startTime: Date.now(), planTask: binding });
+    runtime.close();
+    const reopened = new RuntimeStore(runtimeDir, parent);
+    assert.deepEqual(reopened.snapshot().runs["existing-runtime-id"].planTask, binding);
+    reopened.close();
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
