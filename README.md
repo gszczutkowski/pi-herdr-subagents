@@ -426,6 +426,8 @@ The copyable example is model-neutral, so it works without requiring credentials
 
 Plan mutations and active-branch restoration refresh the native plan widget directly from the store. Process/activity refresh uses the process widget. Neither UI path sends a model message or schedules an extra model turn; a tool's normal response is not an additional notification. Widgets are presentation, not model context: the existing `context` hook projects the current plan on the next naturally required model request, without starting one.
 
+The centralized `notification-policy.ts` gates the production completion outbox: results, explicit help/blockers, questions, errors and required decisions wake the immediate parent (`triggerTurn:true`, `deliverAs:"steer"`). Classification uses event types/structured error fields, never words in a progress message. Unknown/progress events cannot enter the waking outbox. Question/decision event categories reserve policy vocabulary only; they do not add a child tool or protocol. Existing durable retry, deduplication and UNKNOWN-handoff recovery semantics remain unchanged.
+
 ## Spawning Subagents
 
 ```typescript

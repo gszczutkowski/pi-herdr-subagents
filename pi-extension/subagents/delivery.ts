@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createLifecycle, markDelivery, type SubagentLifecycle } from "./lifecycle.ts";
+import { messageNotificationReason, notificationOptions } from "./notification-policy.ts";
 
 export interface DeliveryOwner {
   id: string;
@@ -55,13 +56,15 @@ export function enqueueDelivery(
   onHandoff: () => void,
   completionId?: string,
 ): void {
+  const options = notificationOptions(messageNotificationReason(message));
+  if (!options) return; // Presentation/progress never enters the waking outbox.
   const eventId = `subagent:${owner.id}:completion${completionId ? `:${completionId}` : ""}`;
   // The first terminal callback owns the payload, including while a retry waits.
   if (owner.lifecycle.delivery !== "pending" || state.pending.has(eventId) || state.handedOff.has(eventId)) return;
   const snapshot = structuredClone(message);
   const envelope = freeze({
     message: { ...snapshot, details: { ...(snapshot.details as Record<string, unknown> | undefined), eventId } },
-    options: { triggerTurn: true, deliverAs: "steer" } as Options,
+    options,
   });
   // Persist before publication; callbacks and owners are never serialized.
   state.store?.enqueue(eventId, owner.id, envelope);
