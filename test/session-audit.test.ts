@@ -39,8 +39,9 @@ test("real separate Pi RPC processes sharing one file are audited, including can
   const dir = mkdtempSync(join(tmpdir(), "pi-audit-processes-"));
   const session = join(dir, "session.jsonl");
   writeFileSync(session, JSON.stringify({ type: "session", version: 3, id: "audit-fixture", timestamp: new Date().toISOString(), cwd: dir }) + "\n");
-  let alias = session;
-  if (process.platform === "linux") { alias = join(dir, "alias.jsonl"); symlinkSync(session, alias); }
+  const aliasDirectory = `${dir}-alias`;
+  symlinkSync(dir, aliasDirectory, process.platform === "win32" ? "junction" : "dir");
+  const alias = join(aliasDirectory, "session.jsonl");
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("PI_SUBAGENT") && !key.startsWith("HC_") && !key.startsWith("HERDR")));
   const children = [session, alias].map(path => spawn(process.execPath, [cli, "--mode", "rpc", "--session", path, "--no-extensions", "--no-mcp", "--no-skills", "--no-context-files", "--offline"], { cwd: dir, env, stdio: ["pipe", "pipe", "pipe"] }));
   for (const child of children) { child.stdout.resume(); child.stderr.resume(); }
@@ -64,6 +65,7 @@ test("real separate Pi RPC processes sharing one file are audited, including can
     assert.equal(auditSession(session).ownerCount, 1);
   } finally {
     await Promise.all(children.map(child => child.exitCode !== null || child.signalCode !== null ? undefined : new Promise<void>(resolveExit => { child.once("exit", () => resolveExit()); child.kill(); })));
+    rmSync(aliasDirectory, { recursive: true, force: true });
     rmSync(dir, { recursive: true, force: true });
   }
 });

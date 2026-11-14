@@ -322,6 +322,8 @@ Subagent tabs and panes are created without stealing keyboard focus. Launch comm
 | `subagent_interrupt` | Interrupt a running Pi-backed subagent's current turn                                       |
 | `subagents_list`     | List available agent definitions                                                            |
 | `subagent_resume`    | Resume a previous sub-agent session (async)                                                 |
+| `subagent_audit`     | Read-only canonical session OS process audit (Windows/Linux)                                 |
+| `subagent_close`     | Request owned idle Pi shutdown; verify original PID + birth exited                           |
 
 | Command                    | Description                          |
 | -------------------------- | ------------------------------------ |
@@ -566,6 +568,21 @@ A durable claim, separate from the immutable acceptance/rejection acknowledgemen
 
 Resume audits before terminal/task writes and again after asynchronous inspection. A sole matching tracked live owner may continue; untracked/duplicate or unverified writers block relaunch with manual cleanup guidance. Three legacy Pi instances may legitimately be found sharing a file after old resumes: audit does **not** close them automatically. Completion is not process exit, and `close:false` remains intentional. No stale PID, idle state or model claim authorizes termination.
 
+### Explicit verified close
+
+```js
+subagent_audit({ sessionPath: "/absolute/path/child.jsonl" })
+subagent_close({ id: "owned-run-id" }) // alternatively exact owned name
+```
+
+`subagent_close` is a parent-owned lifecycle tool, not a child completion tool. It accepts only a tracked owned Pi child, honors `deny-tools` and `spawning:false`, and is **not** automatically added to child tool allowlists. No arbitrary session path, force option, cancellation, process-name kill, terminal typing or legacy cleanup is supported. Duplicate owners or uncertain OS/ancestry evidence refuse a new shutdown request. Recovered artifact-only children with detached terminal custody remain ineligible; update/reload legacy children and complete a turn, or close them manually.
+
+The separate `close-v1` artifact capability binds requests to the run, canonical session, process birth/nonce and a fresh child-issued settled-idle token. The child rechecks current session, idle state and pending input, durably claims the UUID, publishes an immutable acknowledgement, and calls Pi's graceful `ctx.shutdown()` without another model turn. Watchers start on `session_start` and stop on `session_shutdown`; reload invalidates old idle proofs. Acknowledgement means **requested**, never exited. RPC mode applies shutdown at its next command-response boundary; without that boundary it may remain pending.
+
+Only an OS probe showing the original PID + birth absent (including PID reuse) yields `closed`. This describes **that owned process**, not every writer of the session; remaining/unverified owners are reported. A timeout or unavailable probe returns `pending`/`uncertain` and retains ownership and the close request. Recheck the same id; do not resume or launch a replacement. Replay/reload does not dispatch again. A rejected request is retained rather than silently retried with a new idle token; inspect/close manually. Branch, binding and durable custody are revalidated after waits. Ancestry gaps (for example exited Windows launchers) fail closed unless direct-child identity proves non-ancestry. No reused PID or pane is killed/closed by this tool. Successful original-process receipts remain read-only across extension reload (bounded to 128); parent restart does not adopt legacy controls.
+
+`subagent_done({close:false})` still intentionally keeps collaboration open. Completion, assistant claims, stale PIDs and idle observations never trigger automatic cleanup. Existing owned-pane supervision remains independent of the explicit close handshake.
+
 ### Nonclosing question/progress channel: considered and deferred
 
 A dedicated nonclosing question channel could preserve a worker's pane while the parent decides, but it is **not implemented**. `caller_ping` still exits; it must not be advertised as a pause-and-wait tool. Ordinary progress belongs in the existing panel, not a new tool or wakeup protocol.
@@ -760,7 +777,7 @@ By default, every sub-agent can spawn further sub-agents. Control this with fron
 
 ### `spawning: false`
 
-Denies all subagent lifecycle tools (`subagent`, `subagent_interrupt`, `subagents_list`, `subagent_resume`):
+Denies all subagent lifecycle tools (`subagent`, `subagent_interrupt`, `subagents_list`, `subagent_resume`, `subagent_close`; read-only `subagent_audit` remains available):
 
 ```yaml
 ---

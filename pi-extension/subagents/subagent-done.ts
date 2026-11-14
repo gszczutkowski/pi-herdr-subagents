@@ -13,6 +13,7 @@ import { registerSubagentAssignment } from "./assignment.ts";
 import { registerLiveContinuation } from "./live-continuation.ts";
 import { StructuredResultSchema, normalizeStructuredResult, prepareCompletionArguments } from "./contracts.ts";
 import { registerRecoveryIdentity } from "./recovery-identity.ts";
+import { registerCloseControl } from "./close-control.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -83,6 +84,7 @@ export default function (pi: ExtensionAPI) {
   registerSubagentAssignment(pi);
   registerLiveContinuation(pi);
   registerRecoveryIdentity(pi);
+  registerCloseControl(pi);
 
   let toolNames: string[] = [];
   let denied: string[] = [];

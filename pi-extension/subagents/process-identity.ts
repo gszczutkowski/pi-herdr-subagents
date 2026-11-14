@@ -18,7 +18,7 @@ export function probeProcess(pid: number): ProcessProbe {
     }
     if (process.platform === "win32") {
       const result = execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
-        `$ErrorActionPreference='Stop'; $p=Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if($null -eq $p){'null'}else{@{pid=$p.Id;birth=$p.StartTime.ToUniversalTime().Ticks.ToString()}|ConvertTo-Json -Compress}`],
+        `$ErrorActionPreference='Stop'; try{$p=Get-Process -Id ${pid} -ErrorAction Stop}catch{if($_.CategoryInfo.Category -eq 'ObjectNotFound'){'null';exit}else{throw}}; @{pid=$p.Id;birth=$p.StartTime.ToUniversalTime().Ticks.ToString()}|ConvertTo-Json -Compress`],
       { encoding: "utf8", timeout: 5000, windowsHide: true }).trim();
       const value = JSON.parse(result);
       if (value === null) return { kind: "absent" };
@@ -30,6 +30,49 @@ export function probeProcess(pid: number): ProcessProbe {
         (error as NodeJS.ErrnoException).path === `/proc/${pid}/stat`) return { kind: "absent" };
   }
   return { kind: "unverified" };
+}
+
+/** True for self/ancestors; undefined when ancestry cannot be verified. No signals are sent. */
+export function isProtectedProcess(pid: number): boolean | undefined {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
+  if (pid === process.pid || pid === process.ppid) return true;
+  try {
+    if (process.platform === "win32") {
+      const rows = JSON.parse(execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
+        "$ErrorActionPreference='Stop'; @(Get-CimInstance Win32_Process | ForEach-Object { @{pid=$_.ProcessId;parent=$_.ParentProcessId} }) | ConvertTo-Json -Compress"],
+      { encoding: "utf8", timeout: 5000, windowsHide: true }));
+      const parents = new Map<number, number>(rows.map((row: any) => [row.pid, row.parent]));
+      // A verified direct descendant cannot be our ancestor, even when an
+      // older launcher has already disappeared from the CIM ancestry snapshot.
+      if (parents.get(pid) === process.pid) {
+        const own = probeProcess(process.pid), target = probeProcess(pid);
+        if (own.kind === "present" && target.kind === "present" &&
+            BigInt(target.identity.birth.slice("windows:".length)) > BigInt(own.identity.birth.slice("windows:".length))) return false;
+      }
+      let current = process.pid;
+      const seen = new Set<number>();
+      while (current > 0 && !seen.has(current)) {
+        if (current === pid) return true;
+        seen.add(current);
+        const parent = parents.get(current);
+        if (parent === undefined) return undefined;
+        current = parent;
+      }
+      return current === 0 ? false : undefined;
+    }
+    if (process.platform === "linux") {
+      let current = process.pid;
+      const seen = new Set<number>();
+      while (current > 0 && !seen.has(current)) {
+        if (current === pid) return true;
+        seen.add(current);
+        const stat = readFileSync(`/proc/${current}/stat`, "utf8");
+        current = Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[1]);
+      }
+      return current === 0 ? false : undefined;
+    }
+  } catch { /* Cannot establish ancestry. */ }
+  return undefined;
 }
 
 export function sameProcess(a: ProcessIdentity, b: ProcessIdentity): boolean {

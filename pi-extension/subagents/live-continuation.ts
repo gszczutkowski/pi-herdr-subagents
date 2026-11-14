@@ -109,6 +109,7 @@ export async function continueLiveChild(owner: SessionOwner, child: LiveChild | 
   transport: { inspect: (surface: string) => Promise<PaneInspection>; send?: (surface: string, text: string) => void;
     beforeSend?: () => void; timeoutMs?: number },
 ): Promise<{ requestId: string; status: "accepted" | "pending" }> {
+  if (owner.closeRequestId) throw new Error(`Close ${owner.closeRequestId} is pending/retained; do not continue or relaunch this process.`);
   if (owner.continuationRequestId) throw new Error(`Continuation ${owner.continuationRequestId} is in flight or uncertain; do not retry.`);
   if (!child || child.id !== owner.runId || child.cli !== "pi" || !child.activityFile ||
       child.lifecycle.process.kind !== "running" || !(child.lifecycle.turn.kind === "interrupted" || (child.hasTurnResult && child.lifecycle.turn.kind === "waiting"))) {

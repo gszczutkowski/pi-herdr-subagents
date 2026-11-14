@@ -10,6 +10,7 @@ import { persistLaunchProfile, persistProfileBinding, readPiLaunchProfile, resol
 import { continueLiveChild } from "./live-continuation.ts";
 import { auditSession, assertSessionWriters } from "./session-audit.ts";
 import { readChildIdentity } from "./recovery-identity.ts";
+import { closeOwnedChild, type CloseResult } from "./close-control.ts";
 import { prepareLaunchRun, registerLaunchedRun } from "./launch-registration.ts";
 import { createLineage, type Lineage } from "./lineage.ts";
 import { recordHistory, registerPlanHistory } from "./history.ts";
@@ -104,6 +105,9 @@ const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
 const WIDGET_INTERVAL_KEY = Symbol.for("pi-subagents/widget-interval");
 const STATUS_INTERVAL_KEY = Symbol.for("pi-subagents/status-interval");
 const RUNTIME_KEY = Symbol.for("pi-subagents/runtime");
+const CLOSED_KEY = Symbol.for("pi-subagents/closed-process-receipts/v1");
+const closedProcessReceipts: Map<string, { id: string; name: string; result: CloseResult }> =
+  (globalThis as any)[CLOSED_KEY] ??= new Map();
 
 {
   const prevInterval = (globalThis as any)[WIDGET_INTERVAL_KEY];
@@ -193,6 +197,7 @@ const SPAWNING_TOOLS = new Set([
   "subagent_interrupt",
   "subagents_list",
   "subagent_resume",
+  "subagent_close",
 ]);
 
 /**
@@ -1918,12 +1923,59 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
 
 
+  if (shouldRegister("subagent_close")) pi.registerTool({
+    name: "subagent_close", label: "Close Owned Subagent",
+    description: "Explicitly request graceful shutdown of one tracked, owned, idle Pi child (id or exact name). No force kill, cancellation, terminal typing, or legacy/untracked cleanup. Closed means original PID+birth is OS-verified gone, NOT session-wide closure. Pending/uncertain retains ownership; recheck the same id.",
+    parameters: Type.Object({ id: Type.Optional(Type.String()), name: Type.Optional(Type.String()) }, { additionalProperties: false }),
+    async execute(_id, params, _signal, _update, ctx) {
+      if (params.id && params.name) throw new Error("Supply owned id OR exact name, not both");
+      if (runtime.recoveryError) throw new Error(runtime.recoveryError);
+      runtime.store?.assertCustody();
+      const receipt = params.id ? closedProcessReceipts.get(params.id) : undefined;
+      if (receipt) return { content: [{ type: "text", text: JSON.stringify(receipt.result) }],
+        details: { id: receipt.id, name: receipt.name, ...receipt.result } };
+      const resolved = resolveInterruptTarget(params);
+      if ("error" in resolved) throw new Error(resolved.error);
+      const child = resolved.running;
+      const path = canonicalSessionPath(child.sessionFile);
+      const owner = sessionOwners.get(path);
+      if (!owner || owner.runId !== child.id) throw new Error("Only currently owned tracked Pi children can be closed; use manual cleanup for legacy/untracked writers.");
+      const store = child.durableStore;
+      const binding = JSON.stringify(child.planTask);
+      const parentSession = ctx.sessionManager.getSessionFile();
+      const validate = () => {
+        if (runtime.treeSuspension || child.terminalActionsAllowed === false ||
+            runningSubagents.get(child.id) !== child || sessionOwners.get(path) !== owner ||
+            child.durableStore !== store || JSON.stringify(child.planTask) !== binding ||
+            ctx.sessionManager.getSessionFile() !== parentSession) throw new Error("Close custody/binding/branch changed; ownership retained and no further request dispatched.");
+        store?.assertCustody();
+        if (child.planTask) {
+          const view = runtime.plans!.read(ctx.sessionManager);
+          const plan = view.snapshot;
+          const task = plan?.tasks.find(t => t.taskId === child.planTask!.taskId);
+          if (!view.writable || plan?.planId !== child.planTask.planId ||
+              JSON.stringify(plan.authority) !== JSON.stringify(child.planTask.authority) ||
+              !task?.attempts.some(a => a.attemptId === child.planTask!.attemptId && a.runIds.includes(child.id))) throw new Error("Close task binding is not on the current parent branch.");
+        }
+      };
+      const result: CloseResult = await closeOwnedChild(owner, child, { validate });
+      validate();
+      if (result.status === "closed") {
+        closedProcessReceipts.set(child.id, { id: child.id, name: child.name, result });
+        // Bound read-only history across extension reload; no live ownership is evicted.
+        if (closedProcessReceipts.size > 128) closedProcessReceipts.delete(closedProcessReceipts.keys().next().value!);
+        releaseSession(path, child.id);
+      }
+      return { content: [{ type: "text", text: JSON.stringify(result) }], details: { id: child.id, name: child.name, ...result } };
+    },
+  });
+
   if (shouldRegister("subagent_audit")) pi.registerTool({
     name: "subagent_audit", label: "Audit Subagent Session",
     description: "Read-only OS audit of Pi CLI processes explicitly selecting one canonical session. Supply sessionPath OR owned id/name. Returns at most 32 PID/birth identities, never command lines. Uncertain is not safe; no automatic cleanup.",
-    parameters: Type.Object({ sessionPath: Type.Optional(Type.String()), id: Type.Optional(Type.String()), name: Type.Optional(Type.String()) }),
+    parameters: Type.Object({ sessionPath: Type.Optional(Type.String()), id: Type.Optional(Type.String()), name: Type.Optional(Type.String()) }, { additionalProperties: false }),
     async execute(_id, params, _signal, _update, ctx) {
-      if (params.sessionPath && (params.id || params.name)) throw new Error("Supply sessionPath OR owned id/name");
+      if ((params.sessionPath && (params.id || params.name)) || (params.id && params.name)) throw new Error("Supply sessionPath OR owned id/name (one selector)");
       let path = params.sessionPath;
       if (!path) {
         const target = resolveInterruptTarget(params);

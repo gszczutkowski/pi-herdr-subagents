@@ -3,11 +3,13 @@ import childProcess from "node:child_process";
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { after, test, mock } from "node:test";
 
 // Exercise actual tool/terminal code, replacing only OS boundaries (no live herdr).
+let powershellResponder: ((command: string) => string) | undefined;
 let prepareFails = false;
 let sendFails = false;
 let serial = 0;
@@ -24,7 +26,7 @@ mock.method(fs, "writeFileSync", (path: any, ...args: any[]) => {
 });
 mock.method(childProcess, "execSync", () => "herdr");
 mock.method(childProcess, "execFileSync", (_command: any, args: any) => {
-  if (_command === "powershell.exe") return "[]";
+  if (_command === "powershell.exe") return powershellResponder?.(args.at(-1)) ?? "[]";
   if (args[0] === "tab" && args[1] === "create") {
     return JSON.stringify({ result: { root_pane: { pane_id: `child-${++serial}` } } });
   }
@@ -100,6 +102,7 @@ async function fixture(run: (f: any) => Promise<void>) {
     failNotifications: (value: boolean) => { failNotifications = value; } }); } finally {
     for (const stop of childShutdowns.splice(0)) stop();
     prepareFails = false;
+    powershellResponder = undefined;
     sendFails = false;
     onRun = () => {};
     inspect = async () => JSON.stringify({ error: { code: "pane_not_found" } });
@@ -114,6 +117,64 @@ async function until(predicate: () => boolean) {
   const deadline = Date.now() + 4000;
   while (!predicate()) { assert.ok(Date.now() < deadline, "condition timed out"); await pause(); }
 }
+
+test("registered close releases only OS-verified original owner and returns idempotent reload receipt (Windows OS boundary)", { skip: process.platform !== "win32" }, async () => fixture(async ({ tools, ctx, session, resume, reload }: any) => {
+  const started = await resume();
+  const child = __test__.runningSubagents.get(started.details.id)!;
+  const targetPid = 98765432;
+  const identity = { schema: 1, runId: child.id, sessionFile: session, headerId: "child", nonce: "test-nonce", process: { pid: targetPid, birth: "windows:2" } };
+  fs.writeFileSync(`${runCompletionFile(session, child.id)}.identity.json`, JSON.stringify(identity));
+  const { closeDir, CLOSE_CAPABILITY } = await import("../pi-extension/subagents/close-control.ts");
+  const dir = closeDir(child.activityFile!); fs.mkdirSync(dir);
+  const token = "00000000-0000-0000-0000-000000000001";
+  fs.writeFileSync(join(dir, `${token}.idle.json`), JSON.stringify({ ...identity, capability: CLOSE_CAPABILITY, idleToken: token }));
+  fs.writeFileSync(join(dir, "current.json"), JSON.stringify({ file: `${token}.idle.json` }));
+  const cli = join(dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"))), "cli.js");
+  let targetGone = false;
+  powershellResponder = (command: string) => {
+    if (command.includes("Where-Object")) return JSON.stringify(targetGone ? [] : [{ pid: targetPid, parentPid: process.pid, command: `node.exe "${cli}" --session "${session}"` }]);
+    if (command.includes("Get-CimInstance")) return JSON.stringify([{ pid: process.pid, parent: 0 }, { pid: targetPid, parent: process.pid }]);
+    if (command.includes(`-Id ${targetPid} `)) return targetGone ? "null" : JSON.stringify({ pid: targetPid, birth: "2" });
+    return JSON.stringify({ pid: process.pid, birth: "1" });
+  };
+  const before = closed.length;
+  const closing = tools.get("subagent_close").execute("close", { id: child.id }, undefined, undefined, ctx);
+  assert.ok(sessionOwners.get(session), "request itself never releases ownership");
+  targetGone = true;
+  const result = await closing;
+  assert.equal(result.details.status, "closed");
+  assert.equal(sessionOwners.has(session), false);
+  assert.equal(closed.length, before, "explicit close never operates a terminal locator");
+  reload();
+  assert.deepEqual((await tools.get("subagent_close").execute("again", { id: child.id }, undefined, undefined, ctx)).details, result.details);
+}));
+
+test("close is parent-owned, honors lifecycle denial and is not a child completion allowlist tool", async () => fixture(async ({ tools, ctx, session, resume }: any) => {
+  const close = tools.get("subagent_close");
+  assert.ok(close);
+  assert.ok(__test__.resolveDenyTools({ spawning: false } as any).has("subagent_close"));
+  assert.ok(__test__.resolveDenyTools({ denyTools: "subagent_close" } as any).has("subagent_close"));
+  const { buildSubagentToolAllowlist } = await import("../pi-extension/subagents/harness/drivers/pi.ts");
+  assert.equal(buildSubagentToolAllowlist("read")!.includes("subagent_close"), false);
+  await assert.rejects(close.execute("close", { id: "untracked" }, undefined, undefined, ctx), /No running subagent/);
+  const started = await resume();
+  await assert.rejects(close.execute("close", { id: started.details.id }, undefined, undefined, ctx), /lacks verified process identity/);
+  assert.equal(sessionOwners.get(session)!.runId, started.details.id);
+  const child = __test__.runningSubagents.get(started.details.id)!;
+  child.terminalActionsAllowed = false;
+  await assert.rejects(close.execute("close", { id: started.details.id }, undefined, undefined, ctx), /custody/);
+  const denied = new Map<string, any>();
+  const previous = [process.env.PI_SUBAGENT_ID, process.env.PI_DENY_TOOLS];
+  process.env.PI_SUBAGENT_ID = "restricted-child";
+  process.env.PI_DENY_TOOLS = "subagent_close";
+  try {
+    extension(new Proxy({}, { get: (_target, key) => key === "registerTool" ? (tool: any) => denied.set(tool.name, tool) : key === "getAllTools" ? () => [] : () => {} }) as any);
+    assert.equal(denied.has("subagent_close"), false);
+    assert.equal(denied.has("subagent_audit"), true);
+  } finally {
+    for (const [i, key] of ["PI_SUBAGENT_ID", "PI_DENY_TOOLS"].entries()) { if (previous[i] === undefined) delete process.env[key]; else process.env[key] = previous[i]; }
+  }
+}));
 
 test("registered audit is read only and accepts a path or an owned selector", async () => fixture(async ({ tools, ctx, session, resume }: any) => {
   const audit = tools.get("subagent_audit");

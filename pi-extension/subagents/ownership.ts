@@ -6,6 +6,7 @@ export interface SessionOwner {
   surface?: string;
   dispatched: boolean;
   continuationRequestId?: string;
+  closeRequestId?: string;
 }
 
 // Deliberately scoped to this parent process, not a cross-process file lock.
