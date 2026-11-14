@@ -161,6 +161,7 @@ export class PiHarnessDriver implements HarnessDriver {
     const assignment: SubagentAssignment = {
       version: 1,
       ...(profile.planTask ? { planTask: profile.planTask } : {}),
+      ...(profile.assignmentContract ? { assignmentContract: profile.assignmentContract } : {}),
       childId: params.id,
       sessionFile: subagentSessionFile,
       sender: process.env.PI_SUBAGENT_NAME || "Parent agent",

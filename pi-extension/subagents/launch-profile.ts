@@ -5,6 +5,7 @@ import type { SubagentLaunchContext } from "./harness/types.ts";
 import { canonicalSessionPath } from "./ownership.ts";
 import { atomicRuntimeWrite } from "./runtime-store.ts";
 import { isPlanTaskBinding, type PlanTaskBinding } from "./plan-runtime.ts";
+import { contractTask, isAssignmentContract, type AssignmentContract } from "./contracts.ts";
 import type { ResolvedRuntimePlan } from "./runtime-routing.ts";
 import { isLineage, type Lineage } from "./lineage.ts";
 
@@ -12,6 +13,7 @@ import { isLineage, type Lineage } from "./lineage.ts";
 export interface LaunchProfile {
   version: 1;
   planTask?: PlanTaskBinding;
+  assignmentContract?: AssignmentContract;
   harness: string;
   sessionFile: string;
   role: string | null;
@@ -35,6 +37,7 @@ export const launchProfilePath = (sessionFile: string): string => `${sessionFile
 export function resolveLaunchProfile(context: SubagentLaunchContext, harness: string, tools: string | null): LaunchProfile {
   const plan = context.runtimePlan;
   return {
+    ...(context.params.assignmentContract ? { assignmentContract: context.params.assignmentContract } : {}),
     version: 1, harness, sessionFile: canonicalSessionPath(context.subagentSessionFile),
     ...(context.lineage ? { lineage: context.lineage } : {}),
     role: context.params.agent ?? context.agentDefs?.name ?? null,
@@ -71,6 +74,7 @@ export function readPiLaunchProfile(sessionFile: string): LaunchProfile {
   const plan = p?.runtimePlan;
   if ((p?.lineage !== undefined && (!isLineage(p.lineage) || p.lineage.child.sessionFile !== p.sessionFile)) || p?.version !== 1 || p.harness !== "pi" || p.sessionFile !== canonicalSessionPath(sessionFile) ||
     (p.planTask !== undefined && !isPlanTaskBinding(p.planTask)) ||
+    (p.assignmentContract !== undefined && !isAssignmentContract(p.assignmentContract)) ||
     typeof p.cwd !== "string" || !isAbsolute(p.cwd) ||
     typeof p.agentDir !== "string" || !isAbsolute(p.agentDir) ||
     ![p.role, p.identity, p.tools, p.skills].every(nullableString) ||
@@ -86,10 +90,11 @@ export function readPiLaunchProfile(sessionFile: string): LaunchProfile {
 }
 
 /** Persist an optional first binding; an existing original authority is immutable. */
-export function persistProfileBinding(sessionFile: string, binding: PlanTaskBinding): void {
+export function persistProfileBinding(sessionFile: string, binding: PlanTaskBinding, assignmentContract?: AssignmentContract): void {
   const profile = readPiLaunchProfile(sessionFile);
   if (profile.planTask && JSON.stringify(profile.planTask) !== JSON.stringify(binding)) throw new Error("Launch profile task binding conflict");
-  if (!profile.planTask) atomicRuntimeWrite(launchProfilePath(sessionFile), { ...profile, planTask: binding });
+  if (assignmentContract && !isAssignmentContract(assignmentContract)) throw new Error("Invalid assignment contract");
+  if (!profile.planTask || assignmentContract) atomicRuntimeWrite(launchProfilePath(sessionFile), { ...profile, planTask: binding, ...(assignmentContract ? { assignmentContract } : {}) });
 }
 
 /** Reconstruct exclusively from the saved profile, never current role defaults or parent runtime. */
@@ -98,7 +103,7 @@ export function resumeLaunchContext(profile: LaunchProfile, run: {
   subagentsDir: string; shellQuote: (value: string) => string;
 }): SubagentLaunchContext {
   return {
-    params: { id: run.id, name: run.name, task: run.message ?? "", agent: profile.role ?? undefined,
+    params: { id: run.id, name: run.name, task: contractTask(run.message ?? "", profile.assignmentContract), assignmentContract: profile.assignmentContract, agent: profile.role ?? undefined,
       tools: profile.tools ?? undefined, skills: profile.skills ?? undefined },
     runtimePlan: profile.runtimePlan, effectiveModel: profile.runtimePlan.model,
     effectiveThinking: profile.runtimePlan.thinking, parentThinking: profile.runtimePlan.thinking,

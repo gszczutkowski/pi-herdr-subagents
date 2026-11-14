@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { isPlanTaskBinding, type PlanTaskBinding } from "./plan-runtime.ts";
+import { isAssignmentContract, type AssignmentContract } from "./contracts.ts";
 import { framedMessage } from "./frame.ts";
 import { isLineage, type Lineage } from "./lineage.ts";
 
@@ -11,6 +12,7 @@ export const ASSIGNMENT_ENV = "PI_SUBAGENT_ASSIGNMENT_FILE";
 
 export interface SubagentAssignment {
   planTask?: PlanTaskBinding;
+  assignmentContract?: AssignmentContract;
   version: 1;
   childId: string;
   sessionFile: string;
@@ -27,6 +29,7 @@ export function isSubagentAssignment(value: unknown): value is SubagentAssignmen
   const data = value as SubagentAssignment;
   return data.version === 1
     && (data.planTask === undefined || isPlanTaskBinding(data.planTask))
+    && (data.assignmentContract === undefined || isAssignmentContract(data.assignmentContract))
     && [data.childId, data.sessionFile, data.sender, data.recipient, data.role, data.task]
       .every((field) => typeof field === "string")
     && Array.isArray(data.skills) && data.skills.every((skill) => typeof skill === "string")
@@ -51,6 +54,7 @@ export function registerSubagentAssignmentRenderer(pi: ExtensionAPI): void {
       "",
       "Task:",
       data.task,
+      ...(data.assignmentContract ? ["", "Assignment contract:", JSON.stringify(data.assignmentContract, null, 2)] : []),
     ].join("\n"), (text) => theme.bg("customMessageBg", text));
   });
 }

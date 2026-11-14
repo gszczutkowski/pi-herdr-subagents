@@ -8,6 +8,7 @@ export interface SubagentLaunchParams {
   id: string;
   name: string;
   task: string;
+  assignmentContract?: import("../contracts.ts").AssignmentContract;
   agent?: string;
   cwd?: string;
   systemPrompt?: string;

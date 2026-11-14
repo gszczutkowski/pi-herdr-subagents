@@ -95,7 +95,16 @@ test("registered task-bound spawn, live/closed resume, failure isolation and res
     children.push(child);
     assert.deepEqual(child.planTask.authority, read().authority);
     const assignmentFile = join(dir, "artifacts", sm.getSessionId(), "context", `subagent-assignment-${child.id}.json`);
-    assert.deepEqual(JSON.parse(fs.readFileSync(assignmentFile, "utf8")).planTask, child.planTask);
+    const assignment = JSON.parse(fs.readFileSync(assignmentFile, "utf8"));
+    assert.deepEqual(assignment.planTask, child.planTask);
+    assert.deepEqual(assignment.assignmentContract.criteria, [{ criterionId, text: "Verified" }]);
+    assert.match(assignment.task, /Assignment contract/);
+    assert.ok(assignment.task.includes(criterionId), "criteria reach actual model task, not only display metadata");
+    const launchProfile = JSON.parse(fs.readFileSync(`${child.sessionFile}.launch-profile.json`, "utf8"));
+    assert.deepEqual(launchProfile.assignmentContract, assignment.assignmentContract);
+    const taskFiles = fs.readdirSync(join(dir, "artifacts", sm.getSessionId(), "context")).filter(f => f.endsWith('.md'));
+    assert.ok(taskFiles.some(f => fs.readFileSync(join(dir, "artifacts", sm.getSessionId(), "context", f), "utf8").includes(criterionId)));
+    assert.deepEqual(readRuntimeManifest(manifestDir)!.runs[child.id].profile?.assignmentContract, assignment.assignmentContract);
     const beforeLive = read().revision;
     child.lifecycle.process = { kind: "running", since: Date.now() } as any;
     child.lifecycle.turn = { kind: "interrupted", since: Date.now() } as any;

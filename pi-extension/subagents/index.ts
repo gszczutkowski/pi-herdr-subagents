@@ -75,6 +75,7 @@ import {
 import { registerSubagentAssignmentRenderer } from "./assignment.ts";
 import { registerPlanTools } from "./plan-tools.ts";
 import type { PlanPersistence } from "./plan-persistence.ts";
+import { AssignmentContractSchema, resolveAssignmentContract, contractTask } from "./contracts.ts";
 import { PlanTaskParams, bindPlanRun, importPlanEnvelope, recordDispatchFailure, type PlanTaskBinding } from "./plan-runtime.ts";
 import { registerPlanCommand } from "./plan-preflight.ts";
 import { createDeliveryState, enqueueDelivery, flushDeliveries, pauseDeliveries, restoreDurableDeliveries, type DeliveryState } from "./delivery.ts";
@@ -134,6 +135,7 @@ const ThinkingLevelSchema = Type.Union(
 );
 
 const SubagentParams = Type.Object({
+  assignmentContract: Type.Optional(AssignmentContractSchema),
   planTask: Type.Optional(PlanTaskParams),
   name: Type.String({ description: "Display name for the subagent" }),
   task: Type.String({ description: "Task/prompt for the sub-agent" }),
@@ -1321,6 +1323,8 @@ async function launchSubagent(
   let planTask: PlanTaskBinding | undefined;
   try {
   if (params.planTask && !store) throw new Error("Task-bound runs require durable runtime custody");
+  const boundTask = params.planTask ? runtime.plans!.read((ctx as ExtensionContext).sessionManager).snapshot?.tasks.find(t => t.taskId === params.planTask!.taskId) : undefined;
+  const assignmentContract = resolveAssignmentContract(params.assignmentContract, boundTask);
   planTask = bindPlanRun(runtime.plans!, ctx as ExtensionContext, id, params.planTask);
   const surfacePreCreated = !!options?.surface;
   const surface = options?.surface ?? createSubagentSurface(params.name, resolveSubagentLayout());
@@ -1367,7 +1371,7 @@ async function launchSubagent(
 
   const launchContext: SubagentLaunchContext = {
     lineage,
-    params: { ...params, id },
+    params: { ...params, id, assignmentContract, task: contractTask(params.task, assignmentContract) },
     agentDefs,
     runtimePlan,
     effectiveModel,
@@ -2181,7 +2185,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         if (liveOwner && runningSubagents.has(liveOwner.runId)) {
           const child = runningSubagents.get(liveOwner.runId)!;
           if (runtime.treeSuspension || child.terminalActionsAllowed === false) throw new Error("Live continuation requires verified terminal custody");
-          const result = await continueLiveChild(liveOwner, child, params, { inspect: inspectPane, beforeSend: () => {
+          const continuationContract = params.planTask ? resolveAssignmentContract(undefined,
+            runtime.plans!.read(ctx.sessionManager).snapshot?.tasks.find(t => t.taskId === params.planTask!.taskId)) : profile.assignmentContract;
+          const continuationParams = { ...params, message: contractTask(params.message ?? "", continuationContract) };
+          const result = await continueLiveChild(liveOwner, child, continuationParams, { inspect: inspectPane, beforeSend: () => {
             if (runtime.treeSuspension || child.terminalActionsAllowed === false) throw new Error("Terminal custody was detached during continuation");
             child.durableStore?.assertCustody();
             // Validate after async inspection, immediately before dispatch.
@@ -2189,7 +2196,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             if (child.planTask) {
               if (!child.durableStore) throw new Error("Task-bound continuation requires durable custody");
               child.durableStore.bindRun(child.id, child.planTask);
-              persistProfileBinding(child.sessionFile, child.planTask);
+              persistProfileBinding(child.sessionFile, child.planTask, continuationContract);
             }
             if (liveOwner.continuationRequestId) child.durableStore?.continuation(child.id, liveOwner.continuationRequestId);
           }, send: (surface, command) => {
@@ -2231,8 +2238,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         if ((params.planTask || profile.planTask) && !store) throw new Error("Task-bound runs require durable runtime custody");
         planTask = bindPlanRun(runtime.plans!, ctx, id, params.planTask, profile.planTask);
         // Preserve the original binding, never infer authority from the selected branch.
-        const resumeProfile = { ...profile, ...(planTask ? { planTask } : {}) };
-        if (planTask) persistProfileBinding(params.sessionPath, planTask);
+        const assignmentContract = params.planTask ? resolveAssignmentContract(undefined,
+          runtime.plans!.read(ctx.sessionManager).snapshot?.tasks.find(t => t.taskId === params.planTask!.taskId)) : profile.assignmentContract;
+        const resumeProfile = { ...profile, ...(planTask ? { planTask } : {}), ...(assignmentContract ? { assignmentContract } : {}) };
+        if (planTask) persistProfileBinding(params.sessionPath, planTask, assignmentContract);
         // Record entry count before resuming so we can extract new messages
         const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
 
