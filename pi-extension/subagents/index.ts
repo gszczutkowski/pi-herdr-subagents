@@ -1196,6 +1196,7 @@ async function launchSubagent(
   try {
   const surfacePreCreated = !!options?.surface;
   const surface = options?.surface ?? createSubagentSurface(params.name, resolveSubagentLayout());
+  owner.surface = surface;
   if (params.task) {
     setPaneTask(surface, params.task);
   }
@@ -1274,10 +1275,8 @@ async function launchSubagent(
     .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
 
-  owner.surface = surface;
-  // After dispatch starts, failure is ambiguous: retain ownership until closure.
-  owner.dispatched = true;
   runScriptInPane(surface, built.command, {
+    onDispatch: () => { owner.dispatched = true; },
     scriptPath: launchScriptFile,
     scriptPreamble: (built.launchScriptPreamble ?? [
       `# Subagent launch script for ${params.name}`,
@@ -1309,7 +1308,12 @@ async function launchSubagent(
   runningSubagents.set(id, running);
   return running;
   } catch (error) {
-    if (!owner.dispatched) releaseSession(subagentSessionFile, id);
+    if (!owner.dispatched) {
+      releaseSession(subagentSessionFile, id);
+      if (owner.surface && !options?.surface) {
+        try { closePane(owner.surface); } catch { /* best-effort cleanup */ }
+      }
+    }
     throw error;
   }
 }
@@ -1915,8 +1919,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         const previousOwner = sessionOwners.get(params.sessionPath);
-        if (previousOwner?.surface && inspectPane(previousOwner.surface).kind === "missing") {
-          releaseSession(params.sessionPath, previousOwner.runId);
+        if (previousOwner?.surface) {
+          const inspection = await inspectPane(previousOwner.surface);
+          // Inspection yielded: never release a replacement owner's reservation.
+          if (inspection.kind === "missing" && sessionOwners.get(params.sessionPath) === previousOwner) {
+            releaseSession(params.sessionPath, previousOwner.runId);
+          }
         }
         const owner = reserveSession(params.sessionPath, id);
         try {
@@ -1924,6 +1932,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
 
         const surface = createSubagentSurface(name, resolveSubagentLayout());
+        owner.surface = surface;
         if (params.message) {
           setPaneTask(surface, params.message);
         }
@@ -1947,9 +1956,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             .replace(/-+/g, "-")
             .replace(/^-|-$/g, "") || "resume"}-resume-${id}.sh`,
         );
-        owner.surface = surface;
-        owner.dispatched = true;
         runScriptInPane(surface, built.command, {
+          onDispatch: () => { owner.dispatched = true; },
           scriptPath: launchScriptFile,
           scriptPreamble: built.launchScriptPreamble?.join("\n"),
         });
@@ -1994,7 +2002,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           },
         };
         } catch (error) {
-          if (!owner.dispatched) releaseSession(params.sessionPath, id);
+          if (!owner.dispatched) {
+            releaseSession(params.sessionPath, id);
+            if (owner.surface) {
+              try { closePane(owner.surface); } catch { /* best-effort cleanup */ }
+            }
+          }
           throw error;
         }
       },

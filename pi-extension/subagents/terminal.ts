@@ -91,8 +91,11 @@ export function renameCurrentWorkspace(title: string): void {
   renameHerdrWorkspace(title);
 }
 
-export function runInPane(paneId: PaneId, command: string): void {
+export function runInPane(paneId: PaneId, command: string, onDispatch?: () => void): void {
   assertTerminalAvailable();
+  // Everything before this boundary is definite preparation failure. Once the
+  // send starts, an error cannot prove that the child did not receive it.
+  onDispatch?.();
   sendHerdrCommand(paneId, command);
 }
 
@@ -104,7 +107,7 @@ export function interruptPane(paneId: PaneId): void {
 export function runScriptInPane(
   paneId: PaneId,
   command: string,
-  options?: { scriptPath?: string; scriptPreamble?: string },
+  options?: { scriptPath?: string; scriptPreamble?: string; onDispatch?: () => void },
 ): string {
   const scriptPath =
     options?.scriptPath ??
@@ -132,7 +135,7 @@ export function runScriptInPane(
 
   // A core-created Bash may inherit a Windows PATH without /usr/bin. Resolve
   // the interpreter from the orchestrator instead of relying on that shell.
-  runInPane(paneId, `${shellQuote(bashPath(bash))} ${shellQuote(scriptPath)}`);
+  runInPane(paneId, `${shellQuote(bashPath(bash))} ${shellQuote(scriptPath)}`, options?.onDispatch);
   return scriptPath;
 }
 
