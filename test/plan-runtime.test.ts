@@ -14,6 +14,7 @@ import { bindPlanRun, importPlanEnvelope } from "../pi-extension/subagents/plan-
 import { RuntimeStore, readRuntimeManifest } from "../pi-extension/subagents/runtime-store.ts";
 import { canonicalSessionPath, releaseSession } from "../pi-extension/subagents/ownership.ts";
 import { continuationDir } from "../pi-extension/subagents/live-continuation.ts";
+import { contractTask, resolveAssignmentContract } from "../pi-extension/subagents/contracts.ts";
 
 // Real native persistence, registered execute, launch builder, completion adapter
 // and durable outbox. Only the Pi API host and terminal transport are mocked.
@@ -38,6 +39,7 @@ test("registered task-bound spawn, live/closed resume, failure isolation and res
   const manifestDir = join(dir, "artifacts", sm.getSessionId(), "subagent-runtime");
   let continuationChild: any;
   const children: any[] = [];
+  let savedContract: any;
   mock.method(childProcess, "execSync", () => "herdr");
   mock.method(childProcess, "execFileSync", (_command: any, args: string[]) => {
     if (args[0] === "tab" && args[1] === "create") return JSON.stringify({ result: { root_pane: { pane_id: `pane-${++serial}` } } });
@@ -54,6 +56,8 @@ test("registered task-bound spawn, live/closed resume, failure isolation and res
       liveSends++;
       const requestId = args.join(" ").match(/\/_subagent_continue ([0-9a-f-]+)/)![1];
       const cdir = continuationDir(continuationChild.activityFile);
+      const request = JSON.parse(fs.readFileSync(join(cdir, `${requestId}.request.json`), "utf8"));
+      assert.equal(request.message, contractTask("follow-up", savedContract));
       fs.writeFileSync(join(cdir, `${requestId}.result.json`), JSON.stringify({ runId: continuationChild.id, requestId, status: "accepted" }));
     }
     return "";
@@ -90,7 +94,9 @@ test("registered task-bound spawn, live/closed resume, failure isolation and res
     mutate((p: any, c: any) => store.startAttempt(p, c, p.tasks[0].taskId));
     await assert.rejects(execute("subagent", { name: "Stale", task: "one", cwd: dir, planTask: { ...selection(), expectedRevision: 0 } }), /Revision conflict/);
     assert.equal(dispatches, 0);
-    const spawned = await execute("subagent", { name: "Bound", task: "one", cwd: dir, planTask: selection() });
+    savedContract = { ...resolveAssignmentContract(undefined, read().tasks[0]),
+      files: ["src/worker.ts"], decisions: ["Keep the public API"], changeConstraints: ["Do not modify generated files"] };
+    const spawned = await execute("subagent", { name: "Bound", task: "one", cwd: dir, planTask: selection(), assignmentContract: savedContract });
     const child = __test__.runningSubagents.get(spawned.details.id)!;
     children.push(child);
     assert.deepEqual(child.planTask.authority, read().authority);
@@ -120,11 +126,23 @@ test("registered task-bound spawn, live/closed resume, failure isolation and res
     await assert.rejects(execute("subagent_resume", { sessionPath: child.sessionFile, message: "redirect", planTask: { ...selection(), attemptId: randomUUID() } }), /redirect/);
     assert.deepEqual(read(), liveSnapshot);
     assert.equal(dispatches, liveDispatches);
-    const continued = await execute("subagent_resume", { sessionPath: `${dirname(child.sessionFile)}/./${basename(child.sessionFile)}`, message: "follow-up", planTask: selection() });
+    const profilePath = `${child.sessionFile}.launch-profile.json`;
+    const assertSavedContract = (runId: string) => {
+      assert.deepEqual(JSON.parse(fs.readFileSync(profilePath, "utf8")).assignmentContract, savedContract);
+      assert.deepEqual(readRuntimeManifest(manifestDir)!.runs[runId].profile?.assignmentContract, savedContract);
+    };
+    const staleProfile = { ...launchProfile, assignmentContract: { ...savedContract, scope: "Stale scope" } };
+    fs.writeFileSync(profilePath, JSON.stringify(staleProfile));
+    await assert.rejects(execute("subagent_resume", { sessionPath: child.sessionFile, message: "stale contract", planTask: selection() }), /scope disagrees/);
+    assert.deepEqual(read(), liveSnapshot, "contract validation never fails the healthy attempt");
+    assert.equal(liveSends, 0);
+    fs.writeFileSync(profilePath, JSON.stringify(launchProfile));
+    const continued = await execute("subagent_resume",  { sessionPath: `${dirname(child.sessionFile)}/./${basename(child.sessionFile)}`, message: "follow-up", planTask: selection() });
     assert.equal(continued.details.id, child.id);
     assert.equal(continued.details.status, "continued");
     assert.equal(read().revision, beforeLive, "idempotent attach does not append");
     assert.equal(liveSends, 1, "rejected live bindings never reach transport");
+    assertSavedContract(child.id);
     continuationChild = undefined;
     const structuredResult = { status: "complete" as const, summary: "Implementation proposal", artifacts: ["report.txt"],
       checks: [{ criterionIds: [criterionId], ref: "report.txt#check", outcome: "passed" as const }], unmetCriterionIds: [], risks: [] };
@@ -156,9 +174,21 @@ test("registered task-bound spawn, live/closed resume, failure isolation and res
     releaseSession(child.sessionFile, child.id);
     __test__.runningSubagents.delete(child.id);
     fs.writeFileSync(child.sessionFile, JSON.stringify({ type: "session", version: 3, id: "child", cwd: dir }) + "\n");
-    const resumed = await execute("subagent_resume", { sessionPath: child.sessionFile, message: "again" });
+    const beforeClosed = structuredClone(read());
+    fs.writeFileSync(profilePath, JSON.stringify(staleProfile));
+    await assert.rejects(execute("subagent_resume", { sessionPath: child.sessionFile, message: "stale contract", planTask: selection() }), /scope disagrees/);
+    assert.deepEqual(read(), beforeClosed, "rejected contract never attaches/fails a closed run");
+    fs.writeFileSync(profilePath, JSON.stringify(launchProfile));
+    const resumed = await execute("subagent_resume", { sessionPath: child.sessionFile, message: "again", planTask: selection() });
     const resumedChild = __test__.runningSubagents.get(resumed.details.id)!;
     children.push(resumedChild);
+    assertSavedContract(resumedChild.id);
+    const resumedAssignment = JSON.parse(fs.readFileSync(join(dir, "artifacts", sm.getSessionId(), "context", `subagent-assignment-${resumedChild.id}.json`), "utf8"));
+    assert.equal(resumedAssignment.task, contractTask("again", savedContract));
+    assert.deepEqual(resumedAssignment.assignmentContract, savedContract);
+    const resumedTaskFile = fs.readdirSync(join(dir, "artifacts", sm.getSessionId(), "context")).find(f => f.endsWith(`${resumedChild.id}.md`))!;
+    assert.equal(fs.readFileSync(join(dir, "artifacts", sm.getSessionId(), "context", resumedTaskFile), "utf8"),
+      contractTask("again", savedContract) + `\n\nCorrelation (report only; do not mutate the parent plan): planId=${resumedChild.planTask.planId}, taskId=${resumedChild.planTask.taskId}, attemptId=${resumedChild.planTask.attemptId}, runId=${resumedChild.id}`);
     assert.notEqual(resumedChild.id, child.id);
     assert.equal(read().tasks.length, 1); assert.equal(read().tasks[0].attempts.length, 1);
     assert.equal(read().tasks[0].attempts[0].runIds.length, 2);

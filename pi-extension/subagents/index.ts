@@ -2198,7 +2198,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         if (liveOwner && runningSubagents.has(liveOwner.runId)) {
           const child = runningSubagents.get(liveOwner.runId)!;
           if (runtime.treeSuspension || child.terminalActionsAllowed === false) throw new Error("Live continuation requires verified terminal custody");
-          const continuationContract = params.planTask ? resolveAssignmentContract(undefined,
+          const continuationContract = params.planTask ? resolveAssignmentContract(profile.assignmentContract,
             runtime.plans!.read(ctx.sessionManager).snapshot?.tasks.find(t => t.taskId === params.planTask!.taskId)) : profile.assignmentContract;
           const continuationParams = { ...params, message: contractTask(params.message ?? "", continuationContract) };
           const result = await continueLiveChild(liveOwner, child, continuationParams, { inspect: inspectPane, beforeSend: () => {
@@ -2249,10 +2249,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         let planTask: PlanTaskBinding | undefined;
         try {
         if ((params.planTask || profile.planTask) && !store) throw new Error("Task-bound runs require durable runtime custody");
+        // Validate saved fields before attaching a run: stale contracts are not
+        // silently rewritten, and rejected metadata is not a dispatch failure.
+        const assignmentContract = params.planTask ? resolveAssignmentContract(profile.assignmentContract,
+          runtime.plans!.read(ctx.sessionManager).snapshot?.tasks.find(t => t.taskId === params.planTask!.taskId)) : profile.assignmentContract;
         planTask = bindPlanRun(runtime.plans!, ctx, id, params.planTask, profile.planTask);
         // Preserve the original binding, never infer authority from the selected branch.
-        const assignmentContract = params.planTask ? resolveAssignmentContract(undefined,
-          runtime.plans!.read(ctx.sessionManager).snapshot?.tasks.find(t => t.taskId === params.planTask!.taskId)) : profile.assignmentContract;
         const resumeProfile = { ...profile, ...(planTask ? { planTask } : {}), ...(assignmentContract ? { assignmentContract } : {}) };
         if (planTask) persistProfileBinding(params.sessionPath, planTask, assignmentContract);
         // Record entry count before resuming so we can extract new messages
