@@ -90,10 +90,25 @@ function validate(plan: PlanSnapshot): void {
     requireValue(["pending", "in_progress", "blocked", "in_review", "accepted", "failed", "skipped", "cancelled"].includes(task.status), "Invalid status");
     text(task.statusReason);
     requireValue(Array.isArray(task.statusHistory) && task.statusHistory.length > 0 && task.statusHistory.length <= 1000, "Invalid status history");
+    requireValue(task.statusHistory[0].status === "pending" && task.statusHistory[0].revision > 0 && task.statusHistory[0].reason === "Awaiting assignment", "Missing pending creation");
+    const transitions: Record<TaskStatus, readonly TaskStatus[]> = {
+      pending: ["in_progress", "blocked", "in_review", "skipped", "cancelled"],
+      in_progress: ["blocked", "in_review", "failed", "skipped", "cancelled"],
+      blocked: ["blocked", "in_progress", "in_review", "failed", "skipped", "cancelled"],
+      in_review: ["in_review", "in_progress", "blocked", "accepted", "failed", "skipped", "cancelled"],
+      accepted: ["pending", "in_review"], failed: ["pending", "in_progress", "skipped", "cancelled"],
+      skipped: ["pending"], cancelled: ["pending"],
+    };
+    let previous: StatusChange | undefined;
     for (const change of task.statusHistory) {
       keys(change, ["revision", "status", "reason"]);
       text(change.reason);
       requireValue(Number.isSafeInteger(change.revision) && change.revision >= 0 && change.revision <= plan.revision && ["pending", "in_progress", "blocked", "in_review", "accepted", "failed", "skipped", "cancelled"].includes(change.status), "Invalid status change");
+      if (previous) {
+        requireValue(change.revision > previous.revision, "Nonchronological status history");
+        requireValue(transitions[previous.status].includes(change.status), "Impossible status transition");
+      }
+      previous = change;
     }
     requireValue(task.statusHistory.at(-1)?.status === task.status && task.statusHistory.at(-1)?.reason === task.statusReason, "Status history mismatch");
     for (const list of [task.criteria, task.dependencies, task.artifacts, task.evidence, task.decisions]) requireValue(Array.isArray(list) && list.length <= 1000, "Invalid bounded list");
@@ -117,14 +132,30 @@ function validate(plan: PlanSnapshot): void {
       if (evidence.artifactId !== undefined) requireValue(artifacts.has(evidence.artifactId), "Unknown artifact");
       if (evidence.resultEventId !== undefined) requireValue(task.attempts.some(a => a.results.some(r => r.eventId === evidence.resultEventId)), "Unknown result reference");
     }
+    let previousDecisionRevision = -1;
     for (const decision of task.decisions) {
       keys(decision, ["revision", "kind", "reason", "criteria"]);
       requireValue(decision.criteria !== null && typeof decision.criteria === "object" && !Array.isArray(decision.criteria) && Object.keys(decision.criteria).length <= 1000, "Invalid decision criteria");
       text(decision.reason);
-      requireValue(["accept", "invalidate"].includes(decision.kind) && Number.isSafeInteger(decision.revision) && decision.revision <= plan.revision, "Invalid decision");
+      requireValue(["accept", "invalidate"].includes(decision.kind) && Number.isSafeInteger(decision.revision) && decision.revision >= 0 && decision.revision <= plan.revision && decision.revision > previousDecisionRevision, "Invalid decision");
+      previousDecisionRevision = decision.revision;
+      const index = task.statusHistory.findIndex(change => change.revision === decision.revision);
+      const change = task.statusHistory[index];
+      const before = task.statusHistory[index - 1];
+      requireValue(change && before && change.reason === decision.reason && (decision.kind === "accept"
+        ? before.status === "in_review" && change.status === "accepted"
+        : before.status === "accepted" && ["pending", "in_review"].includes(change.status) && Object.keys(decision.criteria).length === 0), "Decision history mismatch");
+      if (decision.kind === "accept") requireValue(Object.keys(decision.criteria).length > 0, "Empty acceptance decision");
       for (const [criterionId, refs] of Object.entries(decision.criteria)) {
         uuid(criterionId);
-        requireValue(Array.isArray(refs) && refs.length <= 1000 && refs.every(id => evidenceIds.has(id)), "Unknown decision evidence");
+        requireValue(Array.isArray(refs) && refs.length > 0 && refs.length <= 1000 && refs.every(id => evidenceIds.has(id) && task.evidence.some(e => e.evidenceId === id && e.criterionId === criterionId)), "Unknown decision evidence");
+      }
+    }
+    for (let i = 1; i < task.statusHistory.length; i++) {
+      const change = task.statusHistory[i];
+      const before = task.statusHistory[i - 1];
+      if (change.status === "accepted" || before.status === "accepted") {
+        requireValue(task.decisions.some(d => d.revision === change.revision && d.kind === (change.status === "accepted" ? "accept" : "invalidate")), "Missing lifecycle decision");
       }
     }
     if (task.status === "accepted") {
