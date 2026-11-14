@@ -162,6 +162,16 @@ parent authority. Retry is an explicit parent-created attempt on the existing
 task, not an implicit new task. Saved launch profiles, assignments and runtime
 manifests retain correlation IDs. Assignment cards remain display-only.
 
+Bound launches also derive a bounded assignment contract from the task and deliver
+its criteria and constraints to the model, not only the card. Optional
+`assignmentContract` supplies explicit supplemental files, decisions and change
+constraints; caller-supplied bound fields must agree. `subagent_done({ result,
+close: false })` can publish a structured complete/partial/blocked proposal with
+artifact/check refs, unmet criterion IDs and risks. These are review proposals,
+not accepted evidence. Plain-text and legacy results remain supported. See
+[assignment/result contracts](CONTRACTS.md) for fields, bounds and the explicit
+parent evidence/acceptance workflow.
+
 The shared completion adapter imports the exact canonical delivery event ID.
 Successful completion enters review, never acceptance; parent evidence can cite
 that result ID and acceptance still requires criterion evidence and a parent

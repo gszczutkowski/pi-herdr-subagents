@@ -821,7 +821,8 @@ export function enqueueSubagentCompletion(running: RunningSubagent, result: Suba
     return;
   }
   const normalized = normalizeStructuredResult(result.structuredResult);
-  const resultDiagnostic = normalized.resultDiagnostic ?? result.resultDiagnostic;
+  const resultDiagnostic = normalized.resultDiagnostic ?? result.resultDiagnostic
+    ?? (!normalized.structuredResult ? "Unstructured result (optional structure absent or invalid): requires parent review, not acceptance." : undefined);
   const base = resolveResultPresentation(result, running.name)
     + (normalized.structuredResult ? `\n\nStructured result (proposal, requires parent review):\n${JSON.stringify(normalized.structuredResult, null, 2)}` : "")
     + (resultDiagnostic ? `\n\n${resultDiagnostic}` : "");
@@ -2207,7 +2208,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             child.planTask = bindPlanRun(runtime.plans!, ctx, child.id, params.planTask, child.planTask);
             if (child.planTask) {
               if (!child.durableStore) throw new Error("Task-bound continuation requires durable custody");
-              child.durableStore.bindRun(child.id, child.planTask);
+              child.durableStore.bindRun(child.id, child.planTask, continuationContract);
               persistProfileBinding(child.sessionFile, child.planTask, continuationContract);
             }
             if (liveOwner.continuationRequestId) child.durableStore?.continuation(child.id, liveOwner.continuationRequestId);

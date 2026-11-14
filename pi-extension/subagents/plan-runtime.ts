@@ -64,7 +64,11 @@ export function importPlanEnvelope(persistence: PlanPersistence, ctx: ExtensionC
   if (!plan) throw new Error("Original plan branch is not selected");
   const task = plan.tasks.find(t => t.taskId === binding.taskId);
   const diagnostics = task && isStructuredResult(d.structuredResult) ? resultClaimDiagnostics(d.structuredResult, task) : [];
-  const proposal = diagnostics.length && result.kind === "result" ? { ...result, reason: `Worker proposal requires parent review: ${diagnostics.join("; ")}`.slice(0, 8192) } : result;
+  const previous = task?.attempts.flatMap(a => a.results).find(r => r.eventId === eventId);
+  // Review diagnostics are evaluated at first ingestion. A later definition edit
+  // must not turn replay of the same immutable event into a conflicting result.
+  const proposal = result.kind === "result" && previous ? { ...result, ...(previous.reason ? { reason: previous.reason } : {}) }
+    : diagnostics.length && result.kind === "result" ? { ...result, reason: `Worker proposal requires parent review: ${diagnostics.join("; ")}`.slice(0, 8192) } : result;
   persistence.mutate(ctx.sessionManager, binding.planId, plan.revision,
     (p, c) => recordResult(p, c, binding.taskId, binding.attemptId, proposal), binding.authority);
 }

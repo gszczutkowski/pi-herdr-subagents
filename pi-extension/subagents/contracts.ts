@@ -13,7 +13,7 @@ export const AssignmentContractSchema = Type.Object({
 }, { additionalProperties: false });
 export type AssignmentContract = Static<typeof AssignmentContractSchema>;
 export function isAssignmentContract(value: unknown): value is AssignmentContract {
-  return Value.Check(AssignmentContractSchema, value);
+  return Value.Check(AssignmentContractSchema, value) && JSON.stringify(value).length <= 40000;
 }
 
 /** Bound fields must agree exactly; supplemental constraints remain caller-owned. */
@@ -41,7 +41,18 @@ export const StructuredResultSchema = Type.Object({
 }, { additionalProperties: false });
 export type StructuredResult = Static<typeof StructuredResultSchema>;
 export function isStructuredResult(value: unknown): value is StructuredResult {
-  return Value.Check(StructuredResultSchema, value);
+  return Value.Check(StructuredResultSchema, value) && JSON.stringify(value).length <= 40000;
+}
+/** Invalid optional output never blocks the text result or certifies completion. */
+export function prepareCompletionArguments(args: unknown): any {
+  if (!args || typeof args !== "object" || Array.isArray(args)) return args;
+  const value = args as Record<string, unknown>;
+  if (value.result === undefined || isStructuredResult(value.result)) return args;
+  // Keep public schemas strict. Legacy/malformed optional structure is dropped
+  // before argument validation; presentation explicitly labels absent/invalid
+  // structure as unstructured review, never as verified evidence.
+  const { result: _invalid, ...rest } = value;
+  return rest;
 }
 export function normalizeStructuredResult(value: unknown): { structuredResult?: StructuredResult; resultDiagnostic?: string } {
   if (value === undefined) return {};

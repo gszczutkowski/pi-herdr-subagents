@@ -2,6 +2,7 @@ import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, re
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { isPlanTaskBinding, type PlanTaskBinding } from "./plan-runtime.ts";
+import { isAssignmentContract, type AssignmentContract } from "./contracts.ts";
 import type { DeliveryEnvelope } from "./delivery.ts";
 import { probeProcess, sameProcess } from "./process-identity.ts";
 import { isLineage, type Lineage } from "./lineage.ts";
@@ -74,7 +75,8 @@ function validate(value: any): asserts value is RuntimeManifest {
   }
   for (const [id, run] of Object.entries(value.runs) as [string, any][]) {
     if ((run.planTask !== undefined && !isPlanTaskBinding(run.planTask)) ||
-        (run.lineage !== undefined && !isLineage(run.lineage)) || run.id !== id || typeof run.sessionFile !== "string" || typeof run.name !== "string" || typeof run.task !== "string" ||
+        (run.lineage !== undefined && !isLineage(run.lineage)) ||
+        (run.profile?.assignmentContract !== undefined && !isAssignmentContract(run.profile.assignmentContract)) || run.id !== id || typeof run.sessionFile !== "string" || typeof run.name !== "string" || typeof run.task !== "string" ||
         !Number.isFinite(run.startTime) || !["prepared", "dispatch-intent", "supervised"].includes(run.phase) ||
         !Array.isArray(run.eventCursor) || !run.eventCursor.every((event: unknown) => typeof event === "string")) {
       throw new Error("Invalid durable run");
@@ -184,15 +186,18 @@ export class RuntimeStore {
     this.commit(next);
   }
 
-  bindRun(id: string, binding: PlanTaskBinding): void {
+  bindRun(id: string, binding: PlanTaskBinding, assignmentContract?: AssignmentContract): void {
     const next = this.snapshot();
     const run = next.runs[id];
     if (!run || !isPlanTaskBinding(binding)) throw new Error("Invalid run binding");
     if (run.planTask) {
       if (JSON.stringify(run.planTask) !== JSON.stringify(binding)) throw new Error("Run binding conflict");
-      return;
+      if (!assignmentContract) return;
     }
+    if (assignmentContract && !isAssignmentContract(assignmentContract)) throw new Error("Invalid assignment contract");
     run.planTask = structuredClone(binding);
+    if (run.profile && typeof run.profile === "object") run.profile = { ...run.profile, planTask: binding,
+      ...(assignmentContract ? { assignmentContract: structuredClone(assignmentContract) } : {}) };
     this.commit(next);
   }
 

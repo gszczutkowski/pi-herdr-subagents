@@ -126,7 +126,13 @@ test("registered task-bound spawn, live/closed resume, failure isolation and res
     assert.equal(read().revision, beforeLive, "idempotent attach does not append");
     assert.equal(liveSends, 1, "rejected live bindings never reach transport");
     continuationChild = undefined;
-    enqueueSubagentCompletion(child, { ...result(child, "turn-a"), keepOpen: true });
+    const structuredResult = { status: "complete" as const, summary: "Implementation proposal", artifacts: ["report.txt"],
+      checks: [{ criterionIds: [criterionId], ref: "report.txt#check", outcome: "passed" as const }], unmetCriterionIds: [], risks: [] };
+    enqueueSubagentCompletion(child, { ...result(child, "turn-a"), structuredResult, keepOpen: true });
+    assert.deepEqual(sent[0].details.structuredResult, structuredResult);
+    assert.match(sent[0].content, /proposal, requires parent review/);
+    assert.equal(read().tasks[0].evidence.length, 0);
+    assert.deepEqual((readRuntimeManifest(manifestDir)!.outbox[sent[0].details.eventId].envelope.message.details as any).structuredResult, structuredResult);
     assert.equal(read().tasks[0].status, "in_review");
     assert.equal(read().tasks[0].attempts[0].results[0].eventId, sent[0].details.eventId);
     const rev = read().revision;
@@ -136,6 +142,7 @@ test("registered task-bound spawn, live/closed resume, failure isolation and res
     failAppend = true;
     enqueueSubagentCompletion(child, { ...result(child, "turn-b"), keepOpen: true });
     assert.equal(sent.length, 2);
+    assert.match(sent[1].details.resultDiagnostic, /Unstructured.*requires parent review/);
     assert.equal(readRuntimeManifest(manifestDir)!.outbox[sent[1].details.eventId].status, "handedOff");
     assert.equal(read().tasks[0].attempts[0].results.length, 1);
     p.reconcile(sm);

@@ -58,6 +58,10 @@ test("bound structured claims remain proposals; parent imports exact evidence th
     assert.equal(read().tasks[0].status, "accepted", "late malformed claims do not undo parent decision");
     assert.equal(read().tasks[0].attempts[0].results.at(-1)?.eventId, "late");
     assert.match(read().tasks[0].attempts[0].results.at(-1)?.reason ?? "", /Unknown criterion/);
+    await execute(command("edit", { patch: { criteria: [{ criterionId: randomUUID(), text: "Changed definition" }] } }));
+    const revision = read().revision;
+    importPlanEnvelope(persistence, ctx, binding, "worker", envelope);
+    assert.equal(read().revision, revision, "definition edits do not make immutable replay conflict");
   } finally {
     if (child !== undefined) process.env.PI_SUBAGENT_ID = child;
     if (childSession !== undefined) process.env.PI_SUBAGENT_SESSION = childSession;

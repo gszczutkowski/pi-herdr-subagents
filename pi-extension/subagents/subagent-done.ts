@@ -11,7 +11,7 @@ import { getBehaviorConfig } from "./config.ts";
 import { createSubagentActivityRecorder } from "./activity.ts";
 import { registerSubagentAssignment } from "./assignment.ts";
 import { registerLiveContinuation } from "./live-continuation.ts";
-import { StructuredResultSchema, normalizeStructuredResult } from "./contracts.ts";
+import { StructuredResultSchema, normalizeStructuredResult, prepareCompletionArguments } from "./contracts.ts";
 import { registerRecoveryIdentity } from "./recovery-identity.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
@@ -318,6 +318,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerTool({
     name: "subagent_done",
+    prepareArguments: prepareCompletionArguments,
     label: "Subagent Done",
     description:
       "Call this tool when you have completed your task. " +
@@ -328,7 +329,7 @@ export default function (pi: ExtensionAPI) {
       close: Type.Optional(Type.Boolean({
         description: "False leaves this session and its pane open for follow-up. True closes it. Omitting it uses behavior.closeOnDone.",
       })),
-    }),
+    }, { additionalProperties: false }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const keepOpen = params.close === undefined ? keepOpenSession : !params.close;
       keepOpenSession = keepOpen;

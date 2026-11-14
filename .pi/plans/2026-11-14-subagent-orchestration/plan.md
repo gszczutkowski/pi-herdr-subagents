@@ -237,7 +237,7 @@ Historia nie obejmuje wewnętrznego toku rozumowania modeli.
 - [x] Zlecenie: cel, zakres, kryteria akceptacji, zależności, potrzebne pliki/decyzje, ograniczenia zmian.
 - [x] Wynik: wykonane/częściowe/zablokowane, podsumowanie, artefakty, sprawdzenia i rezultaty, niespełnione kryteria, ryzyka.
 - [x] Powiązać dowody z kryteriami; samo pole `testsPassed` lub tekst „gotowe” nie wystarcza.
-- [ ] Zachować kompatybilność z wynikami tekstowymi; brak struktury nie może automatycznie oznaczać akceptacji.
+- [x] Zachować kompatybilność z wynikami tekstowymi; brak struktury nie może automatycznie oznaczać akceptacji.
 
 ### Polityka komunikatów
 
