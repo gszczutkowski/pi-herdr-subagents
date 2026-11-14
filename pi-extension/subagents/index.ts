@@ -30,6 +30,7 @@ import {
   setPaneTask,
 } from "./terminal.ts";
 import { waitForCompletion } from "./completion.ts";
+import { canonicalSessionPath, reserveSession, releaseSession, sessionOwners } from "./ownership.ts";
 import {
   buildAuthenticatedModelCatalog,
   resolveRuntimePlan,
@@ -1189,6 +1190,8 @@ async function launchSubagent(
   ].join("-");
   const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
 
+  const owner = reserveSession(subagentSessionFile, id);
+  try {
   const surfacePreCreated = !!options?.surface;
   const surface = options?.surface ?? createSubagentSurface(params.name, resolveSubagentLayout());
   if (params.task) {
@@ -1265,6 +1268,9 @@ async function launchSubagent(
     .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
 
+  owner.surface = surface;
+  // After dispatch starts, failure is ambiguous: retain ownership until closure.
+  owner.dispatched = true;
   runScriptInPane(surface, built.command, {
     scriptPath: launchScriptFile,
     scriptPreamble: (built.launchScriptPreamble ?? [
@@ -1295,6 +1301,10 @@ async function launchSubagent(
 
   runningSubagents.set(id, running);
   return running;
+  } catch (error) {
+    if (!owner.dispatched) releaseSession(subagentSessionFile, id);
+    throw error;
+  }
 }
 
 /**
@@ -1870,6 +1880,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+        params.sessionPath = canonicalSessionPath(params.sessionPath, ctx.cwd);
         const name = params.name ?? "Resume";
         const { autoExit, interactive } = resolveResumeLaunchBehavior(params);
         const startTime = Date.now();
@@ -1888,6 +1899,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
+        const previousOwner = sessionOwners.get(params.sessionPath);
+        if (previousOwner?.surface && inspectPane(previousOwner.surface).kind === "missing") {
+          releaseSession(params.sessionPath, previousOwner.runId);
+        }
+        const owner = reserveSession(params.sessionPath, id);
+        try {
         // Record entry count before resuming so we can extract new messages
         const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
 
@@ -1952,6 +1969,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             .replace(/-+/g, "-")
             .replace(/^-|-$/g, "") || "resume"}-resume-${id}.sh`,
         );
+        owner.surface = surface;
+        owner.dispatched = true;
         runScriptInPane(surface, command, {
           scriptPath: launchScriptFile,
           scriptPreamble: [
@@ -1999,6 +2018,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             status: "started",
           },
         };
+        } catch (error) {
+          if (!owner.dispatched) releaseSession(params.sessionPath, id);
+          throw error;
+        }
       },
     });
 
