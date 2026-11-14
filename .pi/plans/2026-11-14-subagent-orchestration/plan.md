@@ -329,7 +329,7 @@ W czasie analizy:
 
 Przed uznaniem wdrożenia za zakończone:
 
-- [ ] Testy jednostkowe przejść stanów, deduplikacji, unikalności artefaktów i kontraktów ścieżek.
+- [x] Testy jednostkowe przejść stanów, deduplikacji, unikalności artefaktów i kontraktów ścieżek.
 - [ ] Testy odtwarzania planu, powtórnych prób, zależności, blokad oraz rozgałęzień sesji.
 - [ ] Testy renderowania dla długich planów, wąskich terminali i historii wyników.
 - [ ] Testy live: równoległy spawn, wynik podczas reloadu, interrupt/kontynuacja/resume, wybrana semantyka keepOpen.
