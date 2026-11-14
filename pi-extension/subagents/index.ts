@@ -584,6 +584,7 @@ interface RunningSubagent {
   abortController?: AbortController;
   cli?: string;
   sentinelFile?: string;
+  completionRunId?: string;
   /**
    * Optional legacy status snapshot retained only for hydrating pre-lifecycle
    * runtime entries after /reload. Live observation uses `lifecycle` only.
@@ -1291,6 +1292,7 @@ async function launchSubagent(
     launchScriptFile,
     cli: built.cli,
     sentinelFile: built.sentinelFile,
+    completionRunId: id,
     interactive: effectiveInteractive,
     runtimePlan,
     activityFile: driver.hasActivitySnapshots ? activityFile : undefined,
@@ -1322,6 +1324,7 @@ async function watchSubagent(
     const result = await waitForCompletion(signal, {
       intervalMs: 1000,
       sessionFile,
+      runId: running.completionRunId,
       sentinelFile: running.sentinelFile,
       readTerminalTail: () => readPaneAsync(surface, 5),
       inspectPane: async () => inspectPane(surface),
@@ -1335,6 +1338,8 @@ async function watchSubagent(
       },
     });
 
+    // Only a shell trailer proves process exit; completion delivery alone does not.
+    if (result.reason === "sentinel" && !running.sentinelFile) releaseSession(sessionFile, running.id);
     const detectedAt = Date.now();
     running.lifecycle = markCompletionDetected(running.lifecycle, result, detectedAt);
     updateWidget();
@@ -1958,7 +1963,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
         const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
 
-        const command = `${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+        const command = `${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_${id}_'$?'__'`;
         const launchScriptFile = join(
           artifactDir,
           "subagent-scripts",
@@ -1994,6 +1999,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           activityFile,
           interactive,
           runtimePlan: undefined,
+          completionRunId: id,
           lifecycle: createLifecycle(startTime),
         };
         runningSubagents.set(id, running);

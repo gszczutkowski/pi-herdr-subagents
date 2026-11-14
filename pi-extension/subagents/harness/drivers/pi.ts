@@ -191,7 +191,7 @@ export class PiHarnessDriver implements HarnessDriver {
 
     const envPrefix = envParts.length > 0 ? `${envParts.join(" ")} ` : "";
     const cdPrefix = effectiveCwd ? `cd ${shellQuote(effectiveCwd)} && ` : "";
-    const command = `${cdPrefix}${envPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+    const command = `${cdPrefix}${envPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_${params.id}_'$?'__'`;
 
     return {
       command,

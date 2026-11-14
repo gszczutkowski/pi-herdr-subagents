@@ -160,7 +160,7 @@ describe("Pi Harness Driver", () => {
     assert.ok(built.command.includes("pi --session '/tmp/sessions/subagent.jsonl'"));
     assert.ok(built.command.includes("--model 'anthropic/claude-sonnet-4-5'"));
     assert.ok(built.command.includes("--thinking 'high'"));
-    assert.ok(built.command.includes("echo '__SUBAGENT_DONE_'$?'__'"));
+    assert.ok(built.command.includes(`echo '__SUBAGENT_DONE_${ctx.params.id}_'$?'__'`));
   });
 });
 
@@ -285,7 +285,7 @@ describe("OpenCode Harness Driver", () => {
 
     assert.equal(built.cli, "opencode");
     assert.ok(built.command.startsWith("cd '/tmp/project' && opencode run --model 'anthropic/claude-3-5-sonnet'"));
-    assert.ok(built.command.includes("echo '__SUBAGENT_DONE_'$?'__'"));
+    assert.ok(built.command.includes(`echo '__SUBAGENT_DONE_${ctx.params.id}_'$?'__'`));
   });
 
   it("extracts output from terminal pane buffer", async () => {
@@ -330,7 +330,7 @@ describe("Codex Harness Driver", () => {
 
     assert.equal(built.cli, "codex");
     assert.ok(built.command.startsWith("cd '/tmp/project' && codex --model 'o3-mini' --reasoning-effort 'high'"));
-    assert.ok(built.command.includes("echo '__SUBAGENT_DONE_'$?'__'"));
+    assert.ok(built.command.includes(`echo '__SUBAGENT_DONE_${ctx.params.id}_'$?'__'`));
   });
 
   it("extracts output from terminal pane buffer", async () => {
@@ -367,7 +367,7 @@ describe("Grok Harness Driver", () => {
 
     assert.equal(built.cli, "grok");
     assert.ok(built.command.startsWith("cd '/tmp/project' && grok --model 'grok-3'"));
-    assert.ok(built.command.includes("echo '__SUBAGENT_DONE_'$?'__'"));
+    assert.ok(built.command.includes(`echo '__SUBAGENT_DONE_${ctx.params.id}_'$?'__'`));
   });
 
   it("extracts output from terminal pane buffer", async () => {
@@ -494,7 +494,7 @@ describe("Generic Harness Driver & Templates", () => {
 
     const built = driver.buildCommand(ctx);
     assert.ok(built.command.includes("gemini run --model 'gemini-2.5-pro' --prompt 'Analyze the repository structure' --dir '/workspace/my-app'"));
-    assert.ok(built.command.includes("echo '__SUBAGENT_DONE_'$?'__'"));
+    assert.ok(built.command.includes(`echo '__SUBAGENT_DONE_${ctx.params.id}_'$?'__'`));
   });
 
   it("falls back to bare binary execution when no commandTemplate is provided", () => {
@@ -538,4 +538,15 @@ describe("Generic Harness Driver & Templates", () => {
     assert.ok(result);
     assert.equal(result.summary, "aider exited with code 1");
   });
+});
+
+describe("run-bound harness completion", () => {
+  for (const cli of ["pi", "claude", "codex", "opencode", "grok", "custom"]) {
+    it(`${cli} emits only its run-qualified shell trailer`, () => {
+      const ctx = createMockLaunchContext();
+      const built = getHarnessDriver(cli).buildCommand(ctx);
+      assert.ok(built.command.includes(`echo '__SUBAGENT_DONE_${ctx.params.id}_'$?'__'`));
+      assert.ok(!built.command.includes("echo '__SUBAGENT_DONE_'$?'__'"));
+    });
+  }
 });

@@ -1,4 +1,5 @@
 import { existsSync, readFileSync, rmSync } from "node:fs";
+import { runCompletionFile } from "./run-artifacts.ts";
 
 const ABORT_MESSAGE = "Aborted while waiting for subagent to finish";
 const TERMINAL_SENTINEL = /__SUBAGENT_DONE_(\d+)__/;
@@ -22,6 +23,8 @@ export interface CompletionOptions {
     observedAt: number,
   ) => void;
   sessionFile?: string;
+  /** Absent only for explicitly legacy runtime entries. */
+  runId?: string;
   sentinelFile?: string;
   onTick?: (elapsedSeconds: number) => void;
 }
@@ -72,14 +75,16 @@ export function interpretExitSidecar(data: unknown): CompletionResult {
   };
 }
 
-function consumeExitSidecar(sessionFile: string | undefined): CompletionResult | null {
+function consumeExitSidecar(sessionFile: string | undefined, runId?: string): CompletionResult | null {
   if (!sessionFile) return null;
 
-  const exitFile = `${sessionFile}.exit`;
+  const exitFile = runId ? runCompletionFile(sessionFile, runId) : `${sessionFile}.exit`;
   if (!existsSync(exitFile)) return null;
 
   try {
-    const result = interpretExitSidecar(JSON.parse(readFileSync(exitFile, "utf8")));
+    const payload = JSON.parse(readFileSync(exitFile, "utf8"));
+    if (runId && payload.runId !== runId) return null;
+    const result = interpretExitSidecar(payload);
     rmSync(exitFile, { force: true });
     return result;
   } catch {
@@ -88,13 +93,23 @@ function consumeExitSidecar(sessionFile: string | undefined): CompletionResult |
   }
 }
 
-function terminalExitCode(screen: string): number | null {
-  const match = screen.match(TERMINAL_SENTINEL);
-  return match ? Number.parseInt(match[1], 10) : null;
+function terminalExitCode(screen: string, runId?: string): number | null {
+  if (!runId) {
+    const match = screen.match(TERMINAL_SENTINEL);
+    return match ? Number.parseInt(match[1], 10) : null;
+  }
+  const prefix = `__SUBAGENT_DONE_${runId}_`;
+  for (const line of screen.split(/\r?\n/).reverse()) {
+    const text = line.trim();
+    if (!text.startsWith(prefix)) continue;
+    const match = text.slice(prefix.length).match(/^(\d+)__$/);
+    if (match) return Number.parseInt(match[1], 10);
+  }
+  return null;
 }
 
 function completionArtifact(options: CompletionOptions): CompletionResult | null {
-  const sidecar = consumeExitSidecar(options.sessionFile);
+  const sidecar = consumeExitSidecar(options.sessionFile, options.runId);
   if (sidecar) return sidecar;
   if (options.sentinelFile && existsSync(options.sentinelFile)) {
     return { reason: "sentinel", exitCode: 0 };
@@ -145,7 +160,7 @@ export async function waitForCompletion(
   for (;;) {
     if (signal.aborted) throw new Error(ABORT_MESSAGE);
 
-    const sidecarResult = consumeExitSidecar(options.sessionFile);
+    const sidecarResult = consumeExitSidecar(options.sessionFile, options.runId);
     if (sidecarResult) return sidecarResult;
 
     if (options.sentinelFile && existsSync(options.sentinelFile)) {
@@ -153,7 +168,7 @@ export async function waitForCompletion(
     }
 
     try {
-      const exitCode = terminalExitCode(await options.readTerminalTail());
+      const exitCode = terminalExitCode(await options.readTerminalTail(), options.runId);
       if (exitCode !== null) return { reason: "sentinel", exitCode };
     } catch {
       // Terminal reads are only sentinel/output probes; Herdr status is polled

@@ -57,7 +57,7 @@ export class CodexHarnessDriver implements HarnessDriver {
     cmdParts.push(shellQuote(fullTask));
 
     const cdPrefix = effectiveCwd ? `cd ${shellQuote(effectiveCwd)} && ` : "";
-    const command = `${cdPrefix}${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+    const command = `${cdPrefix}${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_${params.id}_'$?'__'`;
 
     return {
       command,

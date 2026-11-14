@@ -81,7 +81,7 @@ export class GenericHarnessDriver implements HarnessDriver {
     }
 
     const cdPrefix = effectiveCwd ? `cd ${shellQuote(effectiveCwd)} && ` : "";
-    const command = `${cdPrefix}${commandBody}; echo '__SUBAGENT_DONE_'$?'__'`;
+    const command = `${cdPrefix}${commandBody}; echo '__SUBAGENT_DONE_${params.id}_'$?'__'`;
 
     return {
       command,

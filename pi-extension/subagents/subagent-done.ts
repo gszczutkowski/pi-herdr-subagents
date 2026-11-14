@@ -6,7 +6,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { writeFileSync } from "node:fs";
+import { writeRunCompletion } from "./run-artifacts.ts";
 import { getBehaviorConfig } from "./config.ts";
 import { createSubagentActivityRecorder } from "./activity.ts";
 import { registerSubagentAssignment } from "./assignment.ts";
@@ -196,10 +196,7 @@ export default function (pi: ExtensionAPI) {
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
       if (sessionFile) {
         try {
-          writeFileSync(
-            `${sessionFile}.exit`,
-            JSON.stringify({ ...buildCompletionSidecar(latestAgentMessages), ...(keepOpen ? { keepOpen: true } : {}) }),
-          );
+          writeRunCompletion({ ...buildCompletionSidecar(latestAgentMessages), ...(keepOpen ? { keepOpen: true } : {}) });
         } catch {
           // Best effort — the watcher can still detect the terminal sentinel
           // or the pane status if the completion sidecar cannot be written.
@@ -297,7 +294,8 @@ export default function (pi: ExtensionAPI) {
         name: process.env.PI_SUBAGENT_NAME ?? "subagent",
         message: params.message,
       };
-      writeFileSync(`${sessionFile}.exit`, JSON.stringify(exitData));
+      writeRunCompletion(exitData);
+      completionDelivered = true;
 
       ctx.shutdown();
       return {
@@ -324,7 +322,7 @@ export default function (pi: ExtensionAPI) {
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
       recorder.subagentDone();
       if (sessionFile) {
-        writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done", ...(keepOpen ? { keepOpen: true } : {}) }));
+        writeRunCompletion({ type: "done", ...(keepOpen ? { keepOpen: true } : {}) });
       }
       completionDelivered = true;
       if (!keepOpen) ctx.shutdown();
