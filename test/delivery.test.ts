@@ -182,7 +182,7 @@ describe("spawn/resume watcher dispatch regressions", () => {
     });
   }
 
-  it("initializes delivery fields on a pre-R3 global runtime without treating its captured API as ready", () => {
+  it("initializes an empty pre-R3 runtime without treating its captured API as ready (active legacy watchers are not migrated)", () => {
     const script = `
       import assert from 'node:assert/strict';
       const key = Symbol.for('pi-subagents/runtime');

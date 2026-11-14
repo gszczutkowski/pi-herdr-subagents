@@ -37,6 +37,15 @@ support local pending/handed-off deduplication across reloads, not exactly-once
 processing. There is no process-restart durability guarantee, nor a guarantee
 against duplication if Pi accepts a message and then throws synchronously.
 
+**Upgrade boundary:** these guarantees apply only to watchers started with the
+outbox implementation. Before upgrading from a pre-outbox release, let all
+existing subagents finish and their results return, then reload or restart the
+parent. Reloading new code cannot replace completion callbacks already captured
+by an older watcher; those callbacks can still call a stale API and lose a result.
+An empty legacy runtime can be initialized, but active legacy supervision is not
+migrated. Restarting the parent while a child is active does not restore its
+supervision; keep its session for manual recovery instead.
+
 ## Development
 
 Run unit tests and lint locally:
