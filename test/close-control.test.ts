@@ -164,6 +164,32 @@ test("child validates wrong run/process, busy state, immutable claims and replay
   }
 });
 
+test("SDK disposal after a real CLOSE watcher starts exits naturally with scrubbed inherited environment", { timeout: 45000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "close-sdk-dispose-"));
+  const session = join(dir, "session.jsonl"), activityFile = join(dir, "activity.json");
+  put(session, { type: "session", version: 3, id: "close-sdk", timestamp: new Date().toISOString(), cwd: dir });
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("PI_") && !key.startsWith("HC_") && !key.startsWith("HERDR")));
+  Object.assign(env, { PI_SUBAGENT_ID: "sdk-run", PI_SUBAGENT_SESSION: session, PI_SUBAGENT_ACTIVITY_FILE: activityFile });
+  const child = spawn(process.execPath, [resolve("test/close-sdk-dispose-fixture.ts"), dir], { cwd: dir, env, stdio: ["ignore", "pipe", "pipe"] });
+  let output = "";
+  child.stdout.on("data", data => { output += data; }); child.stderr.on("data", data => { output += data; });
+  try {
+    const code = await new Promise<number | null>((resolveExit, reject) => {
+      const timer = setTimeout(() => reject(new Error(`SDK host failed natural exit: ${output}`)), 30000);
+      child.once("exit", code => { clearTimeout(timer); resolveExit(code); });
+      child.once("error", error => { clearTimeout(timer); reject(error); });
+    });
+    assert.equal(code, 0, output);
+    assert.match(output, /SDK disposed after live CLOSE publication/);
+    assert.equal(probeProcess(child.pid!).kind, "absent");
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) {
+      const exited = new Promise(resolveExit => child.once("exit", resolveExit)); child.kill(); await exited;
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("real Pi RPC UI cannot prove editor safety and rejects CLOSE without a model turn", { timeout: 90000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "close-pi-rpc-"));
   const session = join(dir, "session.jsonl"), activityFile = join(dir, "activity.json");

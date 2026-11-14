@@ -75,6 +75,9 @@ export function registerCloseControl(pi: ExtensionAPI): void {
       try { for (const name of filename ? [filename.toString()] : readdirSync(dir)) receive(name); }
       catch { stop(); } // Claimed/ambiguous requests never replay, and never reject in the background.
     });
+    // SDK AgentSession.dispose() does not emit session_shutdown. This control
+    // must never keep an otherwise disposed/finished host alive.
+    watcher.unref();
     watcher.on("error", stop);
   });
   pi.on("before_agent_start", busy);
