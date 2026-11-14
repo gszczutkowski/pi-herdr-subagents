@@ -1,5 +1,7 @@
 # Final MAIN authenticated HC TUI verification — 2026-11-14
 
+Final complete confirmation command: **5 passed, 0 failed, 0 skipped, exit 0**. Across all three complete commands: 13 passes and 2 failures; the earlier failures below are retained, not reclassified. No production changes or weakened journey assertions.
+
 ## Original plan live criterion (T4): evidence for parent review
 
 All four lifecycle journeys passed against the final production/live-harness source on MAIN. This report supplies evidence for the original live criterion in `.pi/plans/2026-11-14-subagent-orchestration/plan.md`; it is not a second status checklist or child acceptance of the parent's plan.
@@ -19,9 +21,24 @@ The final confirmation command redirected all output to private root `.git/verif
 
 Each run has `assertions.json` with `passed: true` and `cleanup.json` with `allMissing: true`. Full timestamped directory names and owned terminal IDs are in the private summary. The former HC private-command transport and stale coarse-status continuation blockers were corrected by `24632da`/`1b91084`; historical failures remain evidence, not current blockers or passing attempts. See `HC-CONTINUATION-VERIFICATION.md` for that separate correction history.
 
+## Original plan restart criterion (T5): evidence for parent review
+
+Final confirmation run `77825fa4-b701-4afc-8985-00c73133490d` passed:
+
+- The recorded parent Pi PID was present before SIGKILL and absent before restarting the exact saved parent session. The independently owned child terminal survived.
+- A new parent process/terminal authenticated again. Generation changed from `17a9e1f4-1e3c-422d-a10a-59c66dd93c69` to `922ed4bd-1c35-4537-b913-53ac879ddbcf`.
+- The fresh challenge and child response matched exactly, including the new generation and original child PID `20020`, for child run `86f6d042-d2b6-4ada-a40b-c14b2bef0712`. Recovery was `verified-live: artifact-only supervision; terminal controls disabled`.
+- The original single subagent launch and single child startup remained the only ones: recovery did not auto-launch another child. The recovered parent rejected interrupt rather than acknowledging dispatch, and the child's terminal remained present.
+- Releasing the original child gate produced its marker/result; a follow-up through the test driver's independent terminal custody produced a second real bash marker and distinct retained completion event. This is not recovered orchestrator control or terminal adoption.
+- `assertions.json` passed, `cleanup.json` confirmed all owned terminals missing, and scratch removal completed. All five final journeys matched the complete final source manifest with zero hash mismatches.
+
+A final independent read-only inspection of all 81 recorded owned terminal IDs across this task's 15 journeys and the 16 preserved earlier journeys found every terminal missing. Proof: private `2026-11-14-final-main-confirmation/independent-owned-terminal-cleanup.json`.
+
+These are worker evidence proposals for the original T4/T5 criteria. Parent verification and original plan checkbox/status changes remain parent-owned; this child did not edit an ancestor plan or create a parallel execution checklist.
+
 ## Source identity and evidence retention
 
-Initial MAIN commit: `7a7297961ffeb3d8bc9a5950981a80b88a1a2d7e`. During the first attempt, HEAD advanced to `9617c8e288e5c7964fb3b0015b60ce82646302a6` for a concurrent test-fixture-only change to `test/harness-drivers.test.ts`, then documentation-only changes. The retry recorded `90bc173079aef1d14775242add7838ea12e21e3b` before its evidence commit was amended, plus an explicitly recorded uncommitted test-only cleanup retry (see below). Production source and behavioral assertions stayed unchanged. Every journey records branch `main`, repository root `E:\Repositories\pi-herdr-subagents`, and identical core SHA-256 values:
+Initial MAIN commit: `7a7297961ffeb3d8bc9a5950981a80b88a1a2d7e`. During the first attempt, HEAD advanced to `9617c8e288e5c7964fb3b0015b60ce82646302a6` for a concurrent test-fixture-only change to `test/harness-drivers.test.ts`, then documentation-only changes. Both the retry and final confirmation recorded `90bc173079aef1d14775242add7838ea12e21e3b` before its evidence commit was amended, plus an explicitly recorded uncommitted test-only cleanup retry (see below). Production source and behavioral assertions stayed unchanged. Every journey records branch `main`, repository root `E:\Repositories\pi-herdr-subagents`, and identical core SHA-256 values:
 
 | Source | SHA-256 |
 | --- | --- |
@@ -33,7 +50,7 @@ Private root `.git/verification/2026-11-14-final-main-confirmation/` contains fi
 
 All 16 earlier run archives, including failures, were copied from `.git/worktrees/pi-herdr-subagents-live-hc-verification/verification/` to root `.git/verification/prior-live-hc-verification/`: 548 files, 2,195,220 bytes, verified byte-identical. They survive removal of the earlier worktree and are not counted as final-source passes.
 
-## Preserved failed attempt
+## Preserved failed attempts
 
 The first complete command reported **4 passed, 1 failed, 0 skipped**. All five behavioral assertion records and all five terminal cleanup records were successful, but parallel/reload threw Windows `EPERM` deleting its owned scratch directory after terminal removal. That is a failed test, not a pass. Its run ID was `efb68605-64d3-45fc-8138-5623668ca602`; the original log/error and all other first-attempt artifacts remain private. The scratch was subsequently removed with bounded retries and separately recorded. The second complete command also reported **4 passed, 1 failed, 0 skipped**: scratch cleanup succeeded, but HC timed out sending Escape (`hc.exe ETIMEDOUT`) in interrupt run `79f3c765-e76d-4475-8e2d-20ba446cfade`. Its strict `interrupt_requested` assertion correctly failed; all owned terminals were removed. No assertion or production transport was weakened. Both failed commands and all their independent successes remain preserved. Final acceptance must use the complete confirmation command, not reinterpret these failures or mix journeys across attempts.
 
