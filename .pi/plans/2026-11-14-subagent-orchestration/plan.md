@@ -137,7 +137,9 @@ Weryfikacja: osobne attemptId, jawne attachRun dla resume, retry zachowuje taskI
 - [x] Przechowywać tytuł, zakres, kryteria akceptacji, zależności, właściciela, powiązane uruchomienia, artefakty i dowody.
 
 Weryfikacja: stabilne criterionId, graf zależności (brakujące/self/cykle odrzucane), ograniczone referencje artefaktów/wyników/dowodów. Akceptacja mapuje wszystkie kryteria do dowodów; edycja definicji unieważnia akceptację do review z zachowaniem historii decyzji. Pokrycie: `test/plan-store.test.ts`.
-- [ ] Rozróżniać stany: oczekuje, realizowane, zablokowane, do weryfikacji, zaakceptowane, nieudane oraz pominięte/anulowane.
+- [x] Rozróżniać stany: oczekuje, realizowane, zablokowane, do weryfikacji, zaakceptowane, nieudane oraz pominięte/anulowane.
+
+Weryfikacja czterech punktów Model: czysty `pi-extension/subagents/plan-store.ts`, komendy rodzica z sessionId/branchInstanceId/expectedRevision; bez replace-snapshot, runtime hooks, UI i persistence. Jawne przejścia ośmiu statusów i historia przyczyn; wynik workera → in_review, ping → blocked, process_exit nie akceptuje. Późne zdarzenia zachowane bez otwierania terminalnych zadań; duplikaty idempotentne. Akceptacja wyłącznie przez rodzica z dowodami każdego kryterium; reopen/retry jawne. To walidacja logicznego autorytetu, nie sandbox OS ani storage CAS. `node --test --test-reporter=tap test/plan-store.test.ts`: 6/6; `npm run lint`: exit 0; pełne `npm test`: 351/370, te same 19 błędów bazowych (18 Claude/Python, 1 CRLF release). Bez live herdr i bez implementacji kolejnych dwóch punktów Model.
 - [ ] Zachować stan zadań po zamknięciu terminala, reloadzie i wznowieniu sesji.
 - [ ] Jawnie określić semantykę rozgałęziania sesji i zmian planu.
 

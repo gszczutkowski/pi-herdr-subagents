@@ -1,5 +1,12 @@
 import { randomUUID } from "node:crypto";
 
+/** Pure parent command layer. Callers retain the current snapshot and supply trusted
+ * session/branch context; worker proposals are data, never authority. This is not
+ * an OS/security sandbox. No persistence, runtime hooks, or snapshot-replace command.
+ * Revision checks only protect commands against the current snapshot supplied by
+ * that caller; future storage adapters must serialize the compare-and-swap.
+ */
+
 export interface Authority { readonly sessionId: string; readonly branchInstanceId: string }
 export interface CommandContext extends Authority { readonly expectedRevision: number }
 export interface Attempt {
@@ -8,7 +15,14 @@ export interface Attempt {
   readonly childSession?: string;
   readonly results: readonly ResultReference[];
 }
-export interface ResultReference { readonly eventId: string; readonly runId: string; readonly ref: string }
+export interface ResultReference {
+  readonly eventId: string;
+  readonly runId: string;
+  readonly ref: string;
+  readonly kind?: "result" | "ping" | "failure" | "process_exit";
+  readonly reason?: string;
+}
+export interface StatusChange { readonly revision: number; readonly status: TaskStatus; readonly reason: string }
 export type TaskStatus = "pending" | "in_progress" | "blocked" | "in_review" | "accepted" | "failed" | "skipped" | "cancelled";
 export interface Criterion { readonly criterionId: string; readonly text: string }
 export interface Artifact { readonly artifactId: string; readonly ref: string }
@@ -28,6 +42,8 @@ export interface PlanTask extends TaskDetails {
   readonly evidence: readonly Evidence[];
   readonly decisions: readonly Decision[];
   readonly status: TaskStatus;
+  readonly statusReason: string;
+  readonly statusHistory: readonly StatusChange[];
 }
 export interface PlanSnapshot {
   readonly schemaVersion: 1;
@@ -54,37 +70,62 @@ function freeze<T>(value: T): T {
   }
   return value;
 }
+function keys(value: object, allowed: readonly string[]): void {
+  requireValue(value !== null && typeof value === "object" && Object.keys(value).every(key => allowed.includes(key)), "Unsupported snapshot field");
+}
 function validate(plan: PlanSnapshot): void {
+  keys(plan, ["schemaVersion", "revision", "planId", "title", "authority", "tasks"]);
+  keys(plan.authority, ["sessionId", "branchInstanceId"]);
   requireValue(plan.schemaVersion === 1, "Unsupported schema version");
   requireValue(Number.isSafeInteger(plan.revision) && plan.revision >= 0, "Invalid revision");
   uuid(plan.planId); text(plan.title); text(plan.authority.sessionId); text(plan.authority.branchInstanceId);
   requireValue(Array.isArray(plan.tasks) && plan.tasks.length <= 1000, "Invalid tasks");
   const ids = new Set<string>();
+  const attemptIds = new Set<string>();
+  const runs = new Set<string>();
+  const events = new Set<string>();
   for (const task of plan.tasks) {
+    keys(task, ["taskId", "title", "scope", "owner", "criteria", "dependencies", "artifacts", "attempts", "evidence", "decisions", "status", "statusReason", "statusHistory"]);
     uuid(task.taskId); text(task.title); text(task.scope); text(task.owner);
     requireValue(["pending", "in_progress", "blocked", "in_review", "accepted", "failed", "skipped", "cancelled"].includes(task.status), "Invalid status");
+    text(task.statusReason);
+    requireValue(Array.isArray(task.statusHistory) && task.statusHistory.length > 0 && task.statusHistory.length <= 1000, "Invalid status history");
+    for (const change of task.statusHistory) {
+      keys(change, ["revision", "status", "reason"]);
+      text(change.reason);
+      requireValue(Number.isSafeInteger(change.revision) && change.revision >= 0 && change.revision <= plan.revision && ["pending", "in_progress", "blocked", "in_review", "accepted", "failed", "skipped", "cancelled"].includes(change.status), "Invalid status change");
+    }
+    requireValue(task.statusHistory.at(-1)?.status === task.status && task.statusHistory.at(-1)?.reason === task.statusReason, "Status history mismatch");
     for (const list of [task.criteria, task.dependencies, task.artifacts, task.evidence, task.decisions]) requireValue(Array.isArray(list) && list.length <= 1000, "Invalid bounded list");
     const criteria = new Set<string>();
     for (const criterion of task.criteria) {
+      keys(criterion, ["criterionId", "text"]);
       uuid(criterion.criterionId); text(criterion.text);
       requireValue(!criteria.has(criterion.criterionId), "Duplicate criterion"); criteria.add(criterion.criterionId);
     }
     const artifacts = new Set<string>();
     for (const artifact of task.artifacts) {
+      keys(artifact, ["artifactId", "ref"]);
       uuid(artifact.artifactId); text(artifact.ref);
       requireValue(!artifacts.has(artifact.artifactId), "Duplicate artifact"); artifacts.add(artifact.artifactId);
     }
     const evidenceIds = new Set<string>();
     for (const evidence of task.evidence) {
+      keys(evidence, ["evidenceId", "criterionId", "ref", "artifactId", "resultEventId"]);
       uuid(evidence.evidenceId); uuid(evidence.criterionId); text(evidence.ref);
       requireValue(!evidenceIds.has(evidence.evidenceId), "Duplicate evidence"); evidenceIds.add(evidence.evidenceId);
       if (evidence.artifactId !== undefined) requireValue(artifacts.has(evidence.artifactId), "Unknown artifact");
       if (evidence.resultEventId !== undefined) requireValue(task.attempts.some(a => a.results.some(r => r.eventId === evidence.resultEventId)), "Unknown result reference");
     }
     for (const decision of task.decisions) {
+      keys(decision, ["revision", "kind", "reason", "criteria"]);
+      requireValue(decision.criteria !== null && typeof decision.criteria === "object" && !Array.isArray(decision.criteria) && Object.keys(decision.criteria).length <= 1000, "Invalid decision criteria");
       text(decision.reason);
       requireValue(["accept", "invalidate"].includes(decision.kind) && Number.isSafeInteger(decision.revision) && decision.revision <= plan.revision, "Invalid decision");
-      for (const refs of Object.values(decision.criteria)) requireValue(Array.isArray(refs) && refs.length <= 1000 && refs.every(id => evidenceIds.has(id)), "Unknown decision evidence");
+      for (const [criterionId, refs] of Object.entries(decision.criteria)) {
+        uuid(criterionId);
+        requireValue(Array.isArray(refs) && refs.length <= 1000 && refs.every(id => evidenceIds.has(id)), "Unknown decision evidence");
+      }
     }
     if (task.status === "accepted") {
       const decision = task.decisions.at(-1);
@@ -93,10 +134,8 @@ function validate(plan: PlanSnapshot): void {
     }
     requireValue(!ids.has(task.taskId), "Duplicate task ID"); ids.add(task.taskId);
     requireValue(Array.isArray(task.attempts) && task.attempts.length <= 1000, "Invalid attempts");
-    const attemptIds = new Set<string>();
-    const runs = new Set<string>();
-    const events = new Set<string>();
     for (const attempt of task.attempts) {
+      keys(attempt, ["attemptId", "runIds", "childSession", "results"]);
       uuid(attempt.attemptId);
       requireValue(!attemptIds.has(attempt.attemptId), "Duplicate attempt"); attemptIds.add(attempt.attemptId);
       if (attempt.childSession !== undefined) text(attempt.childSession);
@@ -106,7 +145,11 @@ function validate(plan: PlanSnapshot): void {
       }
       requireValue(Array.isArray(attempt.results) && attempt.results.length <= 1000, "Invalid results");
       for (const result of attempt.results) {
+        keys(result, ["eventId", "runId", "ref", "kind", "reason"]);
         text(result.eventId); text(result.ref);
+        requireValue(["result", "ping", "failure", "process_exit"].includes(result.kind ?? "result"), "Invalid result kind");
+        if (result.reason !== undefined) text(result.reason);
+        if (result.kind === "ping" || result.kind === "failure") text(result.reason);
         requireValue(attempt.runIds.includes(result.runId), "Unknown result run");
         requireValue(!events.has(result.eventId), "Duplicate event"); events.add(result.eventId);
       }
@@ -136,7 +179,11 @@ function validateAcceptance(task: PlanTask, mapping: Readonly<Record<string, rea
   }
 }
 function snapshot(plan: PlanSnapshot): PlanSnapshot {
-  const copy = structuredClone(plan); validate(copy); return freeze(copy);
+  validate(plan);
+  // JSON is the schema boundary; omit optional undefined properties consistently.
+  const copy: PlanSnapshot = JSON.parse(JSON.stringify(plan));
+  validate(copy);
+  return freeze(copy);
 }
 function authorize(plan: PlanSnapshot, context: CommandContext): void {
   requireValue(context.sessionId === plan.authority.sessionId && context.branchInstanceId === plan.authority.branchInstanceId, "Parent authority mismatch");
@@ -150,14 +197,19 @@ export function createPlan(title: string, authority: Authority): PlanSnapshot {
   return snapshot({ schemaVersion: 1, revision: 0, planId: randomUUID(), title, authority, tasks: [] });
 }
 export function addTask(plan: PlanSnapshot, context: CommandContext, title: string, details: Partial<TaskDetails> = {}): PlanSnapshot {
-  return update(plan, context, [...plan.tasks, { taskId: randomUUID(), title, scope: title, owner: plan.authority.sessionId, criteria: [], dependencies: [], artifacts: [], ...details, attempts: [], evidence: [], decisions: [], status: "pending" }]);
+  requireValue(Object.keys(details).every(key => ["scope", "owner", "criteria", "dependencies", "artifacts"].includes(key)), "Unsupported task details");
+  return update(plan, context, [...plan.tasks, { taskId: randomUUID(), title, scope: title, owner: plan.authority.sessionId, criteria: [], dependencies: [], artifacts: [], ...details, attempts: [], evidence: [], decisions: [], status: "pending", statusReason: "Awaiting assignment", statusHistory: [{ revision: plan.revision + 1, status: "pending", reason: "Awaiting assignment" }] }]);
 }
 export function createCriterion(textValue: string): Criterion { text(textValue); return freeze({ criterionId: randomUUID(), text: textValue }); }
 export function createArtifact(ref: string): Artifact { text(ref); return freeze({ artifactId: randomUUID(), ref }); }
 export function editTask(plan: PlanSnapshot, context: CommandContext, taskId: string, patch: Partial<TaskDetails & { title: string }>): PlanSnapshot {
   const allowed = ["title", "scope", "criteria", "dependencies", "owner", "artifacts"];
   requireValue(Object.keys(patch).every(key => allowed.includes(key)), "Unsupported task edit");
-  return changeTask(plan, context, taskId, task => ({ ...task, ...patch, ...(task.status === "accepted" ? { status: "in_review" as const, decisions: [...task.decisions, { revision: plan.revision + 1, kind: "invalidate" as const, reason: "Task definition edited", criteria: {} }] } : {}) }));
+  return changeTask(plan, context, taskId, task => {
+    const edited = { ...task, ...patch };
+    if (task.status !== "accepted" || Object.keys(patch).length === 0) return edited;
+    return { ...setStatus(edited, plan, "in_review", "Task definition edited"), decisions: [...task.decisions, { revision: plan.revision + 1, kind: "invalidate", reason: "Task definition edited", criteria: {} }] };
+  });
 }
 export function addEvidence(plan: PlanSnapshot, context: CommandContext, taskId: string, evidence: Omit<Evidence, "evidenceId">): PlanSnapshot {
   return changeTask(plan, context, taskId, task => {
@@ -168,14 +220,16 @@ export function addEvidence(plan: PlanSnapshot, context: CommandContext, taskId:
 export function accept(plan: PlanSnapshot, context: CommandContext, taskId: string, criteria: Readonly<Record<string, readonly string[]>>, reason: string): PlanSnapshot {
   text(reason);
   return changeTask(plan, context, taskId, task => {
+    requireValue(task.status === "in_review", "Accept requires in_review");
     validateAcceptance(task, criteria);
-    return { ...task, status: "accepted", decisions: [...task.decisions, { revision: plan.revision + 1, kind: "accept", reason, criteria }] };
+    return { ...setStatus(task, plan, "accepted", reason), decisions: [...task.decisions, { revision: plan.revision + 1, kind: "accept", reason, criteria }] };
   });
 }
 /** References an existing runtime ID; this module never creates a second runtime identity. */
 export function attachRun(plan: PlanSnapshot, context: CommandContext, taskId: string, attemptId: string, runId: string): PlanSnapshot {
   return changeTask(plan, context, taskId, task => {
-    requireValue(task.attempts.some(a => a.attemptId === attemptId), "Unknown attempt");
+    requireValue(task.status === "in_progress" || task.status === "blocked" || task.status === "in_review", "Cannot attach run in terminal/pending state");
+    requireValue(task.attempts.at(-1)?.attemptId === attemptId, "Attach requires current attempt");
     return { ...task, attempts: task.attempts.map(a => a.attemptId === attemptId ? { ...a, runIds: [...a.runIds, runId] } : a) };
   });
 }
@@ -184,25 +238,72 @@ function changeTask(plan: PlanSnapshot, context: CommandContext, taskId: string,
   requireValue(plan.tasks.some(t => t.taskId === taskId), "Unknown task");
   return update(plan, context, plan.tasks.map(t => t.taskId === taskId ? change(t) : t));
 }
+function setStatus(task: PlanTask, plan: PlanSnapshot, status: TaskStatus, reason: string): PlanTask {
+  text(reason);
+  return { ...task, status, statusReason: reason, statusHistory: [...task.statusHistory, { revision: plan.revision + 1, status, reason }] };
+}
+function newAttempt(task: PlanTask, plan: PlanSnapshot, childSession: string | undefined, reason: string): PlanTask {
+  return { ...setStatus(task, plan, "in_progress", reason), attempts: [...task.attempts, { attemptId: randomUUID(), runIds: [], ...(childSession === undefined ? {} : { childSession }), results: [] }] };
+}
 export function startAttempt(plan: PlanSnapshot, context: CommandContext, taskId: string, childSession?: string): PlanSnapshot {
-  return changeTask(plan, context, taskId, task => ({ ...task, attempts: [...task.attempts, { attemptId: randomUUID(), runIds: [], ...(childSession === undefined ? {} : { childSession }), results: [] }] }));
+  return changeTask(plan, context, taskId, task => {
+    requireValue(task.status === "pending", "Start requires pending");
+    return newAttempt(task, plan, childSession, "Parent started attempt");
+  });
 }
 export function retry(plan: PlanSnapshot, context: CommandContext, taskId: string, childSession?: string): PlanSnapshot {
-  return startAttempt(plan, context, taskId, childSession);
+  return changeTask(plan, context, taskId, task => {
+    requireValue(["failed", "blocked", "in_review"].includes(task.status), "Retry requires failed, blocked or in_review");
+    return newAttempt(task, plan, childSession, "Parent requested retry");
+  });
+}
+function transition(plan: PlanSnapshot, context: CommandContext, taskId: string, from: readonly TaskStatus[], to: TaskStatus, reason: string): PlanSnapshot {
+  return changeTask(plan, context, taskId, task => {
+    requireValue(from.includes(task.status), `Cannot transition ${task.status} to ${to}`);
+    return setStatus(task, plan, to, reason);
+  });
+}
+export function block(plan: PlanSnapshot, context: CommandContext, taskId: string, reason: string): PlanSnapshot {
+  return transition(plan, context, taskId, ["pending", "in_progress", "in_review", "blocked"], "blocked", reason);
+}
+export function submitReview(plan: PlanSnapshot, context: CommandContext, taskId: string, reason: string): PlanSnapshot {
+  return transition(plan, context, taskId, ["pending", "in_progress", "blocked", "in_review"], "in_review", reason);
+}
+export function reject(plan: PlanSnapshot, context: CommandContext, taskId: string, reason: string): PlanSnapshot {
+  return transition(plan, context, taskId, ["in_review"], "failed", reason);
+}
+export function skip(plan: PlanSnapshot, context: CommandContext, taskId: string, reason: string): PlanSnapshot {
+  return transition(plan, context, taskId, ["pending", "in_progress", "blocked", "in_review", "failed"], "skipped", reason);
+}
+export function cancel(plan: PlanSnapshot, context: CommandContext, taskId: string, reason: string): PlanSnapshot {
+  return transition(plan, context, taskId, ["pending", "in_progress", "blocked", "in_review", "failed"], "cancelled", reason);
+}
+export function reopen(plan: PlanSnapshot, context: CommandContext, taskId: string, reason: string): PlanSnapshot {
+  return changeTask(plan, context, taskId, task => {
+    requireValue(["accepted", "failed", "skipped", "cancelled"].includes(task.status), "Reopen requires terminal state");
+    return { ...setStatus(task, plan, "pending", reason), ...(task.status === "accepted" ? { decisions: [...task.decisions, { revision: plan.revision + 1, kind: "invalidate" as const, reason, criteria: {} }] } : {}) };
+  });
 }
 /** Worker payload is data only: a parent must authorize recording it. */
 export function recordResult(plan: PlanSnapshot, context: CommandContext, taskId: string, attemptId: string, result: ResultReference): PlanSnapshot {
   authorize(plan, context);
+  keys(result, ["eventId", "runId", "ref", "kind", "reason"]);
   const task = plan.tasks.find(t => t.taskId === taskId);
   requireValue(task, "Unknown task");
   const existing = task.attempts.flatMap(a => a.results).find(r => r.eventId === result.eventId);
   if (existing) {
-    requireValue(JSON.stringify(existing) === JSON.stringify(result) && task.attempts.some(a => a.attemptId === attemptId && a.results.includes(existing)), "Conflicting event");
+    requireValue(existing.runId === result.runId && existing.ref === result.ref && (existing.kind ?? "result") === (result.kind ?? "result") && existing.reason === result.reason && task.attempts.some(a => a.attemptId === attemptId && a.results.includes(existing)), "Conflicting event");
     return plan;
   }
   return changeTask(plan, context, taskId, task => {
     requireValue(task.attempts.some(a => a.attemptId === attemptId), "Unknown attempt");
-    return { ...task, attempts: task.attempts.map(a => a.attemptId === attemptId ? { ...a, results: [...a.results, result] } : a) };
+    const recorded = { ...task, attempts: task.attempts.map(a => a.attemptId === attemptId ? { ...a, results: [...a.results, result] } : a) };
+    // Completion is observation, never acceptance. Old attempts and terminal tasks
+    // retain late events without changing the parent's decision.
+    if (task.attempts.at(-1)?.attemptId !== attemptId || !["in_progress", "blocked", "in_review"].includes(task.status) || result.kind === "process_exit") return recorded;
+    if (result.kind === "ping") return setStatus(recorded, plan, "blocked", result.reason!);
+    if (result.kind === "failure") return setStatus(recorded, plan, "failed", result.reason!);
+    return setStatus(recorded, plan, "in_review", result.reason ?? "Worker result requires parent review");
   });
 }
 export function serializePlan(plan: PlanSnapshot): string { validate(plan); return JSON.stringify(plan); }

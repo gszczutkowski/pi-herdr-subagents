@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createPlan, addTask, createCriterion, createArtifact, editTask, addEvidence, accept, attachRun, startAttempt, retry, recordResult, serializePlan, deserializePlan } from "../pi-extension/subagents/plan-store.ts";
+import { createPlan, addTask, createCriterion, createArtifact, editTask, addEvidence, accept, submitReview, block, reject, skip, cancel, reopen, attachRun, startAttempt, retry, recordResult, serializePlan, deserializePlan } from "../pi-extension/subagents/plan-store.ts";
 
 test("retry and explicit closed resume preserve task identity; live results share an attempt", () => {
   let plan = createPlan("Plan", authority);
@@ -20,7 +20,7 @@ test("retry and explicit closed resume preserve task identity; live results shar
   assert.equal(plan.tasks[0].attempts.length, 2);
   assert.notEqual(plan.tasks[0].attempts[1].attemptId, attemptId);
   assert.equal(plan.tasks[0].attempts[0].results.length, 2);
-  assert.throws(() => attachRun(plan, context(plan), taskId, attemptId, "run-a"), /Duplicate/);
+  assert.throws(() => attachRun(plan, context(plan), taskId, plan.tasks[0].attempts[1].attemptId, "run-a"), /Duplicate/);
   assert.deepEqual(deserializePlan(serializePlan(plan)), plan);
 });
 
@@ -34,6 +34,7 @@ test("task definitions validate dependency graphs and evidence-backed acceptance
   assert.throws(() => editTask(plan, context(plan), id, { dependencies: ["missing"] }), /Missing/);
   plan = addTask(plan, context(plan), "B", { dependencies: [id] });
   assert.throws(() => editTask(plan, context(plan), id, { dependencies: [plan.tasks[1].taskId] }), /Cyclic/);
+  plan = submitReview(plan, context(plan), id, "Parent review requested");
   assert.throws(() => accept(plan, context(plan), id, {}, "reviewed"), /ALL/);
   assert.throws(() => addEvidence(plan, context(plan), id, { criterionId: criterion.criterionId, ref: "x", artifactId: "missing" }), /artifact/);
   assert.throws(() => addEvidence(plan, context(plan), id, { criterionId: criterion.criterionId, ref: "x".repeat(8193) }), /bounded/);
@@ -48,6 +49,100 @@ test("task definitions validate dependency graphs and evidence-backed acceptance
   assert.deepEqual(plan.tasks[0].decisions[0].criteria, mapping);
   assert.equal(plan.tasks[0].criteria[0].criterionId, criterion.criterionId);
   assert.deepEqual(deserializePlan(serializePlan(plan)), plan);
+});
+
+test("explicit lifecycle, parent-only authority, retained reasons and late event safety", () => {
+  const criterion = createCriterion("Proof");
+  let plan = createPlan("Lifecycle", authority);
+  plan = addTask(plan, context(plan), "Task", { criteria: [criterion] });
+  const id = plan.tasks[0].taskId;
+  assert.equal(plan.tasks[0].status, "pending");
+  assert.throws(() => accept(plan, context(plan), id, {}, "no"), /in_review/);
+  assert.throws(() => editTask(plan, context(plan), id, { status: "accepted" } as never), /Unsupported/);
+  plan = startAttempt(plan, context(plan), id);
+  const attemptId = plan.tasks[0].attempts[0].attemptId;
+  plan = attachRun(plan, context(plan), id, attemptId, "run");
+  const result = (eventId: string, kind: "result" | "ping" | "failure" | "process_exit", reason?: string) => ({ eventId, runId: "run", ref: "result.txt", kind, ...(reason ? { reason } : {}) });
+  assert.throws(() => recordResult(plan, { ...context(plan), sessionId: "child" }, id, attemptId, result("child", "result")), /authority/);
+  assert.throws(() => recordResult(plan, { ...context(plan), expectedRevision: 0 }, id, attemptId, result("stale", "result")), /Revision/);
+  plan = recordResult(plan, context(plan), id, attemptId, result("exit", "process_exit"));
+  assert.equal(plan.tasks[0].status, "in_progress");
+  assert.throws(() => recordResult(plan, context(plan), id, attemptId, result("bad-ping", "ping")), /nonempty/);
+  plan = recordResult(plan, context(plan), id, attemptId, result("ping", "ping", "Need a decision"));
+  assert.equal(plan.tasks[0].status, "blocked");
+  assert.equal(plan.tasks[0].statusReason, "Need a decision");
+  plan = recordResult(plan, context(plan), id, attemptId, result("turn", "result"));
+  assert.equal(plan.tasks[0].status, "in_review");
+  assert.ok(plan.tasks[0].statusHistory.some(s => s.reason === "Need a decision"));
+  plan = addEvidence(plan, context(plan), id, { criterionId: criterion.criterionId, ref: "checked", resultEventId: "turn" });
+  const mapping = { [criterion.criterionId]: [plan.tasks[0].evidence[0].evidenceId] };
+  plan = accept(plan, context(plan), id, mapping, "Parent verified");
+  plan = recordResult(plan, context(plan), id, attemptId, result("late", "ping", "Late question"));
+  assert.equal(plan.tasks[0].status, "accepted");
+  assert.equal(recordResult(plan, context(plan), id, attemptId, result("late", "ping", "Late question")), plan);
+  assert.throws(() => retry(plan, context(plan), id), /Retry/);
+  plan = reopen(plan, context(plan), id, "New requirement");
+  plan = startAttempt(plan, context(plan), id);
+  plan = recordResult(plan, context(plan), id, attemptId, result("old-attempt", "result"));
+  assert.equal(plan.tasks[0].status, "in_progress");
+  plan = cancel(plan, context(plan), id, "No longer needed");
+  plan = recordResult(plan, context(plan), id, attemptId, result("after-cancel", "result"));
+  assert.equal(plan.tasks[0].status, "cancelled");
+  assert.throws(() => submitReview(plan, context(plan), id, "late"), /Cannot/);
+  plan = reopen(plan, context(plan), id, "Parent reopened");
+  plan = block(plan, context(plan), id, "Waiting");
+  plan = submitReview(plan, context(plan), id, "Manual review");
+  plan = reject(plan, context(plan), id, "Criteria not met");
+  assert.equal(plan.tasks[0].status, "failed");
+  plan = retry(plan, context(plan), id);
+  plan = skip(plan, context(plan), id, "Out of scope");
+  assert.equal(plan.tasks[0].status, "skipped");
+  assert.throws(() => reopen(plan, context(plan), id, ""), /nonempty/);
+  assert.deepEqual(deserializePlan(serializePlan(plan)), plan);
+});
+
+test("every criterion needs its own evidence; accepted definition edits invalidate decisions", () => {
+  const criteria = [createCriterion("A"), createCriterion("B")];
+  let plan = addTask(createPlan("Plan", authority), { ...authority, expectedRevision: 0 }, "Task", { criteria });
+  const id = plan.tasks[0].taskId;
+  plan = submitReview(plan, context(plan), id, "Ready");
+  for (const criterion of criteria) plan = addEvidence(plan, context(plan), id, { criterionId: criterion.criterionId, ref: "proof" });
+  const evidence = plan.tasks[0].evidence;
+  const mapping = Object.fromEntries(criteria.map((c, i) => [c.criterionId, [evidence[i].evidenceId]]));
+  assert.throws(() => accept(plan, context(plan), id, { ...mapping, [criteria[1].criterionId]: mapping[criteria[0].criterionId] }, "wrong evidence"), /evidence/);
+  plan = accept(plan, context(plan), id, mapping, "Checked both");
+  for (const patch of [{ title: "Renamed" }, { owner: "new-owner" }, { criteria: [criteria[0]] }, { dependencies: [] }, { artifacts: [createArtifact("new-report")] }]) {
+    const changed = editTask(plan, context(plan), id, patch);
+    assert.equal(changed.tasks[0].status, "in_review");
+    assert.equal(changed.tasks[0].decisions[0].kind, "accept");
+    assert.equal(changed.tasks[0].decisions[1].kind, "invalidate");
+  }
+  mapping[criteria[0].criterionId].push("external-mutation");
+  assert.equal(plan.tasks[0].decisions[0].criteria[criteria[0].criterionId].length, 1);
+});
+
+test("failure observations need reasons; stale commands, forged fields and unbounded refs are rejected", () => {
+  let plan = addTask(createPlan("Plan", authority), { ...authority, expectedRevision: 0 }, "Task");
+  const id = plan.tasks[0].taskId;
+  plan = startAttempt(plan, context(plan), id);
+  const attemptId = plan.tasks[0].attempts[0].attemptId;
+  plan = attachRun(plan, context(plan), id, attemptId, "run");
+  assert.throws(() => startAttempt(plan, context(plan), id), /pending/);
+  assert.throws(() => block(plan, context(plan), id, " "), /nonempty/);
+  assert.throws(() => recordResult(plan, context(plan), id, attemptId, { eventId: "bad", runId: "unknown", ref: "r" }), /Unknown result run/);
+  assert.throws(() => recordResult(plan, context(plan), id, attemptId, { eventId: "bad", runId: "run", ref: "r", kind: "failure" }), /nonempty/);
+  plan = recordResult(plan, context(plan), id, attemptId, { eventId: "failed", runId: "run", ref: "error.txt", kind: "failure", reason: "Provider error" });
+  assert.equal(plan.tasks[0].status, "failed");
+  assert.equal(plan.tasks[0].statusReason, "Provider error");
+  assert.throws(() => retry(plan, { ...context(plan), branchInstanceId: "fork" }, id), /authority/);
+  assert.throws(() => cancel(plan, { ...context(plan), expectedRevision: plan.revision - 1 }, id, "stale"), /Revision/);
+  const input = JSON.parse(serializePlan(plan));
+  input.tasks[0].status = "accepted";
+  assert.throws(() => deserializePlan(JSON.stringify(input)), /history|acceptance/);
+  input.tasks[0].status = "failed";
+  input.replaceTasks = [];
+  assert.throws(() => deserializePlan(JSON.stringify(input)), /Unsupported snapshot/);
+  assert.throws(() => addTask(plan, context(plan), "Injected", { attempts: [] } as never), /Unsupported/);
 });
 
 const authority = { sessionId: "parent", branchInstanceId: "branch-a" };
