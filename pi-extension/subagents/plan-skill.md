@@ -165,6 +165,8 @@ subagent({
 
 **Always run workers sequentially in the same git repo** — parallel workers will conflict on commits.
 
+Commits require both permission under project policy and user authorization. Honor an explicit request for per-point commits when permitted; todo completion alone is not authorization. If instructions conflict, report the conflict before committing. Without authorization, leave changes uncommitted and report paths and verification evidence. Use the `commit` skill when available and authorized, otherwise follow project commit conventions.
+
 ---
 
 ## Phase 6: Review
@@ -198,6 +200,6 @@ Before reporting done:
 1. ✅ Scout ran before the planner?
 2. ✅ Scout context was passed to the planner?
 3. ✅ All worker todos closed?
-4. ✅ Every todo has a polished commit (using the `commit` skill)?
+4. ✅ Commit handling matches project policy and user authorization (including requested per-point commits), or uncommitted paths and verification evidence are reported?
 5. ✅ Reviewer has run?
 6. ✅ Reviewer findings triaged and addressed?

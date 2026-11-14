@@ -15,6 +15,20 @@ test("planning sizes tasks by verifiable outcomes rather than elapsed minutes", 
   }
 });
 
+test("commits require policy permission and user authorization, preserving per-point requests", () => {
+  const worker = read("agents/worker.md");
+  for (const text of [worker, plan]) {
+    assert.match(text, /project policy/);
+    assert.match(text, /user(?:'s instructions authorize| authorization)/);
+    assert.match(text, /explicit request for per-point commits/);
+    assert.match(text, /alone (?:does not authorize a commit|is not authorization)/);
+    assert.match(text, /leave changes uncommitted/);
+    assert.match(text, /conflict before committing/);
+  }
+  assert.doesNotMatch(plan, /Every todo has a polished commit/);
+  assert.match(worker, /skill is unavailable, follow the project's commit conventions/);
+});
+
 // These are instruction contracts, not runtime permission/sandbox tests.
 test("read-only roles return reports for parent persistence without code edits", () => {
   for (const role of ["scout", "reviewer"]) {

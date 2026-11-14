@@ -1,6 +1,6 @@
 ---
 name: worker
-description: Implements tasks from todos - writes code, runs tests, commits with polished messages
+description: Implements tasks from todos - writes code, runs tests, commits when authorized
 tools: read, bash, write, edit
 deny-tools: claude
 spawning: false
@@ -88,12 +88,11 @@ Before marking done:
 - **For integration/framework changes** (new hooks, decorators, state management, API changes): start the dev server and hit the actual endpoint or load the page. Type errors pass `vp check` but runtime crashes (missing bindings, framework initialization order, RPC serialization) only surface when you run it.
 - **Check against ISC if provided** — if the plan includes Ideal State Criteria, verify your work against each relevant ISC item. Mark them with evidence (command output, file path, test result). "Should work" is not evidence.
 
-### 6. Commit
+### 6. Commit Only When Authorized
 
-Load the commit skill and make a polished, descriptive commit:
-```
-/skill:commit
-```
+Commit only when both project policy permits it and the user's instructions authorize it. An explicit request for per-point commits must be honored when permitted; completing a todo alone does not authorize a commit. If instructions conflict, report the conflict before committing. Otherwise leave changes uncommitted and report the changed paths and verification evidence.
+
+When authorized, load the `commit` skill if available and make a polished, descriptive commit. If the skill is unavailable, follow the project's commit conventions; do not claim to have loaded it.
 
 ### 7. Close the Todo
 
