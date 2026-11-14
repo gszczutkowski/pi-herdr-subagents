@@ -619,6 +619,8 @@ interface SubagentRuntime {
   store?: RuntimeStore;
   stopRecovery?: () => void;
   recoveryError?: string;
+  /** Settlements observed while no session-bound context is available. */
+  suspendedCompletions?: Map<string, { running: RunningSubagent; result: SubagentResult }>;
   runningSubagents: Map<string, RunningSubagent>;
   pi?: ExtensionAPI;
   latestCtx?: ExtensionContext;
@@ -680,19 +682,14 @@ function ownsActiveBranch(ctx: ExtensionContext | undefined, parent: RuntimePare
 async function recoverParentRuntime(ctx: ExtensionContext): Promise<void> {
   if (typeof ctx.sessionManager.getHeader !== "function") return;
   try {
-    if (runtime.store) {
-      runtime.store.isCurrent = () => ownsActiveBranch(runtime.latestCtx, runtime.store!.snapshot().parent);
-      runtime.store.assertCustody();
-      return;
-    }
     const header = ctx.sessionManager.getHeader();
     if (!header?.id) return;
     const directory = join(getArtifactDir(ctx.sessionManager.getSessionDir(), header.id), "subagent-runtime");
-    const manifest = readRuntimeManifest(directory);
+    const manifest = runtime.store?.snapshot() ?? readRuntimeManifest(directory);
     if (!manifest) return;
     if (manifest.custodyPaused) throw new Error(`Recovery requires an explicit branch decision: ${manifest.custodyPaused}`);
     if (!ownsActiveBranch(ctx, manifest.parent)) throw new Error("Recovery parent session/active branch mismatch; no custody inherited");
-    const store = new RuntimeStore(directory, manifest.parent);
+    const store = runtime.store ?? new RuntimeStore(directory, manifest.parent);
     runtime.store = store;
     delivery.store = store;
     store.isCurrent = () => ownsActiveBranch(runtime.latestCtx, manifest.parent);
@@ -703,7 +700,14 @@ async function recoverParentRuntime(ctx: ExtensionContext): Promise<void> {
       return expected && (message as any)?.customType === expected.customType &&
         JSON.stringify((message as any)?.content) === JSON.stringify(expected.content) ? [id] : [];
     }));
+    store.assertCustody();
     restoreDurableDeliveries(delivery, store, eventIds);
+    for (const [key, settlement] of runtime.suspendedCompletions ?? []) {
+      if (settlement.running.durableStore !== store) continue;
+      enqueueSubagentCompletion(settlement.running, settlement.result);
+      runtime.suspendedCompletions!.delete(key);
+    }
+    runtime.stopRecovery?.();
     const stopRecovery = await reconcileRuntime(store, (run, evidence) => {
       const running: RunningSubagent = { ...run, durableStore: store, surface: "", interactive: false,
         lifecycle: createLifecycle(run.startTime), runtimePlan: undefined, terminalActionsAllowed: false };
@@ -776,6 +780,14 @@ export function shouldDeliverSubagentCompletion(
 /** Shared by spawn and resume; transport failures stay inside the outbox. */
 export function enqueueSubagentCompletion(running: RunningSubagent, result: SubagentResult): void {
   if (!shouldDeliverSubagentCompletion(running)) return;
+  if (running.durableStore && !runtime.latestCtx) {
+    // Reload is not custody loss. Preserve the original settlement until a
+    // fresh session context proves the branch; never publish through a stale API.
+    const key = `${running.id}:${result.eventId ?? "terminal"}`;
+    const suspended = runtime.suspendedCompletions ??= new Map();
+    if (!suspended.has(key)) suspended.set(key, { running, result: structuredClone(result) });
+    return;
+  }
   if (result.ping) {
     const sessionRef = `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`;
     enqueueCompletion(running, {
@@ -827,6 +839,10 @@ export function observeSubagentCompletion(
   completion: Promise<SubagentResult>,
   resume?: { sessionPath: string; entryCountBefore: number },
 ): Promise<void> {
+  const reportError = (error: unknown) => {
+    try { enqueueSubagentError(running, error, !!resume); }
+    catch (failure) { delivery.persistenceError = String(failure); }
+  };
   return completion.then(
     (result) => {
       if (!shouldDeliverSubagentCompletion(running)) return;
@@ -849,10 +865,10 @@ export function observeSubagentCompletion(
           return observeSubagentCompletion(running, watchSubagent(running, running.abortController.signal));
         }
       } catch (err) {
-        enqueueSubagentError(running, err, !!resume);
+        reportError(err);
       }
     },
-    (err) => enqueueSubagentError(running, err, !!resume),
+    reportError,
   );
 }
 
@@ -1724,6 +1740,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       }
       delivery.pending.clear();
       delivery.handedOff.clear();
+      runtime.suspendedCompletions?.clear();
       runtime.modelCatalog = undefined;
       runtime.agentCatalog = undefined;
       runtime.recoveryError = undefined;

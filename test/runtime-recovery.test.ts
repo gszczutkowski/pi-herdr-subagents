@@ -146,3 +146,52 @@ test("live/legacy lease and stale cursor cannot be replaced by a second parent",
     manifest.runs.run.eventCursor = []; atomicRuntimeWrite(file, manifest); store.close();
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("durable observer preserves original settlements across reload gaps and reconciles existing store artifacts", () => {
+  const dir = mkdtempSync(join(tmpdir(), "runtime-reload-"));
+  try {
+    execute(`import extension,{observeSubagentCompletion} from ${JSON.stringify(moduleURL("index"))};
+      import {RuntimeStore} from ${JSON.stringify(moduleURL("runtime-store"))};
+      import {createLifecycle} from ${JSON.stringify(moduleURL("lifecycle"))};
+      import {runCompletionFile} from ${JSON.stringify(moduleURL("run-artifacts"))};
+      import {canonicalSessionPath} from ${JSON.stringify(moduleURL("ownership"))};
+      import assert from 'node:assert/strict';import fs from 'node:fs';
+      const directory=${JSON.stringify(dir)};
+      const parent={sessionFile:canonicalSessionPath(directory+'/parent.jsonl'),headerId:'parent',branchToken:'token',checkpoint:'checkpoint'};
+      const branch=[{id:'checkpoint',type:'custom',customType:'subagent-custody',data:{branchToken:'token'}}];
+      const ctx={hasUI:false,scopedModels:[],modelRegistry:{getAvailable:()=>[]},sessionManager:{
+        getHeader:()=>({id:'parent'}),getSessionFile:()=>parent.sessionFile,getSessionDir:()=>directory,getBranch:()=>branch}};
+      const delivered=[];const stale=[];
+      function host(messages){const handlers=new Map();extension(new Proxy({}, {get:(_,key)=>key==='on'?(n,f)=>handlers.set(n,f):key==='getAllTools'?()=>[]:key==='sendMessage'?m=>messages.push(m):()=>{}}));return handlers;}
+      const old=host(stale);await old.get('session_start')({},ctx);
+      const runtime=globalThis[Symbol.for('pi-subagents/runtime')];
+      const store=new RuntimeStore(directory+'/artifacts/parent/subagent-runtime',parent);
+      runtime.store=store;runtime.delivery.store=store;store.isCurrent=()=>!!runtime.latestCtx;
+      const children=['shutdown','factory','artifact'].map(id=>({id,name:id,task:'task',sessionFile:directory+'/'+id+'.jsonl',startTime:1,
+        durableStore:store,lifecycle:createLifecycle(1),interactive:false}));
+      for(const child of children)store.prepare({id:child.id,name:child.name,task:child.task,sessionFile:child.sessionFile,startTime:child.startTime});
+      old.get('session_shutdown')({reason:'reload'},ctx);
+      const output=child=>({name:child.name,task:'task',sessionFile:child.sessionFile,summary:'original '+child.id,elapsed:2,exitCode:0,eventId:child.id+'-event'});
+      await observeSubagentCompletion(children[0],Promise.resolve(output(children[0])));
+      const fresh=host(delivered);
+      await observeSubagentCompletion(children[1],Promise.resolve(output(children[1])));
+      const base=runCompletionFile(children[2].sessionFile,'artifact');fs.mkdirSync(base+'.events',{recursive:true});
+      fs.writeFileSync(base+'.events/evidence.json',JSON.stringify({type:'done',runId:'artifact',eventId:'evidence',summary:'retained original'}));
+      assert.equal(delivered.length,0);assert.equal(stale.length,0);
+      await fresh.get('session_start')({reason:'reload'},ctx);
+      await fresh.get('session_start')({reason:'reload'},ctx);
+      assert.equal(runtime.recoveryError,undefined);assert.equal(delivered.length,3);
+      for(const child of children.slice(0,2)){
+        const messages=delivered.filter(m=>m.details.eventId==='subagent:'+child.id+':completion:'+child.id+'-event');
+        assert.equal(messages.length,1);assert.equal(messages[0].details.response,'original '+child.id);
+      }
+      assert.equal(delivered.find(m=>m.details.eventId==='subagent:artifact:completion:evidence').details.response,'retained original');
+      // A real branch mismatch still fences both observer enqueue and fallback;
+      // neither callback may produce an unhandled rejected observer promise.
+      runtime.latestCtx={...ctx,sessionManager:{...ctx.sessionManager,getBranch:()=>[]}};
+      await observeSubagentCompletion(children[0],Promise.resolve({...output(children[0]),eventId:'foreign'}));
+      await observeSubagentCompletion(children[0],Promise.reject(new Error('observer failure')));
+      assert.equal(delivered.length,3);
+      fresh.get('session_shutdown')({reason:'quit'},ctx);`);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
