@@ -105,6 +105,9 @@ export interface CloseResult {
 }
 interface CloseTransport {
   validate: () => void;
+  /** Binding/lease fences still apply, but normal watcher cleanup may have
+   * removed the original owner only AFTER verified original process death. */
+  validateClosed?: (original: ProcessIdentity) => void;
   timeoutMs?: number;
   audit?: (path: string) => SessionAudit;
   probe?: (pid: number) => ProcessProbe;
@@ -132,11 +135,13 @@ export async function closeOwnedChild(owner: SessionOwner, child: CloseChild, tr
     return current.kind === "absent" || !sameProcess(identity.process, current.identity);
   };
   const closed = (): CloseResult => {
+    if (transport.validateClosed) transport.validateClosed(identity.process);
+    else transport.validate();
     const remaining = audit(child.sessionFile);
     return { status: "closed", requestId: intent?.requestId, process: identity.process, remainingOwners: remaining.ownerCount,
       reason: remaining.ownerCount || remaining.uncertainCount ? "Original owned process exited; session still has other or unverified possible writers." : "Original owned process exited; no other CLI owners observed." };
   };
-  if (gone() === true) { transport.validate(); return closed(); }
+  if (gone() === true) return closed();
   if (!intent) {
     assertSessionWriters(audit(child.sessionFile), identity.process);
     const pointer = read(join(dir, "current.json"));
@@ -168,9 +173,11 @@ export async function closeOwnedChild(owner: SessionOwner, child: CloseChild, tr
   }
   const deadline = Date.now() + (transport.timeoutMs ?? 3000);
   do {
-    transport.validate(); // Branch, binding, lease and owner must survive every await.
+    // Normal supervision can remove the maps before our OS wait completes.
+    // Only proven original-process death can enter the closure validation phase.
     const absent = gone();
     if (absent === true) return closed();
+    transport.validate(); // Live/unknown process still requires exact ownership.
     const ack = read(join(dir, `${intent.requestId}.ack.json`));
     if (ack?.requestId === intent.requestId && matches(ack, identity) && ack.capability === CLOSE_CAPABILITY &&
         ack.idleToken === intent.idleToken && ack.status === "rejected" && ack.dispatched === false &&
@@ -188,7 +195,7 @@ export async function closeOwnedChild(owner: SessionOwner, child: CloseChild, tr
     if (Date.now() >= deadline) break;
     await new Promise(resolve => setTimeout(resolve, 50));
   } while (Date.now() <= deadline);
-  transport.validate();
   if (gone() === true) return closed();
+  transport.validate();
   return { status: "pending", requestId: intent.requestId, process: identity.process, reason: "Shutdown requested, but OS process exit not verified; ownership retained. Recheck with the same owned id, not a replacement launch." };
 }

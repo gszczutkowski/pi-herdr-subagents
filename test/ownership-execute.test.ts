@@ -118,7 +118,8 @@ async function until(predicate: () => boolean) {
   while (!predicate()) { assert.ok(Date.now() < deadline, "condition timed out"); await pause(); }
 }
 
-test("registered close releases only OS-verified original owner and returns idempotent reload receipt (Windows OS boundary)", { skip: process.platform !== "win32" }, async () => fixture(async ({ tools, ctx, session, resume, reload }: any) => {
+for (const scenario of ["watcher-cleanup", "wrong-branch-live", "replacement-live", "wrong-branch-after-exit", "replacement-after-exit"]) {
+test(`registered close ${scenario} preserves phase-specific ownership fences (Windows OS boundary)`, { skip: process.platform !== "win32" }, async () => fixture(async ({ tools, ctx, session, resume, reload }: any) => {
   const started = await resume();
   const child = __test__.runningSubagents.get(started.details.id)!;
   const targetPid = 98765432;
@@ -140,7 +141,22 @@ test("registered close releases only OS-verified original owner and returns idem
   const before = closed.length;
   const closing = tools.get("subagent_close").execute("close", { id: child.id }, undefined, undefined, ctx);
   assert.ok(sessionOwners.get(session), "request itself never releases ownership");
-  targetGone = true;
+  if (scenario === "watcher-cleanup") {
+    // Normal supervision removes both records during closeOwnedChild's OS wait.
+    __test__.runningSubagents.delete(child.id);
+    sessionOwners.delete(session);
+    targetGone = true;
+  } else {
+    const replacement = { runId: child.id, dispatched: true };
+    if (scenario.startsWith("wrong-branch")) ctx.sessionManager.getSessionFile = () => join(dirname(session), "other-branch.jsonl");
+    else sessionOwners.set(session, replacement);
+    targetGone = scenario.endsWith("after-exit");
+    await assert.rejects(closing, /branch|ownership/);
+    if (scenario.startsWith("replacement")) assert.equal(sessionOwners.get(session), replacement);
+    assert.equal(closed.length, before, "no terminal action on failed custody");
+    assert.equal(fs.readdirSync(dir).filter(name => name.endsWith(".request.json")).length, 1);
+    return;
+  }
   const result = await closing;
   assert.equal(result.details.status, "closed");
   assert.equal(sessionOwners.has(session), false);
@@ -148,6 +164,7 @@ test("registered close releases only OS-verified original owner and returns idem
   reload();
   assert.deepEqual((await tools.get("subagent_close").execute("again", { id: child.id }, undefined, undefined, ctx)).details, result.details);
 }));
+}
 
 test("close is parent-owned, honors lifecycle denial and is not a child completion allowlist tool", async () => fixture(async ({ tools, ctx, session, resume }: any) => {
   const close = tools.get("subagent_close");

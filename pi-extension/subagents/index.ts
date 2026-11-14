@@ -11,6 +11,7 @@ import { continueLiveChild } from "./live-continuation.ts";
 import { auditSession, assertSessionWriters } from "./session-audit.ts";
 import { readChildIdentity } from "./recovery-identity.ts";
 import { closeOwnedChild, type CloseResult } from "./close-control.ts";
+import { probeProcess, sameProcess, type ProcessIdentity } from "./process-identity.ts";
 import { prepareLaunchRun, registerLaunchedRun } from "./launch-registration.ts";
 import { createLineage, type Lineage } from "./lineage.ts";
 import { recordHistory, registerPlanHistory } from "./history.ts";
@@ -1943,9 +1944,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       const store = child.durableStore;
       const binding = JSON.stringify(child.planTask);
       const parentSession = ctx.sessionManager.getSessionFile();
-      const validate = () => {
+      const validateBinding = () => {
         if (runtime.treeSuspension || child.terminalActionsAllowed === false ||
-            runningSubagents.get(child.id) !== child || sessionOwners.get(path) !== owner ||
             child.durableStore !== store || JSON.stringify(child.planTask) !== binding ||
             ctx.sessionManager.getSessionFile() !== parentSession) throw new Error("Close custody/binding/branch changed; ownership retained and no further request dispatched.");
         store?.assertCustody();
@@ -1958,13 +1958,33 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               !task?.attempts.some(a => a.attemptId === child.planTask!.attemptId && a.runIds.includes(child.id))) throw new Error("Close task binding is not on the current parent branch.");
         }
       };
-      const result: CloseResult = await closeOwnedChild(owner, child, { validate });
-      validate();
+      const validate = () => {
+        validateBinding();
+        if (runningSubagents.get(child.id) !== child || sessionOwners.get(path) !== owner) {
+          throw new Error("Close live ownership changed; no further request dispatched.");
+        }
+      };
+      const validateClosed = (original: ProcessIdentity) => {
+        validateBinding();
+        const current = probeProcess(original.pid);
+        if (current.kind === "unverified" || (current.kind === "present" && sameProcess(current.identity, original))) {
+          throw new Error("Close cleanup requires verified original process death.");
+        }
+        // Absence is normal watcher cleanup, not permission to adopt/evict a
+        // different owner (including a replacement using the same run id).
+        const live = runningSubagents.get(child.id), reserved = sessionOwners.get(path);
+        if ((live && live !== child) || (reserved && reserved !== owner)) {
+          throw new Error("Close replacement ownership changed; replacement retained.");
+        }
+      };
+      const result: CloseResult = await closeOwnedChild(owner, child, { validate, validateClosed });
+      if (result.status === "closed") validateClosed(result.process);
+      else validate();
       if (result.status === "closed") {
         closedProcessReceipts.set(child.id, { id: child.id, name: child.name, result });
         // Bound read-only history across extension reload; no live ownership is evicted.
         if (closedProcessReceipts.size > 128) closedProcessReceipts.delete(closedProcessReceipts.keys().next().value!);
-        releaseSession(path, child.id);
+        if (sessionOwners.get(path) === owner) releaseSession(path, child.id);
       }
       return { content: [{ type: "text", text: JSON.stringify(result) }], details: { id: child.id, name: child.name, ...result } };
     },
