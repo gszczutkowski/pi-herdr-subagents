@@ -167,7 +167,7 @@ describe("Pi Harness Driver", () => {
 describe("Pi activity path contract", () => {
   it("boots the child writer at the generated path and exposes its tool snapshot to the parent", async () => {
     const dir = mkdtempSync(join(tmpdir(), "pi-activity-contract-"));
-    const envNames = ["PI_SUBAGENT_ID", "PI_SUBAGENT_ACTIVITY_FILE", "PI_SUBAGENT_AUTO_EXIT", "PI_SUBAGENT_ASSIGNMENT_FILE"];
+    const envNames = ["PI_SUBAGENT_ID", "PI_SUBAGENT_SESSION", "PI_SUBAGENT_ACTIVITY_FILE", "PI_SUBAGENT_AUTO_EXIT", "PI_SUBAGENT_ASSIGNMENT_FILE"];
     const previous = envNames.map((name) => process.env[name]);
     let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
     try {
@@ -182,6 +182,9 @@ describe("Pi activity path contract", () => {
       process.env.PI_SUBAGENT_ID = childId;
       process.env.PI_SUBAGENT_ACTIVITY_FILE = childActivityFile;
       process.env.PI_SUBAGENT_AUTO_EXIT = "0";
+      // This fixture exercises activity, not the calling agent's control session.
+      // Inherited continuation resources must not survive session.dispose().
+      delete process.env.PI_SUBAGENT_SESSION;
       delete process.env.PI_SUBAGENT_ASSIGNMENT_FILE;
       const settingsManager = SettingsManager.inMemory({});
       const loader = new DefaultResourceLoader({
