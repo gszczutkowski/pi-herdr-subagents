@@ -168,6 +168,7 @@ export class PiHarnessDriver implements HarnessDriver {
       role: params.agent || agentDefs?.name || "Subagent",
       task: params.task,
       skills: (effectiveSkills ?? "").split(",").map((skill) => skill.trim()).filter(Boolean),
+      ...(context.lineage ? { lineage: context.lineage } : {}),
     };
     const assignmentPath = join(artifactDir, `context/subagent-assignment-${params.id}.json`);
     mkdirSync(dirname(assignmentPath), { recursive: true });

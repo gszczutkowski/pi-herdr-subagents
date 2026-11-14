@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { isPlanTaskBinding, type PlanTaskBinding } from "./plan-runtime.ts";
 import type { DeliveryEnvelope } from "./delivery.ts";
 import { probeProcess, sameProcess } from "./process-identity.ts";
+import { isLineage, type Lineage } from "./lineage.ts";
 
 export interface RuntimeParent {
   sessionFile: string;
@@ -23,6 +24,7 @@ export interface DurableRun {
   sentinelFile?: string;
   launchScriptFile?: string;
   profile?: unknown;
+  lineage?: Lineage;
   entryCountBefore?: number;
   continuationRequestId?: string;
   startTime: number;
@@ -71,7 +73,8 @@ function validate(value: any): asserts value is RuntimeManifest {
     throw new Error("Invalid or unsupported runtime manifest; explicit reconciliation required");
   }
   for (const [id, run] of Object.entries(value.runs) as [string, any][]) {
-    if ((run.planTask !== undefined && !isPlanTaskBinding(run.planTask)) || run.id !== id || typeof run.sessionFile !== "string" || typeof run.name !== "string" || typeof run.task !== "string" ||
+    if ((run.planTask !== undefined && !isPlanTaskBinding(run.planTask)) ||
+        (run.lineage !== undefined && !isLineage(run.lineage)) || run.id !== id || typeof run.sessionFile !== "string" || typeof run.name !== "string" || typeof run.task !== "string" ||
         !Number.isFinite(run.startTime) || !["prepared", "dispatch-intent", "supervised"].includes(run.phase) ||
         !Array.isArray(run.eventCursor) || !run.eventCursor.every((event: unknown) => typeof event === "string")) {
       throw new Error("Invalid durable run");

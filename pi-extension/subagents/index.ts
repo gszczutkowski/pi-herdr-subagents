@@ -8,6 +8,7 @@ import { randomUUID } from "node:crypto";
 import { resolveSubagentCwd } from "./paths.ts";
 import { persistLaunchProfile, persistProfileBinding, readPiLaunchProfile, resolveLaunchProfile, resumeLaunchContext } from "./launch-profile.ts";
 import { continueLiveChild } from "./live-continuation.ts";
+import { createLineage, type Lineage } from "./lineage.ts";
 import { RuntimeStore, readRuntimeManifest, type RuntimeParent } from "./runtime-store.ts";
 import { reconcileRuntime } from "./runtime-recovery.ts";
 import type { SubagentLaunchContext } from "./harness/types.ts";
@@ -573,6 +574,7 @@ interface SubagentResult {
  */
 interface RunningSubagent {
   planTask?: PlanTaskBinding;
+  lineage?: Lineage;
   durableStore?: RuntimeStore;
   terminalActionsAllowed?: boolean;
   id: string;
@@ -804,7 +806,7 @@ export function enqueueSubagentCompletion(running: RunningSubagent, result: Suba
       display: true,
       details: {
         name: result.ping.name, message: result.ping.message,
-        agent: running.agent, sessionFile: result.sessionFile,
+        agent: running.agent, sessionFile: result.sessionFile, lineage: running.lineage,
       },
     }, result);
     return;
@@ -819,7 +821,7 @@ export function enqueueSubagentCompletion(running: RunningSubagent, result: Suba
       name: running.name, recipient: "Parent", task: running.task,
       response: result.errorMessage ? `Error: ${result.errorMessage}` : result.summary,
       keepOpen: result.keepOpen, agent: running.agent, exitCode: result.exitCode,
-      elapsed: result.elapsed, sessionFile: result.sessionFile,
+      elapsed: result.elapsed, sessionFile: result.sessionFile, lineage: running.lineage,
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
       ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
       ...(running.runtimePlan ? { runtimePlan: running.runtimePlan } : {}),
@@ -836,7 +838,7 @@ export function enqueueSubagentError(running: RunningSubagent, err: unknown, res
     display: true,
     details: {
       name: running.name, recipient: "Parent", task: running.task,
-      agent: running.agent, sessionFile: running.sessionFile, error, response: error,
+      agent: running.agent, sessionFile: running.sessionFile, lineage: running.lineage, error, response: error,
     },
   });
 }
@@ -1333,6 +1335,8 @@ async function launchSubagent(
     });
   }
 
+  const lineage = driver.id === "pi" ? createLineage(ctx.sessionManager, subagentSessionFile,
+    targetCwdForSession, artifactDir, store?.snapshot().parent, (type, data) => runtime.pi?.appendEntry(type, data)) : undefined;
   const activityFile = getSubagentActivityFile(artifactDir, id);
   if (driver.hasActivitySnapshots) {
     mkdirSync(dirname(activityFile), { recursive: true });
@@ -1356,6 +1360,7 @@ async function launchSubagent(
   const effectiveModel = driver.formatModel(runtimePlan);
 
   const launchContext: SubagentLaunchContext = {
+    lineage,
     params: { ...params, id },
     agentDefs,
     runtimePlan,
@@ -1399,7 +1404,7 @@ async function launchSubagent(
   store?.prepare({ id, planTask, name: params.name, task: params.task, startTime,
     sessionFile: canonicalSessionPath(built.sessionFile ?? subagentSessionFile),
     surface, cli: built.cli, activityFile, sentinelFile: built.sentinelFile,
-    launchScriptFile, profile: launchContext.launchProfile });
+    launchScriptFile, profile: launchContext.launchProfile, lineage });
   runScriptInPane(surface, built.command, {
     onDispatch: () => {
       if (planTask) bindPlanRun(runtime.plans!, ctx as ExtensionContext, id, undefined, planTask);
@@ -1417,6 +1422,7 @@ async function launchSubagent(
   const running: RunningSubagent = {
     planTask,
     durableStore: store,
+    lineage,
     id,
     name: params.name,
     task: params.task,
@@ -2185,7 +2191,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               ? `Session "${child.name}" continued in its existing process.`
               : `Continuation ${result.requestId} is pending/uncertain. Do not retry or launch a replacement; the existing watcher remains active.` }],
             details: { id: child.id, name: child.name, sessionPath: child.sessionFile,
-              requestId: result.requestId, status: result.status === "accepted" ? "continued" : "pending" },
+              lineage: child.lineage, requestId: result.requestId, status: result.status === "accepted" ? "continued" : "pending" },
           };
         }
         const interactive = profile.interactive;
@@ -2244,7 +2250,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         );
         store?.prepare({ id, planTask, name, task: params.message ?? "resumed session", startTime,
           sessionFile: params.sessionPath, surface, cli: "pi", activityFile,
-          launchScriptFile, profile: resumeProfile, entryCountBefore });
+          launchScriptFile, profile: resumeProfile, lineage: resumeProfile.lineage, entryCountBefore });
         runScriptInPane(surface, built.command, {
           onDispatch: () => {
             if (planTask) bindPlanRun(runtime.plans!, ctx, id, undefined, planTask);
@@ -2268,7 +2274,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           launchScriptFile,
           activityFile,
           interactive,
-          agent: profile.role ?? undefined,
+          agent: profile.role ?? undefined, lineage: profile.lineage,
           cli: "pi",
           runtimePlan: profile.runtimePlan,
           completionRunId: id,

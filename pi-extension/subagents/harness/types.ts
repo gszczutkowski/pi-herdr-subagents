@@ -37,6 +37,7 @@ export interface SubagentLaunchContext {
   /** Closed-session reopen: deliver only the new message, never the original task/skills. */
   resume?: boolean;
   launchProfile?: import("../launch-profile.ts").LaunchProfile;
+  lineage?: import("../lineage.ts").Lineage;
   params: SubagentLaunchParams;
   agentDefs?: AgentDefinition | null;
   runtimePlan: ResolvedRuntimePlan;

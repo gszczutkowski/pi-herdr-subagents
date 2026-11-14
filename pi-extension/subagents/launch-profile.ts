@@ -6,6 +6,7 @@ import { canonicalSessionPath } from "./ownership.ts";
 import { atomicRuntimeWrite } from "./runtime-store.ts";
 import { isPlanTaskBinding, type PlanTaskBinding } from "./plan-runtime.ts";
 import type { ResolvedRuntimePlan } from "./runtime-routing.ts";
+import { isLineage, type Lineage } from "./lineage.ts";
 
 /** Resolved, noncredential launch inputs only; never snapshot process.env or auth/config contents. */
 export interface LaunchProfile {
@@ -26,6 +27,7 @@ export interface LaunchProfile {
   runtimePlan: ResolvedRuntimePlan;
   autoExit: boolean;
   interactive: boolean;
+  lineage?: Lineage;
 }
 
 export const launchProfilePath = (sessionFile: string): string => `${sessionFile}.launch-profile.json`;
@@ -34,6 +36,7 @@ export function resolveLaunchProfile(context: SubagentLaunchContext, harness: st
   const plan = context.runtimePlan;
   return {
     version: 1, harness, sessionFile: canonicalSessionPath(context.subagentSessionFile),
+    ...(context.lineage ? { lineage: context.lineage } : {}),
     role: context.params.agent ?? context.agentDefs?.name ?? null,
     identity: context.identity ?? null, cwd: resolve(context.effectiveCwd),
     agentDir: resolve(context.localAgentDir && existsSync(context.localAgentDir)
@@ -66,7 +69,7 @@ export function readPiLaunchProfile(sessionFile: string): LaunchProfile {
   }
   const nullableString = (value: unknown) => value === null || typeof value === "string";
   const plan = p?.runtimePlan;
-  if (p?.version !== 1 || p.harness !== "pi" || p.sessionFile !== canonicalSessionPath(sessionFile) ||
+  if ((p?.lineage !== undefined && !isLineage(p.lineage)) || p?.version !== 1 || p.harness !== "pi" || p.sessionFile !== canonicalSessionPath(sessionFile) ||
     (p.planTask !== undefined && !isPlanTaskBinding(p.planTask)) ||
     typeof p.cwd !== "string" || !isAbsolute(p.cwd) ||
     typeof p.agentDir !== "string" || !isAbsolute(p.agentDir) ||
@@ -106,6 +109,6 @@ export function resumeLaunchContext(profile: LaunchProfile, run: {
     taskDelivery: profile.taskDelivery, denySet: new Set(profile.denyTools), identity: profile.identity,
     identityInSystemPrompt: profile.identityInSystemPrompt, systemPromptMode: profile.systemPromptMode ?? undefined,
     subagentsDir: run.subagentsDir, shellQuote: run.shellQuote, resume: true,
-    launchProfile: profile,
+    launchProfile: profile, lineage: profile.lineage,
   };
 }

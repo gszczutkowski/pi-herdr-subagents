@@ -21,6 +21,17 @@ subagent({ name: "Scout: DB", agent: "scout", task: "Map database schema" });
 // Both return immediately, results steer back independently
 ```
 
+### Session provenance
+
+Pi-backed launches carry optional versioned lineage: canonical session paths and
+header IDs for the immediate parent, root and child, plus root branch assignment
+references. Standalone still starts with no conversation; fork alone copies Pi
+history. The display name is never identity. Saved profiles, assignment cards,
+durable runs and result details retain original lineage across resume and live
+follow-up. Legacy launches may have no lineage. Foreign harnesses do not promise
+Pi context inheritance or verified native session identity. This metadata grants
+no terminal custody or child authentication.
+
 ### Result delivery boundary
 
 Pi's extension `sendMessage` returns `void`. A normal return acknowledges only

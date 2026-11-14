@@ -4,6 +4,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { isPlanTaskBinding, type PlanTaskBinding } from "./plan-runtime.ts";
 import { framedMessage } from "./frame.ts";
+import { isLineage, type Lineage } from "./lineage.ts";
 
 export const ASSIGNMENT_ENTRY_TYPE = "subagent-assignment";
 export const ASSIGNMENT_ENV = "PI_SUBAGENT_ASSIGNMENT_FILE";
@@ -18,6 +19,7 @@ export interface SubagentAssignment {
   role: string;
   task: string;
   skills: string[];
+  lineage?: Lineage;
 }
 
 export function isSubagentAssignment(value: unknown): value is SubagentAssignment {
@@ -27,7 +29,8 @@ export function isSubagentAssignment(value: unknown): value is SubagentAssignmen
     && (data.planTask === undefined || isPlanTaskBinding(data.planTask))
     && [data.childId, data.sessionFile, data.sender, data.recipient, data.role, data.task]
       .every((field) => typeof field === "string")
-    && Array.isArray(data.skills) && data.skills.every((skill) => typeof skill === "string");
+    && Array.isArray(data.skills) && data.skills.every((skill) => typeof skill === "string")
+    && (data.lineage === undefined || isLineage(data.lineage));
 }
 
 const registeredRenderers = new WeakSet<ExtensionAPI>();
