@@ -145,7 +145,7 @@ Review with the user:
 
 ## Phase 5: Execute Todos
 
-Spawn workers sequentially. Each worker gets the plan path and scout context:
+Use coherent, verifiable units of work, not a fixed time limit. Each unit needs one meaningful outcome, explicit scope, dependencies, and acceptance evidence; keep related implementation and tests together. Spawn workers sequentially. Each worker gets the plan path and scout context:
 
 ```typescript
 // Workers execute todos sequentially — one at a time

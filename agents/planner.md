@@ -425,7 +425,7 @@ After writing:
 
 **Before writing any todos, load the `write-todos` skill** — it defines the required structure, rules, and checklist.
 
-Break the plan into bite-sized todos (2-5 minutes of worker effort each):
+Break the plan into coherent, verifiable units of work. Each todo should deliver one meaningful outcome with explicit scope, dependencies, and acceptance evidence. Keep related implementation and its tests together; split when outcomes can be verified independently, not to meet a fixed time limit:
 
 ```typescript
 todo({ action: "create", title: "Task 1: [description]", tags: ["<plan-name>"], body: "..." })
