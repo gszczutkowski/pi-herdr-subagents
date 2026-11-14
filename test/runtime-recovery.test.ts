@@ -174,10 +174,19 @@ test("durable observer preserves original settlements across reload gaps and rec
       const runtime=globalThis[Symbol.for('pi-subagents/runtime')];
       const store=new RuntimeStore(directory+'/artifacts/parent/subagent-runtime',parent);
       runtime.store=store;runtime.delivery.store=store;store.isCurrent=()=>!!runtime.latestCtx;
-      const children=['shutdown','factory','artifact'].map(id=>({id,name:id,task:'task',sessionFile:directory+'/'+id+'.jsonl',startTime:1,
-        durableStore:store,lifecycle:createLifecycle(1),interactive:false}));
+      const children=['shutdown','factory','artifact','kept'].map(id=>({id,name:id,task:'task',sessionFile:directory+'/'+id+'.jsonl',startTime:1,
+        durableStore:store,lifecycle:createLifecycle(1),interactive:false,completionRunId:id,
+        surface:'unverified-test-surface',terminalActionsAllowed:false,abortController:new AbortController()}));
+      runtime.runningSubagents.set('kept',children[3]);
       for(const child of children)store.prepare({id:child.id,name:child.name,task:child.task,sessionFile:child.sessionFile,startTime:child.startTime});
       old.get('session_shutdown')({reason:'reload'},ctx);
+      const keptBase=runCompletionFile(children[3].sessionFile,'kept');fs.mkdirSync(keptBase+'.events',{recursive:true});
+      fs.writeFileSync(keptBase+'.events/kept-event.json',JSON.stringify({type:'done',runId:'kept',eventId:'kept-event',summary:'retained kept',keepOpen:true}));
+      await observeSubagentCompletion(children[3],Promise.resolve({name:'kept',task:'task',sessionFile:children[3].sessionFile,
+        summary:'retained kept',elapsed:2,exitCode:0,eventId:'kept-event',keepOpen:true}));
+      await new Promise(resolve=>setTimeout(resolve,50));
+      assert.deepEqual(store.snapshot().runs.kept.eventCursor,[]);
+      assert.equal(runtime.suspendedCompletions.size,1,'keep-open observation must remain suspended, not re-read evidence');
       const output=child=>({name:child.name,task:'task',sessionFile:child.sessionFile,summary:'original '+child.id,elapsed:2,exitCode:0,eventId:child.id+'-event'});
       await observeSubagentCompletion(children[0],Promise.resolve(output(children[0])));
       const fresh=host(delivered);
@@ -187,7 +196,9 @@ test("durable observer preserves original settlements across reload gaps and rec
       assert.equal(delivered.length,0);assert.equal(stale.length,0);
       await fresh.get('session_start')({reason:'reload'},ctx);
       await fresh.get('session_start')({reason:'reload'},ctx);
-      assert.equal(runtime.recoveryError,undefined);assert.equal(delivered.length,3);
+      assert.equal(runtime.recoveryError,undefined);assert.equal(delivered.length,4);
+      assert.deepEqual(store.snapshot().runs.kept.eventCursor,['subagent:kept:completion:kept-event']);
+      assert.equal(runtime.suspendedCompletions.size,0);
       for(const child of children.slice(0,2)){
         const messages=delivered.filter(m=>m.details.eventId==='subagent:'+child.id+':completion:'+child.id+'-event');
         assert.equal(messages.length,1);assert.equal(messages[0].details.response,'original '+child.id);
@@ -198,7 +209,7 @@ test("durable observer preserves original settlements across reload gaps and rec
       runtime.latestCtx={...ctx,sessionManager:{...ctx.sessionManager,getBranch:()=>[]}};
       await observeSubagentCompletion(children[0],Promise.resolve({...output(children[0]),eventId:'foreign'}));
       await observeSubagentCompletion(children[0],Promise.reject(new Error('observer failure')));
-      assert.equal(delivered.length,3);
+      assert.equal(delivered.length,4);
       fresh.get('session_shutdown')({reason:'quit'},ctx);`);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

@@ -707,6 +707,13 @@ async function recoverParentRuntime(ctx: ExtensionContext): Promise<void> {
       if (settlement.running.durableStore !== store) continue;
       enqueueSubagentCompletion(settlement.running, settlement.result);
       runtime.suspendedCompletions!.delete(key);
+      // The suspended observer stopped before re-reading retained evidence.
+      // Resume only after the branch-verified enqueue committed its cursor.
+      if (settlement.result.keepOpen && settlement.running.abortController &&
+          !settlement.running.abortController.signal.aborted) {
+        void observeSubagentCompletion(settlement.running,
+          watchSubagent(settlement.running, settlement.running.abortController.signal));
+      }
     }
     runtime.stopRecovery?.();
     const stopRecovery = await reconcileRuntime(store, (run, evidence) => {
@@ -862,6 +869,9 @@ export function observeSubagentCompletion(
           result = { ...result, summary, sessionFile: resume.sessionPath };
         }
         enqueueSubagentCompletion(running, result);
+        // A retained event has not been committed while reload suspends custody.
+        // Reattaching now would immediately read it again and starve the loop.
+        if (runtime.suspendedCompletions?.has(`${running.id}:${result.eventId ?? "terminal"}`)) return;
         if (result.keepOpen && running.abortController && !running.abortController.signal.aborted) {
           return observeSubagentCompletion(running, watchSubagent(running, running.abortController.signal));
         }
