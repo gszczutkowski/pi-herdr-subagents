@@ -66,6 +66,23 @@ test("spawn and closed-session resume durably record intent before terminal disp
     } as any, "pi", "read"));
     const resumed = await tools.get("subagent_resume").execute("resume", { sessionPath: saved, message: "two" }, undefined, undefined, ctx);
     assert.equal(dispatches, 2);
+    // Both production paths consume the same durable-to-registry projection.
+    // Read from disk, not a helper fixture, to catch fields lost in either path.
+    const prepared = JSON.parse(fs.readFileSync(manifestFile, "utf8"));
+    for (const id of [spawned.details.id, resumed.details.id]) {
+      const registered = __test__.runningSubagents.get(id)!;
+      const durable = prepared.runs[id];
+      for (const key of ["id", "name", "task", "surface", "startTime", "sessionFile", "launchScriptFile", "cli", "sentinelFile", "planTask", "lineage"] as const) {
+        assert.deepEqual(key === "sessionFile" ? canonicalSessionPath(registered.sessionFile) : registered[key], durable[key], `${key} survives prepare/register for ${id}`);
+      }
+      assert.equal(registered.completionRunId, durable.id);
+      assert.equal(registered.activityFile, durable.activityFile);
+      assert.equal(registered.interactive, durable.profile.interactive);
+      assert.deepEqual(registered.runtimePlan, durable.profile.runtimePlan);
+      const profileOnDisk = JSON.parse(fs.readFileSync(`${durable.sessionFile}.launch-profile.json`, "utf8"));
+      assert.deepEqual(durable.profile, profileOnDisk, "one saved launch profile roundtrips through manifest");
+      assert.equal(durable.phase, "supervised");
+    }
     const child = __test__.runningSubagents.get(resumed.details.id)!;
     const events = `${runCompletionFile(saved, child.id)}.events`;
     fs.mkdirSync(events, { recursive: true });

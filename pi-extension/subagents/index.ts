@@ -8,6 +8,7 @@ import { randomUUID } from "node:crypto";
 import { resolveSubagentCwd } from "./paths.ts";
 import { persistLaunchProfile, persistProfileBinding, readPiLaunchProfile, resolveLaunchProfile, resumeLaunchContext } from "./launch-profile.ts";
 import { continueLiveChild } from "./live-continuation.ts";
+import { prepareLaunchRun, registerLaunchedRun } from "./launch-registration.ts";
 import { createLineage, type Lineage } from "./lineage.ts";
 import { recordHistory, registerPlanHistory } from "./history.ts";
 import { registerHistoryView } from "./history-view.ts";
@@ -1248,8 +1249,8 @@ async function launchSubagent(
     .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
 
-  store?.prepare({ id, planTask, name: params.name, task: params.task, startTime,
-    sessionFile: canonicalSessionPath(built.sessionFile ?? subagentSessionFile),
+  const preparedRun = prepareLaunchRun(store, { id, planTask, name: params.name, task: params.task, startTime,
+    sessionFile: built.sessionFile ?? subagentSessionFile,
     surface, cli: built.cli, activityFile, sentinelFile: built.sentinelFile,
     launchScriptFile, profile: launchContext.launchProfile, lineage });
   runScriptInPane(surface, built.command, {
@@ -1267,30 +1268,9 @@ async function launchSubagent(
 
   store?.phase(id, "supervised");
   recordHistory(lineage, id, "assignment", params.task, id, [subagentSessionFile, launchScriptFile]);
-  const running: RunningSubagent = {
-    planTask,
-    durableStore: store,
-    lineage,
-    id,
-    name: params.name,
-    task: params.task,
-    agent: params.agent,
-    surface,
-    startTime,
-    sessionFile: built.sessionFile ?? subagentSessionFile,
-    launchScriptFile,
-    cli: built.cli,
-    sentinelFile: built.sentinelFile,
-    completionRunId: id,
-    interactive: effectiveInteractive,
-    runtimePlan,
-    activityFile: driver.hasActivitySnapshots ? activityFile : undefined,
-    lifecycle: !driver.hasActivitySnapshots
-      ? markProcessRunning(createLifecycle(startTime), Date.now())
-      : createLifecycle(startTime),
-  };
-
-  runningSubagents.set(id, running);
+  const running = registerLaunchedRun(runningSubagents, store, preparedRun, {
+    agent: params.agent, hasActivitySnapshots: driver.hasActivitySnapshots, runtimePlan,
+  });
   return running;
   } catch (error) {
     try { recordDispatchFailure(runtime.plans!, runtime.latestCtx ?? ctx as ExtensionContext, planTask, id, error,
@@ -2051,7 +2031,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               lineage: child.lineage, requestId: result.requestId, status: result.status === "accepted" ? "continued" : "pending" },
           };
         }
-        const interactive = profile.interactive;
         const startTime = Date.now();
         const id = randomUUID();
 
@@ -2109,7 +2088,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             .replace(/-+/g, "-")
             .replace(/^-|-$/g, "") || "resume"}-resume-${id}.sh`,
         );
-        store?.prepare({ id, planTask, name, task: params.message ?? "resumed session", startTime,
+        const preparedRun = prepareLaunchRun(store, { id, planTask, name, task: params.message ?? "resumed session", startTime,
           sessionFile: params.sessionPath, surface, cli: "pi", activityFile,
           launchScriptFile, profile: resumeProfile, lineage: resumeProfile.lineage, entryCountBefore });
         runScriptInPane(surface, built.command, {
@@ -2125,25 +2104,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         store?.phase(id, "supervised");
         recordHistory(profile.lineage, id, "continuation", `Parent closed-session resume: ${params.message ?? ""}`,
           id, [params.sessionPath, launchScriptFile]);
-        const running: RunningSubagent = {
-          planTask,
-          durableStore: store,
-          id,
-          name,
-          task: params.message ?? "resumed session",
-          surface,
-          startTime,
-          sessionFile: params.sessionPath,
-          launchScriptFile,
-          activityFile,
-          interactive,
-          agent: profile.role ?? undefined, lineage: profile.lineage,
-          cli: "pi",
-          runtimePlan: profile.runtimePlan,
-          completionRunId: id,
-          lifecycle: createLifecycle(startTime),
-        };
-        runningSubagents.set(id, running);
+        const running: RunningSubagent = registerLaunchedRun(runningSubagents, store, preparedRun, {
+          agent: profile.role ?? undefined, hasActivitySnapshots: true,
+        });
         startWidgetRefresh();
         startStatusRefresh(pi);
 

@@ -288,7 +288,9 @@ Trzy odrębne modele:
 - [x] Wydzielać discovery, uruchamianie, dostarczanie i UI z `index.ts` przy okazji realizacji zmian, bez jednorazowego przepisywania całości.
 
 Weryfikacja: `discovery.ts` przejmuje typy, parser, name-keyed discovery i katalog, z zachowaniem aliasów `__test__`, call-time cwd/config, CRLF i local override. Istniejące moduły launch/delivery/UI pozostają oddzielne; granice opisuje `ARCHITECTURE.md`. `node --test test/discovery.test.ts test/test.ts`: 185/185, bez skip; bez live herdr.
-- [ ] Współdzielić ścieżki spawn i resume oraz definicję manifestu uruchomienia.
+- [x] Współdzielić ścieżki spawn i resume oraz definicję manifestu uruchomienia.
+
+Weryfikacja: wspólne `prepareLaunchRun`/`registerLaunchedRun` w obu produkcyjnych ścieżkach, typ wejścia wyprowadzony z istniejącego `DurableRun`, jeden RuntimeStore i zapisany LaunchProfile. Regresja execute porównuje pola rejestru z manifestem na dysku i profilami spawn/closed resume; dotychczasowe ownership/continuation dowodzą zachowania run/pane/watchera przy interrupt. Focused runtime-execute/ownership/profile/continuation/keep-open: 31/31, zero skip; lint exit 0. Bez nowego engine ani live herdr.
 - [ ] Określić jedno miejsce zatwierdzania zmian zadania; dzieci zgłaszają wyniki zamiast niezależnie nadpisywać wspólny stan.
 - [ ] Użyć natywnych mechanizmów Pi do widgetów i zapisów sesji tam, gdzie wystarczą; trwały transport wyników traktować oddzielnie od prezentacji.
 
