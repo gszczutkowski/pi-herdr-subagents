@@ -4,6 +4,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { PlanPersistence } from "./plan-persistence.ts";
 import { attachRun, recordResult, type Authority, type ResultReference } from "./plan-store.ts";
 import type { DeliveryEnvelope } from "./delivery.ts";
+import type { RuntimeStore, DurableRun } from "./runtime-store.ts";
 
 const id = () => Type.String({ minLength: 1, maxLength: 8192 });
 export const PlanTaskParams = Type.Object({
@@ -65,9 +66,20 @@ export function importPlanEnvelope(persistence: PlanPersistence, ctx: ExtensionC
 }
 
 export function recordDispatchFailure(persistence: PlanPersistence, ctx: ExtensionContext,
-  binding: PlanTaskBinding | undefined, runId: string, error: unknown, dispatchId = "launch"): void {
+  binding: PlanTaskBinding | undefined, runId: string, error: unknown,
+  runtime: RuntimeStore | undefined, run: Omit<DurableRun, "phase" | "eventCursor">, dispatched = false): void {
   if (!binding) return;
-  importPlanEnvelope(persistence, ctx, binding, runId, { message: { customType: "subagent_result", display: true,
-    content: String(error), details: { eventId: `subagent:${runId}:dispatch-failure:${dispatchId}`, error: `Dispatch failed/uncertain: ${String(error)}` } },
-    options: { triggerTurn: true, deliverAs: "steer" } });
+  const reason = `${dispatched ? "Dispatch uncertain; reconcile existing process" : "Dispatch failed before send"}: ${String(error)}`;
+  const envelope: DeliveryEnvelope = { message: { customType: dispatched ? "subagent_ping" : "subagent_result", display: true,
+    content: reason, details: { eventId: `subagent:${runId}:dispatch-failure:launch`,
+      ...(dispatched ? { message: reason } : { error: reason }) } },
+    options: { triggerTurn: true, deliverAs: "steer" } };
+  try {
+    if (!runtime) throw new Error("No durable runtime custody");
+    runtime.recordDispatchFailure({ ...run, planTask: binding }, envelope);
+  } catch (persistError) {
+    throw new Error(`Failure evidence NOT persisted; explicit reconciliation required: ${String(persistError)}`);
+  }
+  // The immutable outbox is already committed, including original authority.
+  importPlanEnvelope(persistence, ctx, binding, runId, envelope);
 }

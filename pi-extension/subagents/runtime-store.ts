@@ -213,6 +213,24 @@ export class RuntimeStore {
     this.commit(next);
   }
 
+  /** Failure evidence is retained under original writer custody even while the
+   * parent has navigated away. It is import-only, not a notification/relaunch. */
+  recordDispatchFailure(run: Omit<DurableRun, "phase" | "eventCursor">, envelope: DeliveryEnvelope): void {
+    const next = this.snapshot();
+    const id = String((envelope.message.details as any).eventId);
+    const existing = next.runs[run.id];
+    if (existing && JSON.stringify(existing.planTask) !== JSON.stringify(run.planTask)) throw new Error("Run binding conflict");
+    if (next.outbox[id]) {
+      if (JSON.stringify(next.outbox[id].envelope) !== JSON.stringify(envelope)) throw new Error("Immutable event conflict");
+      return;
+    }
+    next.runs[run.id] ??= { ...structuredClone(run), phase: "prepared", eventCursor: [] };
+    next.runs[run.id].eventCursor.push(id);
+    next.runs[run.id].reconciliation = "Dispatch ended with failure/uncertainty; never automatically relaunch";
+    next.outbox[id] = { runId: run.id, envelope: structuredClone(envelope), status: "handedOff" };
+    this.commit(next, false);
+  }
+
   delivery(id: string, status: DurableEvent["status"]): void {
     const next = this.snapshot();
     if (!next.outbox[id]) throw new Error("Unrecorded delivery");

@@ -1429,8 +1429,15 @@ async function launchSubagent(
   runningSubagents.set(id, running);
   return running;
   } catch (error) {
-    try { recordDispatchFailure(runtime.plans!, runtime.latestCtx ?? ctx as ExtensionContext, planTask, id, error); }
-    catch (importError) { (runtime.planImportErrors ??= new Map()).set(id, `Dispatch failed/uncertain; task import pending: ${String(importError)}`); }
+    try { recordDispatchFailure(runtime.plans!, runtime.latestCtx ?? ctx as ExtensionContext, planTask, id, error,
+      store, { id, sessionFile: subagentSessionFile, name: params.name, task: params.task, startTime }, owner.dispatched); }
+    catch (importError) {
+      (runtime.planImportErrors ??= new Map()).set(id, `Dispatch failed/uncertain; task import pending: ${String(importError)}`);
+      if (String(importError).includes("NOT persisted")) {
+        runtime.recoveryError = String(importError);
+        if (error instanceof Error) error.message += `; ${String(importError)}`;
+      }
+    }
     if (!owner.dispatched) {
       releaseSession(subagentSessionFile, id);
       if (owner.surface && !options?.surface) {
@@ -2152,12 +2159,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             child.durableStore?.assertCustody();
             // Validate after async inspection, immediately before dispatch.
             child.planTask = bindPlanRun(runtime.plans!, ctx, child.id, params.planTask, child.planTask);
-              if (child.planTask) {
-                if (!child.durableStore) throw new Error("Task-bound continuation requires durable custody");
-                child.durableStore.bindRun(child.id, child.planTask);
-                persistProfileBinding(child.sessionFile, child.planTask);
-              }
-              if (liveOwner.continuationRequestId) child.durableStore?.continuation(child.id, liveOwner.continuationRequestId);
+            if (child.planTask) {
+              if (!child.durableStore) throw new Error("Task-bound continuation requires durable custody");
+              child.durableStore.bindRun(child.id, child.planTask);
+              persistProfileBinding(child.sessionFile, child.planTask);
+            }
+            if (liveOwner.continuationRequestId) child.durableStore?.continuation(child.id, liveOwner.continuationRequestId);
           }, send: (surface, command) => {
             // A live bridge rejection/uncertain send cannot certify that the
             // existing healthy process or its task attempt failed.
@@ -2280,8 +2287,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           },
         };
         } catch (error) {
-          try { recordDispatchFailure(runtime.plans!, ctx, planTask, id, error); }
-          catch (importError) { runtime.planImportErrors!.set(id, `Dispatch failed/uncertain; task import pending: ${String(importError)}`); }
+          try { recordDispatchFailure(runtime.plans!, ctx, planTask, id, error,
+            store, { id, sessionFile: params.sessionPath, name, task: params.message ?? "resumed session", startTime }, owner.dispatched); }
+          catch (importError) {
+            runtime.planImportErrors!.set(id, `Dispatch failed/uncertain; task import pending: ${String(importError)}`);
+            if (String(importError).includes("NOT persisted")) {
+              runtime.recoveryError = String(importError);
+              if (error instanceof Error) error.message += `; ${String(importError)}`;
+            }
+          }
           if (!owner.dispatched) {
             releaseSession(params.sessionPath, id);
             if (owner.surface) {

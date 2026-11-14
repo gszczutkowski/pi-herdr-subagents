@@ -22,7 +22,15 @@ test("registered task-bound spawn, live/closed resume, failure isolation and res
   const savedEnv = { ...process.env };
   const originalExec = childProcess.execFile;
   let serial = 0; let dispatches = 0; let failAppend = false; let failSend = false;
-  let liveSends = 0;
+  let liveSends = 0; let failPrepare = false;
+  const originalWrite = fs.writeFileSync;
+  mock.method(fs, "writeFileSync", (path: any, ...args: any[]) => {
+    if (failPrepare && String(path).endsWith(".sh")) {
+      failPrepare = false; failAppend = true;
+      throw new Error("preparation failed");
+    }
+    return (originalWrite as any)(path, ...args);
+  });
   const sm = SessionManager.create(dir, dir);
   sm.appendMessage({ role: "user", content: "Start", timestamp: Date.now() });
   const tools = new Map<string, any>(); const events = new Map<string, any[]>();
@@ -40,7 +48,7 @@ test("registered task-bound spawn, live/closed resume, failure isolation and res
       assert.ok(run.planTask);
       assert.ok(read().tasks[0].attempts.some(a => a.runIds.includes(run.id)), "native append precedes dispatch");
       assert.equal(run.phase, "dispatch-intent");
-      if (failSend) throw new Error("ambiguous transport");
+      if (failSend) { failAppend = true; throw new Error("ambiguous transport"); }
     }
     if (continuationChild && args.some(a => a.includes("/_subagent_continue"))) {
       liveSends++;
@@ -217,10 +225,25 @@ test("registered task-bound spawn, live/closed resume, failure isolation and res
     await assert.rejects(execute("subagent", { name: "No append", task: "three", cwd: dir, planTask: selection() }), /append failed/);
     assert.equal(dispatches, 2);
     p.reconcile(sm);
-    failSend = true;
-    await assert.rejects(execute("subagent", { name: "Send fails", task: "four", cwd: dir, planTask: selection() }), /ambiguous transport/);
+    failPrepare = true;
+    await assert.rejects(execute("subagent", { name: "Preparation fails", task: "four", cwd: dir, planTask: selection() }), /preparation failed/);
+    assert.equal(read().tasks[0].status, "in_progress", "failed append leaves task import pending");
+    assert.equal(dispatches, 2);
+    p.reconcile(sm);
+    await emit("context", { messages: [] });
     assert.equal(read().tasks[0].status, "failed");
-    assert.match(read().tasks[0].statusReason, /Dispatch failed\/uncertain/);
+    assert.match(read().tasks[0].statusReason, /before send/);
+    const failureRevision = read().revision;
+    await emit("context", { messages: [] });
+    assert.equal(read().revision, failureRevision);
+    mutate((p: any, c: any) => store.retry(p, c, p.tasks[0].taskId));
+    failSend = true;
+    await assert.rejects(execute("subagent", { name: "Send fails", task: "five", cwd: dir, planTask: selection() }), /ambiguous transport/);
+    assert.equal(read().tasks[0].status, "in_progress");
+    p.reconcile(sm);
+    await emit("context", { messages: [] });
+    assert.equal(read().tasks[0].status, "blocked", "ambiguous send cannot certify process failure");
+    assert.match(read().tasks[0].statusReason, /Dispatch uncertain/);
   } finally {
     for (const child of children) { child.lifecycle.delivery = "suppressed"; child.abortController?.abort(); releaseSession(child.sessionFile, child.id); }
     await emit("session_shutdown", { reason: "quit" });
