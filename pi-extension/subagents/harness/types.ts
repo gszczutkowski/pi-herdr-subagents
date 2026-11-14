@@ -1,6 +1,9 @@
 import type { ResolvedRuntimePlan, ThinkingLevel } from "../runtime-routing.ts";
 import type { CompletionResult } from "../completion.ts";
 
+/** standalone: fresh context; lineage-only: parent link without messages; fork: seeded Pi history. */
+export type HarnessSessionMode = "standalone" | "lineage-only" | "fork";
+
 export interface SubagentLaunchParams {
   id: string;
   name: string;
@@ -101,6 +104,12 @@ export interface HarnessDriver {
 
   /** Human-readable display name (e.g. "Claude Code", "OpenCode", "Codex", "Grok", "Pi") */
   readonly name: string;
+
+  /** Session transfer modes actually consumed by the generated command. Missing means standalone only. */
+  readonly supportedSessionModes?: readonly HarnessSessionMode[];
+
+  /** Whether resumeSessionId is forwarded to this harness's native resume command. */
+  readonly supportsNativeResume?: boolean;
 
   /** Format the model reference for this CLI */
   formatModel(runtimePlan: Pick<ResolvedRuntimePlan, "model" | "modelId" | "provider">): string;

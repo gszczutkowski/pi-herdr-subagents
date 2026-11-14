@@ -36,6 +36,8 @@ export class ClaudeHarnessDriver implements HarnessDriver {
   readonly name = "Claude Code";
   readonly hasActivitySnapshots = false;
   readonly supportsTurnInterrupt = false;
+  readonly supportedSessionModes = ["standalone"] as const;
+  readonly supportsNativeResume = true;
 
   formatModel(runtimePlan: Pick<ResolvedRuntimePlan, "model" | "modelId" | "provider">): string {
     return runtimePlan.modelId;

@@ -13,6 +13,8 @@ export class GrokHarnessDriver implements HarnessDriver {
   readonly name = "Grok";
   readonly hasActivitySnapshots = false;
   readonly supportsTurnInterrupt = false;
+  readonly supportedSessionModes = ["standalone"] as const;
+  readonly supportsNativeResume = false;
 
   formatModel(runtimePlan: Pick<ResolvedRuntimePlan, "model" | "modelId" | "provider">): string {
     return runtimePlan.modelId;

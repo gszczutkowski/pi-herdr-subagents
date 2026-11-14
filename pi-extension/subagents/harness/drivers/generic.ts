@@ -13,6 +13,8 @@ export class GenericHarnessDriver implements HarnessDriver {
   readonly name: string;
   readonly hasActivitySnapshots = false;
   readonly supportsTurnInterrupt = false;
+  readonly supportedSessionModes = ["standalone"] as const;
+  readonly supportsNativeResume = false;
 
   constructor(cliId = "generic", displayName?: string) {
     this.id = cliId;

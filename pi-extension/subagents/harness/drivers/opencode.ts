@@ -13,6 +13,8 @@ export class OpenCodeHarnessDriver implements HarnessDriver {
   readonly name = "OpenCode";
   readonly hasActivitySnapshots = false;
   readonly supportsTurnInterrupt = false;
+  readonly supportedSessionModes = ["standalone"] as const;
+  readonly supportsNativeResume = true;
 
   formatModel(runtimePlan: Pick<ResolvedRuntimePlan, "model" | "modelId" | "provider">): string {
     return runtimePlan.model;

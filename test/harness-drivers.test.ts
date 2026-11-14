@@ -112,6 +112,17 @@ describe("Harness Drivers Registry", () => {
   });
 });
 
+describe("declared harness capabilities", () => {
+  it("limits Pi session transfer to Pi and native resume to commands that forward it", () => {
+    for (const cli of ["pi", "claude", "codex", "opencode", "grok", "aider"]) {
+      const driver = getHarnessDriver(cli);
+      assert.deepEqual(driver.supportedSessionModes, cli === "pi"
+        ? ["standalone", "lineage-only", "fork"] : ["standalone"]);
+      assert.equal(driver.supportsNativeResume, ["claude", "opencode"].includes(cli));
+    }
+  });
+});
+
 describe("Pi Harness Driver", () => {
   const driver = new PiHarnessDriver();
 

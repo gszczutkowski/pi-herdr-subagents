@@ -100,7 +100,7 @@ Problem: terminal zostaje otwarty, ale obserwacja kończy się i wpis znika. Kol
 
 ### R6. Jawne możliwości harnessów
 
-- [ ] Dodać deklarację obsługi fork i innych operacji wymagających konkretnego harnessu.
+- [x] Dodać deklarację obsługi fork i innych operacji wymagających konkretnego harnessu.
 - [ ] Odrzucać nieobsługiwane kombinacje przed utworzeniem terminala.
 - [ ] Dodać testy zgodności obietnicy dziedziczenia kontekstu z faktyczną komendą uruchomienia.
 
