@@ -128,7 +128,9 @@ Weryfikacja: `readPaneAsync`/`inspectPane` wykonują świeże asynchroniczne zap
 
 ### Model
 
-- [ ] Wprowadzić stabilne identyfikatory `planId`, `taskId`, `runId`.
+- [x] Wprowadzić stabilne identyfikatory `planId`, `taskId`, `runId`.
+
+Weryfikacja: `plan-store.ts` tworzy UUID planu/zadania, referencjonuje istniejący runtime runId, wersjonuje i zamraża snapshot. `test/plan-store.test.ts`: tożsamość niezależna od tytułów, roundtrip, autorytet i rewizje. Bez integracji runtime/persistence/UI.
 - [ ] Oddzielić zadanie od prób jego realizacji; resume i retry nie tworzą nowego zadania.
 - [ ] Przechowywać tytuł, zakres, kryteria akceptacji, zależności, właściciela, powiązane uruchomienia, artefakty i dowody.
 - [ ] Rozróżniać stany: oczekuje, realizowane, zablokowane, do weryfikacji, zaakceptowane, nieudane oraz pominięte/anulowane.
