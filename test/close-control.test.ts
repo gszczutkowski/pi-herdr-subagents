@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { closeDir, closeOwnedChild, registerCloseControl, CLOSE_CAPABILITY } from "../pi-extension/subagents/close-control.ts";
 import { canonicalSessionPath } from "../pi-extension/subagents/ownership.ts";
+import { continueLiveChild, continuationDir, CONTINUATION_TRANSPORT } from "../pi-extension/subagents/live-continuation.ts";
 import { runCompletionFile } from "../pi-extension/subagents/run-artifacts.ts";
 import { isProtectedProcess, probeProcess } from "../pi-extension/subagents/process-identity.ts";
 import { auditSession, enumerateProcesses } from "../pi-extension/subagents/session-audit.ts";
@@ -69,6 +70,65 @@ test("acknowledgement without actual exit stays pending; repeated/reloaded reque
     assert.equal(unknown.status, "uncertain");
     assert.equal(f.owner.closeRequestId, id);
   } finally { f.cleanup(); }
+});
+
+test("definite rejection unlocks only its request, preserves immutable history and permits continuation/new close after reload", async () => {
+  for (const reason of ["busy race", "draft typed after idle"]) {
+    const f = fixture();
+    try {
+      const first = await closeOwnedChild(f.owner, f.child, f.transport);
+      const id = first.requestId!;
+      const intent = read(join(f.control, "intent.json"));
+      const ack = { ...f.identity, capability: CLOSE_CAPABILITY, idleToken: intent.idleToken,
+        requestId: id, status: "rejected", dispatched: false, reason };
+      put(join(f.control, `${id}.ack.json`), ack);
+      const bytes = readFileSync(join(f.control, `${id}.ack.json`), "utf8");
+      const reloadedOwner: any = { runId: "run", dispatched: true, closeRequestId: id };
+      assert.equal((await closeOwnedChild(reloadedOwner, f.child, f.transport)).status, "rejected");
+      assert.equal(reloadedOwner.closeRequestId, undefined);
+      assert.equal(existsSync(join(f.control, "intent.json")), false);
+      assert.equal(reloadedOwner.runId, "run", "process ownership is not released");
+      assert.equal(readFileSync(join(f.control, `${id}.ack.json`), "utf8"), bytes);
+      assert.ok(existsSync(join(f.control, `${id}.request.json`)));
+      // Exercise the actual continuation reservation guard, not just its flag.
+      const dir = continuationDir(f.child.activityFile); mkdirSync(dir);
+      put(join(dir, "state.json"), { runId: "run", sessionFile: f.child.sessionFile,
+        transport: CONTINUATION_TRANSPORT, state: "settled-idle", idleToken: randomUUID() });
+      const live: any = { ...f.child, name: "child", surface: "owned", hasTurnResult: true,
+        lifecycle: { process: { kind: "running" }, turn: { kind: "waiting" } } };
+      const continuation = await continueLiveChild(reloadedOwner, live, { message: "resume after rejection" }, {
+        inspect: async () => ({ kind: "present", agentStatus: "idle" } as any), timeoutMs: 0 });
+      assert.equal(continuation.status, "pending", "continuation publication is no longer locked by rejected close");
+      assert.ok(existsSync(join(dir, `${continuation.requestId}.request.json`)));
+      // A later accepted continuation would clear this independent reservation.
+      delete reloadedOwner.continuationRequestId;
+      const token = randomUUID();
+      put(join(f.control, `${token}.idle.json`), { ...f.identity, capability: CLOSE_CAPABILITY, idleToken: token });
+      put(join(f.control, "current.json"), { file: `${token}.idle.json` });
+      const fresh = await closeOwnedChild(reloadedOwner, f.child, f.transport);
+      assert.notEqual(fresh.requestId, id); assert.equal(fresh.status, "pending");
+      assert.equal(readFileSync(join(f.control, `${id}.ack.json`), "utf8"), bytes);
+      assert.equal((await closeOwnedChild(reloadedOwner, f.child, f.transport)).requestId, fresh.requestId);
+      assert.equal(readdirSync(f.control).filter(name => name.endsWith(".request.json")).length, 2);
+    } finally { f.cleanup(); }
+  }
+});
+
+test("wrong/ambiguous rejection records and durable claims never unlock or replay CLOSE", async () => {
+  for (const extra of [{ process: { pid: 123, birth: "wrong" } }, { nonce: "wrong" }, { runId: "wrong" },
+    { requestId: randomUUID() }, { headerId: "wrong" }, { idleToken: randomUUID() }, { dispatched: undefined }, { status: "requested" }, { claim: true }]) {
+    const f = fixture();
+    try {
+      const first = await closeOwnedChild(f.owner, f.child, f.transport);
+      const id = first.requestId!; const intent = read(join(f.control, "intent.json"));
+      put(join(f.control, `${id}.ack.json`), { ...f.identity, capability: CLOSE_CAPABILITY, idleToken: intent.idleToken,
+        requestId: id, status: "rejected", dispatched: false, ...extra });
+      if ("claim" in extra) put(join(f.control, `${id}.claim.json`), { requestId: id });
+      assert.equal((await closeOwnedChild(f.owner, f.child, f.transport)).status, "pending");
+      assert.equal(f.owner.closeRequestId, id); assert.ok(existsSync(join(f.control, "intent.json")));
+      assert.equal(readdirSync(f.control).filter(name => name.endsWith(".request.json")).length, 1);
+    } finally { f.cleanup(); }
+  }
 });
 
 test("PID reuse proves only original gone; remaining duplicate writers are not reported as whole-session closure", async () => {

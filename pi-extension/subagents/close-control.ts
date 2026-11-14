@@ -18,7 +18,8 @@ function publish(file: string, value: unknown): void {
   try { linkSync(temp, file); } finally { rmSync(temp, { force: true }); }
 }
 function matches(a: any, b: any): boolean {
-  return !!a && !!b && a.runId === b.runId && a.sessionFile === b.sessionFile && a.nonce === b.nonce &&
+  return !!a && !!b && a.schema === b.schema && a.headerId === b.headerId &&
+    a.runId === b.runId && a.sessionFile === b.sessionFile && a.nonce === b.nonce &&
     !!a.process && !!b.process && sameProcess(a.process, b.process);
 }
 
@@ -63,7 +64,8 @@ export function registerCloseControl(pi: ExtensionAPI): void {
         canonicalSessionPath(ctx.sessionManager.getSessionFile() ?? "") === identity!.sessionFile &&
         ctx.sessionManager.getHeader()?.id === identity!.headerId;
       if (!valid || !idleToken || request.idleToken !== idleToken || !ctx.isIdle() || ctx.hasPendingMessages() || !editorSafe(ctx)) {
-        publish(ack, { runId, requestId, status: "rejected", reason: valid ? "Child is busy, has a draft/unverifiable editor, or idle proof expired" : "Wrong run/session/process identity" });
+        publish(ack, { ...identity, capability: CLOSE_CAPABILITY, idleToken: request?.idleToken,
+          runId, requestId, status: "rejected", dispatched: false, reason: valid ? "Child is busy, has a draft/unverifiable editor, or idle proof expired" : "Wrong run/session/process identity" });
         return;
       }
       publish(claim, { runId, requestId, status: "requested" });
@@ -170,7 +172,16 @@ export async function closeOwnedChild(owner: SessionOwner, child: CloseChild, tr
     const absent = gone();
     if (absent === true) return closed();
     const ack = read(join(dir, `${intent.requestId}.ack.json`));
-    if (ack?.requestId === intent.requestId && ack.runId === child.id && ack.status === "rejected") {
+    if (ack?.requestId === intent.requestId && matches(ack, identity) && ack.capability === CLOSE_CAPABILITY &&
+        ack.idleToken === intent.idleToken && ack.status === "rejected" && ack.dispatched === false &&
+        !existsSync(join(dir, `${intent.requestId}.claim.json`))) {
+      // Only a run/process/token-bound definite NON-dispatch releases this
+      // request reservation. Keep immutable requests/acks as replay history.
+      const current = read(join(dir, "intent.json"));
+      if (matches(current, identity) && current.requestId === intent.requestId && current.idleToken === intent.idleToken) {
+        rmSync(join(dir, "intent.json"));
+      }
+      if (owner.closeRequestId === intent.requestId) delete owner.closeRequestId;
       return { status: "rejected", requestId: intent.requestId, process: identity.process, reason: typeof ack.reason === "string" ? ack.reason.slice(0, 256) : "Child rejected shutdown." };
     }
     if (absent === undefined) return { status: "uncertain", requestId: intent.requestId, process: identity.process, reason: "Process probe unavailable; ownership retained." };
