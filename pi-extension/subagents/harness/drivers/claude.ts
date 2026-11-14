@@ -1,5 +1,5 @@
 import { copyFileSync, existsSync, mkdirSync, readFileSync, unlinkSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import type {
   HarnessDriver,
   SubagentLaunchContext,
@@ -22,7 +22,7 @@ function copyClaudeSession(sentinelFile: string): string | null {
     const transcriptPath = readFileSync(transcriptFile, "utf-8").trim();
     if (!transcriptPath || !existsSync(transcriptPath)) return null;
     mkdirSync(CLAUDE_SESSIONS_DIR, { recursive: true });
-    const filename = transcriptPath.split("/").pop() ?? `claude-${Date.now()}.jsonl`;
+    const filename = basename(transcriptPath);
     const dest = join(CLAUDE_SESSIONS_DIR, filename);
     copyFileSync(transcriptPath, dest);
     return filename;
