@@ -7,7 +7,27 @@ description: Load when proving pi-herdr-subagents behavior through real Pi termi
 
 Read [features/README.md](features/README.md), then the relevant feature recipe. The primary surface is the Pi TUI: tools, slash commands, child tabs, and async completion messages. Unit-testable modules are secondary; there is no web server, port, database, migration, or seed service.
 
-## Launch
+## HC TUI journeys (opt-in authenticated model requests)
+
+When `HC_TERMINAL_ID` and `HC_TERMINAL_SOCKET` are present but legacy `herdr`/`HERDR_ENV` are absent, **do not** claim the legacy helper passed. Use:
+
+```bash
+PI_TEST_HC_TUI=1 node --test --test-concurrency=1 test/integration/hc-tui.test.ts > "$TEMP/hc-tui.log" 2>&1
+```
+
+This is separate from `PI_TEST_HC_LIVE=1 node --test test/hc-live.test.ts`, which starts no model and proves terminal transport only. Normal `npm test` does not run either opt-in live journey. A skipped test is not live evidence.
+
+`hc send` adds `<hc>` provenance tags around messages; the harness uses literal `hc keys` for `/reload` so it runs Pi's slash command rather than sending a tagged model prompt. Production continuation commands still go through production transport and must pass on their own; the test does not bypass or repair that path.
+
+The HC harness uses production `HcClient` and terminal script dispatch, `hc run --bg --no-notify`, exact owned terminal IDs, a unique empty scratch project and seeded `verify-worker` (auto-exit) / `verify-open` (non-auto-exit for interruption and collaboration). It never focuses or sends input to the current user's terminal. A scratch PATH wrapper applies `-ne` plus a test-only observer to both parent and child; the parent explicitly loads this worktree's `index.ts`, and the production child command explicitly loads its `subagent-done.ts`. This avoids duplicate global registration without copying credentials or changing global settings. Existing authentication remains in its original agent directory. The observer records actual TUI lifecycle/tool events; it never calls orchestration tools or supplies model responses.
+
+Default model is exact `openai-codex/gpt-6.1-sol`; override only with an exact authenticated `PI_TEST_MODEL`. The parent requests `--thinking off`; this model clamps it to minimal and production child routing rejects explicit off, so the seed uses supported minimal. Readiness requires an exact generated assistant token and observed `mode: tui`, not an open shell. Provider/startup failures block the journey.
+
+Four independent lifecycle tests require overlapping child bash gates, distinct run/session IDs, completion inside the actual reload shutdown/start interval, two parent results, closed-session resume history, same-process live continuation after aborted settlement, and two keep-open results with distinct event IDs. Each gets a fresh parent so one failed journey does not conceal the others. The observer deliberately holds the real reload shutdown interval open for 20 seconds; this proves delivery across an instrumented reload window, not a natural timing frequency claim. The restart test kills only the recorded parent Pi PID, verifies OS death before starting the same saved session, requires fresh-generation verified-live artifact-only recovery, no child relaunch, disabled recovered controls, and two retained results. No exactly-once or terminal-adoption claim is made.
+
+Run final acceptance from MAIN in the repository root so private artifacts live under root `.git/verification/`, not disposable `.git/worktrees/<name>/verification/`. Preserve earlier worktree evidence there before removing a worktree. Each run records entrypoint and core source hashes/commit/model/versions, launch scripts, timestamped actions, real parent/child sessions, observer events, terminal text captures, marker copies, assertions and cleanup. Text captures are not image screenshots or proof of colors/layout. Always inspect `assertions.json` and `cleanup.json`; a log saying a test ran is not a pass. All recorded owned terminals are closed on success or failure; scratch is retained on failure for diagnostics. Evidence may contain local paths, prompts and model output: never upload it or include credentials. A test constructor/preflight error before terminal creation can have only partial evidence.
+
+## Launch (legacy herdr helper)
 
 From the repository root, inside herdr:
 

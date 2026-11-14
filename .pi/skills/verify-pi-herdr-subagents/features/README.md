@@ -2,7 +2,11 @@
 
 Read this index before choosing a journey. This is the maintained source for user-facing verification, not a claim that all listed paths have passed.
 
-## Baseline preconditions
+## HC backend
+
+With `HC_TERMINAL_ID` + `HC_TERMINAL_SOCKET`, use the explicit opt-in real TUI journeys in `../SKILL.md` and `test/integration/hc-tui.test.ts`. The legacy helper and workspace/pane commands below are not HC-compatible. Read `test/integration/HC-TUI-VERIFICATION.md` for actual results and blockers; terminal transport smoke alone is not lifecycle proof.
+
+## Baseline preconditions (legacy herdr)
 
 - Follow `../SKILL.md`: Node 24+, installed dependencies, real Pi and herdr, authenticated model.
 - Launch a fresh owned workspace with `$CONTROL launch "$EVIDENCE"`. `$CONTROL` and `$EVIDENCE` are exported by the skill.

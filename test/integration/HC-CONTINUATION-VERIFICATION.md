@@ -1,5 +1,7 @@
 # Live HC continuation corrections — 2026-11-14
 
+Historical correction-stage report. Subsequent complete final-MAIN acceptance evidence, including preserved failed attempts and teardown limits, is in [HC-TUI-VERIFICATION.md](HC-TUI-VERIFICATION.md). The coverage limits below describe this earlier two-journey run, not current unresolved HC continuation blockers.
+
 ## Result
 
 Both relevant **actual authenticated HC Pi TUI journeys passed on MAIN** after the corrections:

@@ -220,7 +220,8 @@ export class HcTuiRun {
     const allMissing = cleanup.filter(x => x.terminal).every(x => x.inspection?.kind === "missing");
     this.save("cleanup.json", { at: Date.now(), allMissing, terminals: cleanup });
     // Retain scratch on failure: gate files and launch inputs are diagnostic evidence.
-    if (!error && allMissing) rmSync(this.scratch, { recursive: true, force: true });
+    // Windows may retain directory handles briefly after HC reports terminal removal.
+    if (!error && allMissing) rmSync(this.scratch, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
     assert.ok(allMissing, "All owned HC terminals must be removed");
   }
   parentPid() {
