@@ -272,6 +272,8 @@ function parseSessionMode(value: string | undefined): SubagentSessionMode | unde
 }
 
 function parseAgentDefinition(content: string, fallbackName: string): AgentDefinition | null {
+  // Git checkouts and Windows editors may use CRLF, including mixed line endings.
+  content = content.replace(/\r\n/g, "\n");
   const match = content.match(/^---\n([\s\S]*?)\n---/);
   if (!match) return null;
 
