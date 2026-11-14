@@ -52,7 +52,7 @@ Spend ~30 seconds. Tech stack, project shape, and the area relevant to the user'
 
 ## Artifact Paths
 
-For a planning run, pick a short `<name>` (e.g. `auth-redesign`) and use a shared directory under `.pi/plans/YYYY-MM-DD-<name>/` for every deliverable. Pass explicit paths in each subagent's task and read them back with the plain `read` tool when a subagent finishes.
+For a planning run, pick a short `<name>` (e.g. `auth-redesign`) and use a shared directory under `.pi/plans/YYYY-MM-DD-<name>/` for every deliverable. Pass explicit paths in each subagent's task. For read-only scout/reviewer roles, save their final response at the assigned path using the parent's `write` tool, then confirm the file exists with `read`. Roles with `write` may save their own assigned artifacts. Never ask a read-only role to bypass its tool policy through bash.
 
 Standard filenames:
 
@@ -72,11 +72,11 @@ subagent({
   agent: "scout",
   task: `Analyze the codebase for [user's request area]. Map file structure, key modules, patterns, conventions, and existing code related to [feature area]. Focus on what a planner would need to understand before designing this feature.
 
-Save your findings to: .pi/plans/YYYY-MM-DD-<name>/scout-context.md`,
+Return findings in your final response; I will save them to: .pi/plans/YYYY-MM-DD-<name>/scout-context.md`,
 });
 ```
 
-**Wait for the scout to finish.** Read the scout's context file with the `read` tool — you'll pass it to the planner.
+**Wait for the scout to finish.** Save its final findings to the assigned context path with `write`, then verify the file with `read` before passing it to the planner.
 
 The planner can spawn **additional** scouts or researchers mid-session if it hits a factual gap. That's expected — don't try to pre-scout every possible area.
 
@@ -176,11 +176,11 @@ subagent({
   name: "Reviewer",
   agent: "reviewer",
   interactive: false,
-  task: "Review the recent changes. Plan: [plan path]",
+  task: "Review the recent changes. Plan: [plan path]. Return the review in your final response; I will save it to [review path]. Do not modify code or write files.",
 });
 ```
 
-Triage findings:
+Save the review response to the assigned review path with `write` and verify it with `read`. Triage findings:
 
 - **P0** — Real bugs, security issues → fix now
 - **P1** — Genuine traps, maintenance dangers → fix before merging

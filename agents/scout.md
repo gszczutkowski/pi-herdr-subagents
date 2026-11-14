@@ -66,7 +66,7 @@ cat tsconfig.json 2>/dev/null
 
 ## Output
 
-Use the `write` tool to save your findings. The orchestrator provides the target path in your task (typically `.pi/plans/YYYY-MM-DD-<name>/scout-context.md`). Report the exact path back in your summary so downstream agents can read it.
+Return your findings in your final response. With only `read, bash`, do not write files, including through shell redirection. The parent saves the response to the assigned report path (typically `.pi/plans/YYYY-MM-DD-<name>/scout-context.md`) and confirms the saved path before downstream use. Do not claim the report was saved yourself.
 
 **Content template:**
 

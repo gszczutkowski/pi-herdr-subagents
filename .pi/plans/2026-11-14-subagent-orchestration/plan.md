@@ -206,7 +206,7 @@ Historia nie obejmuje wewnętrznego toku rozumowania modeli.
 
 ### Dopasowanie instrukcji ról
 
-- [ ] Zweryfikować zgodność wymaganych czynności z dostępnymi narzędziami; scout i reviewer proszą o zapis raportów, choć deklarują tylko `read, bash`.
+- [x] Zweryfikować zgodność wymaganych czynności z dostępnymi narzędziami; scout i reviewer proszą o zapis raportów, choć deklarują tylko `read, bash`.
 - [ ] Preferować sensowne, weryfikowalne jednostki pracy zamiast sztywnego wymogu zadań na 2–5 minut.
 - [ ] Uzależnić commitowanie od polityki projektu i polecenia użytkownika, nie od bezwarunkowego zamknięcia każdego todo.
 - [ ] Przekazywać ścieżki do artefaktów i celowane skróty zamiast wielokrotnego wklejania całych raportów.
