@@ -127,12 +127,57 @@ test("registered task-bound spawn, live/closed resume, failure isolation and res
     assert.notEqual(resumedChild.id, child.id);
     assert.equal(read().tasks.length, 1); assert.equal(read().tasks[0].attempts.length, 1);
     assert.equal(read().tasks[0].attempts[0].runIds.length, 2);
-    enqueueSubagentCompletion(resumedChild, result(resumedChild, "closed-result"));
+    // Execute the real child tool, then let the original parent watcher consume
+    // its run-bound artifact. No direct task mutation stands in for caller_ping.
+    const childTools = new Map<string, any>();
+    const childApi: any = new Proxy({}, { get: (_, key) => key === "registerTool" ? (t: any) => childTools.set(t.name, t) : () => {} });
+    const { default: childExtension } = await import("../pi-extension/subagents/subagent-done.ts");
+    const reason = "Choose schema A or B; migration approval needed.";
+    let shutdown = false;
+    const childEnv = { ...process.env };
+    try {
+      process.env.PI_SUBAGENT_SESSION = resumedChild.sessionFile;
+      process.env.PI_SUBAGENT_ID = resumedChild.id;
+      process.env.PI_SUBAGENT_NAME = resumedChild.name;
+      process.env.PI_SUBAGENT_ACTIVITY_FILE = resumedChild.activityFile;
+      childExtension(childApi);
+      await childTools.get("caller_ping").execute("ping", { message: reason }, undefined, undefined, { shutdown: () => { shutdown = true; } });
+    } finally {
+      for (const key of Object.keys(process.env)) if (!(key in childEnv)) delete process.env[key];
+      Object.assign(process.env, childEnv);
+    }
+    assert.equal(shutdown, true);
+    const pingDeadline = Date.now() + 5000;
+    while (__test__.runningSubagents.has(resumedChild.id) && Date.now() < pingDeadline) await new Promise(r => setTimeout(r, 25));
+    assert.equal(__test__.runningSubagents.has(resumedChild.id), false, "ping closes/removes the child");
+    assert.equal(read().tasks[0].status, "blocked");
+    assert.equal(read().tasks[0].statusReason, reason);
+    const rendered = widgets.get("subagent-plan")({}, { fg: (_: string, text: string) => text }).render(200).join("\n");
+    assert.match(rendered, /blocked/);
+    assert.ok(rendered.includes(reason), "actual native panel retains the blocker after process removal");
+    const reopenedPlan = new PlanPersistence(() => { throw new Error("read only"); }, false).restore(SessionManager.open(sm.getSessionFile()!)).snapshot!;
+    assert.equal(reopenedPlan.tasks[0].statusReason, reason);
+    assert.equal(reopenedPlan.tasks[0].status, "blocked");
+    events.clear(); tools.clear();
+    extension(pi); // Replace the parent persistence/adapter while keeping runtime custody.
+    await emit("session_start", { reason: "reload" });
+    assert.equal(read().tasks[0].statusReason, reason);
+    const reloadedPanel = widgets.get("subagent-plan")({}, { fg: (_: string, text: string) => text }).render(200).join("\n");
+    assert.ok(reloadedPanel.includes(reason), "fresh parent persistence restores the actual blocker panel");
+    assert.equal(dispatches, 2, "reload never relaunches blocked work");
     const eventId = sent.at(-1).details.eventId;
+    assert.equal(sent.at(-1).customType, "subagent_ping");
+    assert.equal(read().tasks[0].attempts[0].results.at(-1)!.eventId, eventId);
+    const pingRevision = read().revision;
+    enqueueSubagentCompletion(resumedChild, { ...result(resumedChild, eventId.slice(`subagent:${resumedChild.id}:completion:`.length)), ping: { name: resumedChild.name, message: reason } });
+    assert.equal(read().revision, pingRevision, "closed-child duplicate cannot clear its blocker");
+    mutate((p: any, c: any) => store.submitReview(p, c, p.tasks[0].taskId, "Parent resolved schema choice; review evidence"));
     mutate((p: any, c: any) => store.addEvidence(p, c, p.tasks[0].taskId, { criterionId, ref: "Parent checked test report", resultEventId: eventId }));
     mutate((p: any, c: any) => store.accept(p, c, p.tasks[0].taskId, { [criterionId]: [p.tasks[0].evidence[0].evidenceId] }, "Verified by parent"));
     enqueueSubagentCompletion(child, { ...result(child, "late"), keepOpen: true });
     assert.equal(read().tasks[0].status, "accepted");
+    enqueueSubagentCompletion(child, { ...result(child, "late-ping"), keepOpen: true, ping: { name: child.name, message: "Stale blocker" } });
+    assert.equal(read().tasks[0].status, "accepted", "late ping cannot reopen an accepted task");
     const binding = child.planTask!;
     const originalLeaf = sm.getLeafId()!;
     const sourcePlan = read();

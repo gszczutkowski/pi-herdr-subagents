@@ -138,7 +138,13 @@ A separate native widget displays persisted tasks even after the process widget
 removes its agents. Only `accepted` tasks count as checked; result submission,
 process exit, skipped and cancelled tasks do not. Role/owner is the explicit
 stored `owner` value, not an inferred runtime role. Block reasons, unmet task
-dependencies, read-only errors and recovery uncertainty remain visible.
+dependencies, read-only errors and recovery uncertainty remain visible. For a
+bound child, `caller_ping` persists `blocked` and its actual help-request reason
+before result handoff. Closing/removing the child does not clear that blocker;
+reload/reopen restores it. Resolving it is an explicit parent decision, and late
+or duplicate pings cannot reopen accepted/cancelled tasks. If task import is
+pending, the original ping is still delivered and its outbox envelope is retained
+for import retry; no blocker is fabricated on another plan branch.
 
 - `/plan-view` toggles the compact/full list; compact shows six tasks.
 - `/plan-view expand` or `/plan-view full` shows all tasks.

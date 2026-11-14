@@ -163,7 +163,9 @@ Weryfikacja Panel 1: `plan-view.ts` jest czystą projekcją magazynu; natywny wi
 - [x] Pozostawiać zakończone zadania w planie, mimo usunięcia agentów z widgetu procesów.
 
 Weryfikacja Panel 2: osobny klucz widgetu `subagent-plan`, wiersze wyłącznie z trwałego store (bez runtime map). Regresja wywołuje rzeczywistą ścieżkę `observeSubagentCompletion(supervisionEnded)`: usunięcie ostatniego agenta i wyczyszczenie widgetu procesów nie usuwa zadań in_review/accepted/failed/skipped/cancelled. Odczyt po ponownym otwarciu sesji z dysku zachowuje identyczny plan i licznik 1/5; exit nie akceptuje zadania. Focused panel 4/4; bez live herdr.
-- [ ] Zachować blokadę i jej przyczynę po `caller_ping`.
+- [x] Zachować blokadę i jej przyczynę po `caller_ping`.
+
+Weryfikacja Panel 3: regresja `test/plan-runtime.test.ts` uruchamia rzeczywiste zarejestrowane child `caller_ping`, zapis run-bound artefaktu i pierwotny watcher rodzica. Wspólny adapter zapisuje blocked z dokładną przyczyną w natywnym planie; po usunięciu dziecka z rejestru test renderuje rzeczywisty widget `subagent-plan` i sprawdza tę przyczynę. Reopen SessionManager z dysku i ponowna rejestracja parent extension z nową persistence zachowują blokadę bez relaunch. Duplicate tego samego kanonicznego ping eventId nie dopisuje rewizji, późny ping nie otwiera accepted; przejście do review jest jawną decyzją rodzica. Focused 81/81, lint exit 0; pełne npm test 398/417, te same 19 błędów bazowych (18 Python/Claude hook, 1 CRLF release). Granice terminala/API Pi mockowane; bez live herdr i bez nowych kontraktów strukturalnych.
 - [x] Dla długich planów udostępnić skrót oraz rozwijaną pełną listę.
 
 Weryfikacja Panel 4: domyślnie sześć zadań i liczba ukrytych, licznik accepted zawsze dla całego planu. `/plan-view expand|full|compact` oraz przełączanie bez argumentu zmieniają tylko prezentację; istniejący `/plan` pozostaje bez zmian. Test z 30 zadaniami, rzeczywiste komendy, brak nowych wpisów sesji/rewizji, resize 1–120 kolumn. Panel 5/5, lint OK; bez live herdr.
