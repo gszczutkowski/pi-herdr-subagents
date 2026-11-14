@@ -2184,7 +2184,7 @@ describe("tool registration", () => {
     assert.match(output, /\(unnamed\)/);
   });
 
-  it("registers subagent_resume with an autoExit override", () => {
+  it("registers subagent_resume with an autoExit profile-compatibility check", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
 
@@ -2193,7 +2193,8 @@ describe("tool registration", () => {
 
     const autoExitSchema = resumeTool.parameters.properties.autoExit;
     assert.equal(autoExitSchema.type, "boolean");
-    assert.match(autoExitSchema.description, /Defaults to true/);
+    assert.match(autoExitSchema.description, /Must match the saved launch profile/);
+    assert.match(autoExitSchema.description, /Omit to preserve/);
   });
 });
 
