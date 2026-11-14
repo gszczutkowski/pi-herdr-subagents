@@ -357,9 +357,13 @@ The `caller_ping` tool lets a subagent request help from its parent agent. When 
 
 **`subagent_resume` parameters:**
 - `sessionPath` (required): Path to the child session `.jsonl` file
-- `name` (optional): Display name for the resumed pane (defaults to `Resume`)
-- `message` (optional): Follow-up prompt to send after resuming
-- `autoExit` (optional): Whether the resumed session should auto-exit after its next response. Defaults to `true` for autonomous follow-up work; set `false` when resuming for an interactive handoff.
+- `name` (optional): Display name for a new resumed pane (defaults to `Resume`); a live child must retain its name.
+- `message`: Follow-up prompt; required and nonempty for live continuation, optional for closed-session resume.
+- `autoExit` (optional): Must match the saved launch profile; omission preserves it.
+
+For an owned, tracked Pi child interrupted with Escape, resume continues the **same process, run, pane and watcher** only after the child confirms `agent_settled` with an aborted run and idle state. Active, starting, finalizing or unknown states reject. The launch configuration is unchanged. A run-bound private command transports only a request UUID; exact follow-up text is read from an atomic request artifact and passed to `sendUserMessage` with template/command expansion disabled (not shell input or `@file` expansion).
+
+Acceptance/rejection artifacts deduplicate requests. A transport timeout or ambiguous dispatch returns `pending`, retains the in-flight reservation and never starts a replacement process; do not retry that continuation. This is a conservative synchronous API-dispatch acknowledgement, not proof that the provider processed the prompt. Unowned closed Pi sessions still use the saved-profile launch path. This does not add post-completion tracking or choose keep-open follow-up semantics.
 
 **Interaction flow:**
 1. Child calls `caller_ping({ message: "Not sure which schema to use" })`

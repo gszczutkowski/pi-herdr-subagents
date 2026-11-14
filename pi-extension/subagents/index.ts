@@ -7,6 +7,7 @@ import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { resolveSubagentCwd } from "./paths.ts";
 import { persistLaunchProfile, readPiLaunchProfile, resolveLaunchProfile, resumeLaunchContext } from "./launch-profile.ts";
+import { continueLiveChild } from "./live-continuation.ts";
 import type { SubagentLaunchContext } from "./harness/types.ts";
 import { fileURLToPath } from "node:url";
 import {
@@ -22,6 +23,7 @@ import {
   createSubagentSurface,
   resolveSubagentLayout,
   runScriptInPane,
+  runInPane,
   closePane,
   interruptPane,
   shellQuote,
@@ -1833,14 +1835,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagent_resume",
       label: "Resume Subagent",
       description:
-        "Resume a previous sub-agent session in a new herdr pane. " +
+        "Continue a settled interrupted live Pi child in its existing pane, or resume a closed session in a new pane. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT poll for status. All of that is wasted work — the harness handles delivery for you. " +
         "DO NOT fabricate or assume results. After resuming, either end your turn or work on other independent tasks; the harness will wake you when the result is ready. " +
         "Use when a sub-agent was cancelled or needs follow-up work.",
       promptSnippet:
-        "Resume a previous sub-agent session in a new herdr pane. " +
+        "Continue a settled interrupted live Pi child in its existing pane, or resume a closed session in a new pane. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT poll for status. All of that is wasted work — the harness handles delivery for you. " +
@@ -1853,7 +1855,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         ),
         message: Type.Optional(
           Type.String({
-            description: "Optional message to send after resuming (e.g. follow-up instructions)",
+            description: "Exact follow-up message. Required and nonempty for live interrupted continuation; optional for closed-session resume.",
           }),
         ),
         autoExit: Type.Optional(
@@ -1900,6 +1902,18 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const profile = readPiLaunchProfile(params.sessionPath);
         if (params.autoExit !== undefined && params.autoExit !== profile.autoExit) {
           throw new Error("Resume must preserve the saved autoExit/interactivity profile. Start a new subagent to change it.");
+        }
+        const liveOwner = sessionOwners.get(params.sessionPath);
+        if (liveOwner && runningSubagents.has(liveOwner.runId)) {
+          const child = runningSubagents.get(liveOwner.runId)!;
+          const result = await continueLiveChild(liveOwner, child, params, { inspect: inspectPane, send: runInPane });
+          return {
+            content: [{ type: "text", text: result.status === "accepted"
+              ? `Session "${child.name}" continued in its existing process.`
+              : `Continuation ${result.requestId} is pending/uncertain. Do not retry or launch a replacement; the existing watcher remains active.` }],
+            details: { id: child.id, name: child.name, sessionPath: child.sessionFile,
+              requestId: result.requestId, status: result.status === "accepted" ? "continued" : "pending" },
+          };
         }
         const interactive = profile.interactive;
         const startTime = Date.now();

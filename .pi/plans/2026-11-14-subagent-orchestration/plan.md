@@ -83,12 +83,14 @@ Weryfikacja R3: `test/delivery.test.ts` obejmuje wspólną ścieżkę settlement
 ### R4. Bezpieczne resume i kontynuacja żywej sesji
 
 - [x] Odrzucać resume sesji, która ma już aktywnego właściciela.
-- [ ] Rozróżnić kontynuowanie żywego dziecka po interrupt od uruchomienia zamkniętej sesji.
+- [x] Rozróżnić kontynuowanie żywego dziecka po interrupt od uruchomienia zamkniętej sesji.
 - [x] Powiązać completion z konkretnym uruchomieniem, nie wyłącznie ze ścieżką JSONL.
 - [x] Współdzielić profil uruchomienia między spawn i resume: rola, katalog, ograniczenia narzędzi i pozostała konfiguracja.
 - [ ] Dodać regresje interrupt → resume oraz równoczesnego resume tej samej sesji.
 
 Akceptacja: nie powstają dwa procesy zapisujące ten sam plik sesji i konkurujące o wspólny completion sidecar.
+
+Weryfikacja R4.2: `live-continuation.ts` rozdziela kontynuację śledzonego żywego dziecka od istniejącej ścieżki saved-profile dla sesji bez właściciela. Rezerwacja przed await, kontrola lifecycle/pane i potwierdzenie dziecka `agent_settled(aborted)` + idle; ten sam proces/run/pane/activity/abort/watcher, bez nowego watchera i bez fallback launch po awarii transportu. Prywatna komenda przenosi wyłącznie UUID, atomowy request jest run-bound; dziecko waliduje token idle i payload oraz wywołuje `sendUserMessage` z `expandPromptTemplates:false`. Trwałe artefakty accepted/rejected/dispatching deduplikują; stan niepewny blokuje retry. Testy focused continuation/ownership/profile/delivery: 40/40, lint bez ostrzeżeń; pełne `npm test`: 335/355 (18 Python/Claude, 1 CRLF release, 1 istniejący nieaktualny test oczekujący `Defaults to true` zamiast zachowania zapisanego autoExit). Dowody na mockach API Pi i transportu; brak live herdr, brak dowodu terminal E2E. R4.5 oraz semantyka R5 pozostają otwarte.
 
 ### R5. Jasna semantyka keepOpen
 
