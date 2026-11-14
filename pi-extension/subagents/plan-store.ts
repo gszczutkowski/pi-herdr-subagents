@@ -175,6 +175,9 @@ function validate(plan: PlanSnapshot): void {
     }
     requireValue(!ids.has(task.taskId), "Duplicate task ID"); ids.add(task.taskId);
     requireValue(Array.isArray(task.attempts) && task.attempts.length <= 1000, "Invalid attempts");
+    // Only start/retry enter in_progress, each appending one attempt. Detach
+    // preserves both histories, including attempts no longer supervised here.
+    requireValue(task.attempts.length === task.statusHistory.filter(change => change.status === "in_progress").length, "Attempt history mismatch");
     for (const attempt of task.attempts) {
       keys(attempt, ["attemptId", "runIds", "childSession", "results", "origin"]);
       if (attempt.origin !== undefined) {
