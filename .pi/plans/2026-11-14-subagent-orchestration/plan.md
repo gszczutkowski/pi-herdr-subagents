@@ -131,7 +131,9 @@ Weryfikacja: `readPaneAsync`/`inspectPane` wykonują świeże asynchroniczne zap
 - [x] Wprowadzić stabilne identyfikatory `planId`, `taskId`, `runId`.
 
 Weryfikacja: `plan-store.ts` tworzy UUID planu/zadania, referencjonuje istniejący runtime runId, wersjonuje i zamraża snapshot. `test/plan-store.test.ts`: tożsamość niezależna od tytułów, roundtrip, autorytet i rewizje. Bez integracji runtime/persistence/UI.
-- [ ] Oddzielić zadanie od prób jego realizacji; resume i retry nie tworzą nowego zadania.
+- [x] Oddzielić zadanie od prób jego realizacji; resume i retry nie tworzą nowego zadania.
+
+Weryfikacja: osobne attemptId, jawne attachRun dla resume, retry zachowuje taskId; wiele wyników keepOpen pozostaje w tej samej próbie. Testy obejmują deduplikację i konflikt eventId, referencje sesji i roundtrip.
 - [ ] Przechowywać tytuł, zakres, kryteria akceptacji, zależności, właściciela, powiązane uruchomienia, artefakty i dowody.
 - [ ] Rozróżniać stany: oczekuje, realizowane, zablokowane, do weryfikacji, zaakceptowane, nieudane oraz pominięte/anulowane.
 - [ ] Zachować stan zadań po zamknięciu terminala, reloadzie i wznowieniu sesji.

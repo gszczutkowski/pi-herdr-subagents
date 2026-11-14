@@ -1,6 +1,28 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createPlan, addTask, attachRun, serializePlan, deserializePlan } from "../pi-extension/subagents/plan-store.ts";
+import { createPlan, addTask, attachRun, startAttempt, retry, recordResult, serializePlan, deserializePlan } from "../pi-extension/subagents/plan-store.ts";
+
+test("retry and explicit closed resume preserve task identity; live results share an attempt", () => {
+  let plan = createPlan("Plan", authority);
+  plan = addTask(plan, context(plan), "Task");
+  const taskId = plan.tasks[0].taskId;
+  plan = startAttempt(plan, context(plan), taskId, "child-session");
+  const attemptId = plan.tasks[0].attempts[0].attemptId;
+  plan = attachRun(plan, context(plan), taskId, attemptId, "run-a");
+  for (const eventId of ["turn-a", "turn-b"]) plan = recordResult(plan, context(plan), taskId, attemptId, { eventId, runId: "run-a", ref: eventId });
+  const event = { eventId: "turn-a", runId: "run-a", ref: "turn-a" };
+  assert.equal(recordResult(plan, context(plan), taskId, attemptId, event), plan);
+  assert.throws(() => recordResult(plan, context(plan), taskId, attemptId, { ...event, ref: "conflict" }), /Conflicting/);
+  plan = attachRun(plan, context(plan), taskId, attemptId, "resumed-run");
+  assert.equal(plan.tasks[0].attempts.length, 1);
+  plan = retry(plan, context(plan), taskId);
+  assert.equal(plan.tasks[0].taskId, taskId);
+  assert.equal(plan.tasks[0].attempts.length, 2);
+  assert.notEqual(plan.tasks[0].attempts[1].attemptId, attemptId);
+  assert.equal(plan.tasks[0].attempts[0].results.length, 2);
+  assert.throws(() => attachRun(plan, context(plan), taskId, attemptId, "run-a"), /Duplicate/);
+  assert.deepEqual(deserializePlan(serializePlan(plan)), plan);
+});
 
 const authority = { sessionId: "parent", branchInstanceId: "branch-a" };
 const context = (plan: { revision: number }) => ({ ...authority, expectedRevision: plan.revision });
@@ -10,8 +32,9 @@ test("stable UUID identities, existing runtime reference, immutable serializatio
   plan = addTask(plan, context(plan), "Same title");
   assert.notEqual(plan.tasks[0].taskId, plan.tasks[1].taskId);
   assert.notEqual(plan.planId, createPlan("Same title", authority).planId);
-  plan = attachRun(plan, context(plan), plan.tasks[0].taskId, "existing-runtime-id");
-  assert.deepEqual(plan.tasks[0].runIds, ["existing-runtime-id"]);
+  plan = startAttempt(plan, context(plan), plan.tasks[0].taskId);
+  plan = attachRun(plan, context(plan), plan.tasks[0].taskId, plan.tasks[0].attempts[0].attemptId, "existing-runtime-id");
+  assert.deepEqual(plan.tasks[0].attempts[0].runIds, ["existing-runtime-id"]);
   assert.deepEqual(deserializePlan(serializePlan(plan)), plan);
   assert.equal(empty.tasks.length, 0);
   assert.ok(Object.isFrozen(plan.tasks[0]));
