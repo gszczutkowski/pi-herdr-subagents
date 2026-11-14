@@ -78,6 +78,32 @@ An empty legacy runtime can be initialized, but active legacy supervision is not
 migrated. Restarting the parent while a child is active does not restore its
 supervision; keep its session for manual recovery instead.
 
+## Durable task plans (Pi)
+
+`plan_read` reads the active branch's plan/revision; pass `taskId` for full
+criteria, attempts, results, evidence and decision history. `plan_update` takes
+`expectedRevision` and a discriminated `command`: `create`, `add`, `edit`,
+`attempt` (start/retry), `run`, `result`, `evidence`, `status`, or `accept`.
+Existing-plan commands also require `planId`. Criteria/artifact IDs are UUIDs.
+Results require their original `{ sessionId, branchInstanceId }` authority.
+Definition edits invalidate acceptance; acceptance requires evidence for every
+criterion. These are parent commands, not worker-controlled snapshot replacement.
+
+Full validated immutable snapshots use native `pi-subagents-plan/v1` entries.
+They survive terminal closure, reload, resume and native compaction. Only the
+latest entry on `getBranch()` is authoritative, never the last physical JSONL
+line. An actual persisted session with a user/assistant message is required:
+`--no-session` and setup-only sessions cannot promise durability. Failed appends
+disable writes across reload. Reopen the durable session, then call
+`plan_read({ reconcile: true })`; an in-memory leaf ahead of disk is not trusted.
+Unknown future plan schemas fail closed, never silently create an empty plan.
+
+Restored `in_progress` tasks stay unchanged and are reported as
+`recoveryUncertain`: persistence is not process-liveness or completion proof.
+There is no automatic launch, acceptance, runtime result adapter, task panel or
+context injection here. Read/update commands do not restore runtime supervision.
+This is single-parent serialization, not multi-process CAS or an OS sandbox.
+
 ## Development
 
 Run unit tests and lint locally:

@@ -73,6 +73,7 @@ import {
   type SubagentActivityState,
 } from "./activity.ts";
 import { registerSubagentAssignmentRenderer } from "./assignment.ts";
+import { registerPlanTools } from "./plan-tools.ts";
 import { createDeliveryState, enqueueDelivery, flushDeliveries, pauseDeliveries, restoreDurableDeliveries, type DeliveryState } from "./delivery.ts";
 import {
   createLifecycle,
@@ -1626,6 +1627,7 @@ async function watchSubagent(
 
 export default function subagentsExtension(pi: ExtensionAPI) {
   registerSubagentAssignmentRenderer(pi);
+  registerPlanTools(pi);
   // A factory API is not bound yet. Never fall back to a captured pre-reload API.
   runtime.pi = undefined; // Also invalidate the legacy global runtime field.
   pauseDeliveries(delivery);
