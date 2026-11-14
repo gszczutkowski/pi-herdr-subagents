@@ -42,23 +42,26 @@ export function isProtectedProcess(pid: number): boolean | undefined {
         "$ErrorActionPreference='Stop'; @(Get-CimInstance Win32_Process | ForEach-Object { @{pid=$_.ProcessId;parent=$_.ParentProcessId} }) | ConvertTo-Json -Compress"],
       { encoding: "utf8", timeout: 5000, windowsHide: true }));
       const parents = new Map<number, number>(rows.map((row: any) => [row.pid, row.parent]));
-      // A verified direct descendant cannot be our ancestor, even when an
-      // older launcher has already disappeared from the CIM ancestry snapshot.
-      if (parents.get(pid) === process.pid) {
+      // Exited MSYS/HC launchers leave holes in the parent chain. Creation
+      // ordering is independent evidence: a process born strictly AFTER us
+      // cannot be our ancestor. Equal/older/denied births remain unverified.
+      const nonAncestorByBirth = (): false | undefined => {
         const own = probeProcess(process.pid), target = probeProcess(pid);
         if (own.kind === "present" && target.kind === "present" &&
             BigInt(target.identity.birth.slice("windows:".length)) > BigInt(own.identity.birth.slice("windows:".length))) return false;
-      }
+        return undefined;
+      };
+      if (parents.get(pid) === process.pid && nonAncestorByBirth() === false) return false;
       let current = process.pid;
       const seen = new Set<number>();
       while (current > 0 && !seen.has(current)) {
         if (current === pid) return true;
         seen.add(current);
         const parent = parents.get(current);
-        if (parent === undefined) return undefined;
+        if (parent === undefined) return nonAncestorByBirth();
         current = parent;
       }
-      return current === 0 ? false : undefined;
+      return current === 0 ? false : nonAncestorByBirth();
     }
     if (process.platform === "linux") {
       let current = process.pid;

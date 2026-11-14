@@ -118,6 +118,20 @@ async function until(predicate: () => boolean) {
   while (!predicate()) { assert.ok(Date.now() < deadline, "condition timed out"); await pause(); }
 }
 
+test("Windows missing launcher ancestry needs independent strict birth ordering, never PID-only permission", { skip: process.platform !== "win32" }, async () => fixture(async () => {
+  const { isProtectedProcess } = await import("../pi-extension/subagents/process-identity.ts");
+  const targetPid = 98765432;
+  let birth: string | undefined = "2";
+  powershellResponder = (command: string) => {
+    if (command.includes("Get-CimInstance")) return JSON.stringify([{ pid: process.pid, parent: 98765431 }, { pid: targetPid, parent: 98765430 }]);
+    if (command.includes(`-Id ${targetPid} `)) return birth ? JSON.stringify({ pid: targetPid, birth }) : "denied";
+    return JSON.stringify({ pid: process.pid, birth: "1" });
+  };
+  assert.equal(isProtectedProcess(targetPid), false, "a verified younger process cannot be an ancestor despite missing MSYS parents");
+  for (const uncertain of ["1", "0", undefined]) { birth = uncertain; assert.equal(isProtectedProcess(targetPid), undefined); }
+  assert.equal(isProtectedProcess(process.pid), true); assert.equal(isProtectedProcess(process.ppid), true);
+}));
+
 for (const scenario of ["watcher-cleanup", "wrong-branch-live", "replacement-live", "wrong-branch-after-exit", "replacement-after-exit"]) {
 test(`registered close ${scenario} preserves phase-specific ownership fences (Windows OS boundary)`, { skip: process.platform !== "win32" }, async () => fixture(async ({ tools, ctx, session, resume, reload }: any) => {
   const started = await resume();
