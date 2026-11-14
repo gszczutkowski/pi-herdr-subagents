@@ -22,6 +22,8 @@ test("literal argv parsing excludes eval and option payload mentions; unknown re
   assert.equal(piSessionArgument(row([cli, "--session", "partial-uuid"])).kind, "uncertain");
   assert.deepEqual(windowsArgv('node.exe "C:\\Program Files\\pi\\cli.js" --session "C:\\a b\\x.jsonl"'), ["node.exe", "C:\\Program Files\\pi\\cli.js", "--session", "C:\\a b\\x.jsonl"]);
   assert.equal(auditSession(session, { rows: [], verified: false }).status, "uncertain");
+  assert.equal(piSessionArgument(row(["--unknown-vm", "unresolved-relative-unrelated.js", "test-server"])).kind, "other", "complete argv without a session selector is outside explicit-owner coverage");
+  assert.equal(piSessionArgument(row(["--unknown-vm", "unresolved-relative.js", "--session", session])).kind, "uncertain", "unresolved potential explicit owner must not be cleared");
 });
 
 test("duplicate, PID reuse and bounded identities never grant resume permission", () => {

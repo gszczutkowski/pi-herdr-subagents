@@ -112,6 +112,10 @@ function piEntrypoint(entry: string, cwd?: string): "pi" | "other" | "uncertain"
 export function piSessionArgument(row: ProcessRow): { kind: "other" | "uncertain" } | { kind: "session"; path: string } {
   const argv = row.argv;
   if (!argv?.length) return { kind: "uncertain" };
+  // This audit covers explicit CLI selection only. With the complete argv and
+  // no selector at all, even an unresolved script/VM option cannot explicitly
+  // select this session. Missing/denied argv above remains uncertain.
+  if (!argv.some(arg => arg === "--session" || arg.startsWith("--session="))) return { kind: "other" };
   let start = 1;
   if (/^(node|nodejs)(\.exe)?$/i.test(basename(argv[0]))) {
     let unknownFlag = false;
