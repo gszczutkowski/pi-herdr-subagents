@@ -14,7 +14,7 @@
   "type": "module",
   "scripts": {
     "lint": "oxlint pi-extension test",
-    "test": "node --test test/runtime-execute.test.ts test/runtime-store.test.ts test/plan-store.test.ts test/role-guidance.test.ts test/hc.test.ts test/terminal-queries.test.ts test/test.ts test/runtime-routing.test.ts test/release-workflow.test.ts test/harness-drivers.test.ts test/harness-capabilities.test.ts test/claude-completion.test.ts test/guidance-delivery.test.ts test/assignment.test.ts test/response-rendering.test.ts test/delivery.test.ts test/resume-safety.test.ts test/launch-profile.test.ts test/ownership-execute.test.ts test/live-continuation.test.ts test/keep-open.test.ts",
+    "test": "node --test test/runtime-recovery.test.ts test/runtime-execute.test.ts test/runtime-store.test.ts test/plan-store.test.ts test/role-guidance.test.ts test/hc.test.ts test/terminal-queries.test.ts test/test.ts test/runtime-routing.test.ts test/release-workflow.test.ts test/harness-drivers.test.ts test/harness-capabilities.test.ts test/claude-completion.test.ts test/guidance-delivery.test.ts test/assignment.test.ts test/response-rendering.test.ts test/delivery.test.ts test/resume-safety.test.ts test/launch-profile.test.ts test/ownership-execute.test.ts test/live-continuation.test.ts test/keep-open.test.ts",
     "test:integration": "node --test --test-concurrency=1 test/integration/*.test.ts"
   },
   "peerDependencies": {

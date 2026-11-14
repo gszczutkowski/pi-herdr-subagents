@@ -1,5 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { markDelivery, type SubagentLifecycle } from "./lifecycle.ts";
+import { createLifecycle, markDelivery, type SubagentLifecycle } from "./lifecycle.ts";
 
 export interface DeliveryOwner {
   id: string;
@@ -66,6 +66,29 @@ export function enqueueDelivery(
   state.store?.enqueue(eventId, owner.id, envelope);
   state.pending.set(eventId, { envelope, owner, onHandoff, attempts: 0, retryAt: 0, inFlight: false });
   flushDeliveries(state);
+}
+
+/** Reconstruct callbacks from stable IDs, never executable serialized state. */
+export function restoreDurableDeliveries(
+  state: DeliveryState,
+  store: import("./runtime-store.ts").RuntimeStore,
+  branchEventIds: ReadonlySet<string>,
+): void {
+  for (const [id, event] of Object.entries(store.snapshot().outbox)) {
+    if (branchEventIds.has(id) && event.status !== "handedOff") store.delivery(id, "handedOff");
+    if (event.status === "handedOff" || branchEventIds.has(id)) {
+      state.handedOff.add(id);
+      state.pending.delete(id);
+      continue;
+    }
+    if (state.pending.has(id)) continue;
+    state.pending.set(id, {
+      envelope: freeze(structuredClone(event.envelope)),
+      owner: { id: event.runId, lifecycle: createLifecycle(Date.now()) },
+      onHandoff: () => {}, attempts: 0, retryAt: 0, inFlight: false,
+      parked: event.status === "dispatching",
+    });
+  }
 }
 
 export function pauseDeliveries(state: DeliveryState): void {

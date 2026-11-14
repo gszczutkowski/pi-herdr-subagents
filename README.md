@@ -41,8 +41,33 @@ Outbox `dispatching` is persisted before `sendMessage`, and `handedOff` afterwar
 A crash between them is UNKNOWN, not permission to resend. Tombstones are retained.
 These records do not promise exactly-once processing or Pi persistence. In-process
 reload retains watchers; session replacement suppresses their late callbacks.
-Restart policy B: never automatically relaunch a task from a manifest. At this
-stage manifests preserve evidence but do not adopt live processes after restart.
+Restart policy B: **never automatically relaunch a task from a manifest**.
+Startup validates the canonical parent session, header ID and custody checkpoint
+on `getBranch()` (not all session entries), acquires a fenced writer generation,
+and reserves child sessions before asynchronous probes. A live writer cannot be
+replaced. A dead writer may be replaced only with OS PID + birth-identity evidence;
+legacy/unsupported/unreadable leases require an explicit decision, never an
+age-based steal. Corrupt manifests and stale revisions/cursors fail closed.
+
+New Pi children answer fresh generation-bound challenges from a non-model timer.
+The responder binds its per-process random nonce, PID, OS creation identity, run,
+canonical child session and header ID. Linux `/proc` and Windows process creation
+time are supported; unavailable platform probes and legacy/foreign children stay
+`unverified`. This assumes same-user filesystem trust, not a security sandbox.
+Authenticated live children regain **artifact-only** supervision, including later
+keep-open results. Immutable completion artifacts and pending outbox entries can
+be reconciled independently of whether a child is alive. Matching active-branch
+message IDs suppress replay; their absence is not proof of non-delivery.
+
+Recovered terminal controls, continuation and pane closing are **disabled**: pane
+presence does not prove pane-to-process binding. Recovered/uncertain session
+reservations (including continuation request IDs) are retained, not replayed.
+`/tree` detaches controls and durably pauses custody for an explicit branch decision;
+fork/new/copied sessions never inherit the old runs. Teardown after custody loss
+must not close a potentially reused pane. `/subagents-recovery` reports decisions
+and UNKNOWN handoffs; it is not a force-resend, lease-break or relaunch command.
+There is currently no automatic or built-in force-resolution of those decisions.
+No live terminal-recovery E2E guarantee is made.
 
 **Upgrade boundary:** these guarantees apply only to watchers started with the
 outbox implementation. Before upgrading from a pre-outbox release, let all
@@ -388,9 +413,10 @@ Tracked keep-open is **Pi-only** (`supportsTrackedKeepOpen`). Other harnesses do
 not support this repeated-result/live-follow-up contract; `behavior.closeOnDone`
 and Pi's `subagent_done` do not give them that capability. Each Pi completion has
 a run/turn event identity and immutable result snapshot; failed parent notifications
-remain in the in-memory outbox across subsequent turns and `/reload`. Handoff means
-normal synchronous `sendMessage` return, not exactly-once execution. Parent process
-restart recovery is not supported.
+remain in the durable outbox across subsequent turns, `/reload` and parent restart.
+Handoff means normal synchronous `sendMessage` return, not exactly-once execution.
+Restart recovery is artifact-only after identity verification, never automatic
+relaunch or reuse of a saved pane (see Result delivery boundary above).
 
 **Interaction flow:**
 1. Child calls `caller_ping({ message: "Not sure which schema to use" })`

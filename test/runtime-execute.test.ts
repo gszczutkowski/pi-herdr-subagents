@@ -16,9 +16,11 @@ test("spawn and closed-session resume durably record intent before terminal disp
   let serial = 0;
   let manifestFile = "";
   let dispatches = 0;
+  let closes = 0;
   mock.method(childProcess, "execSync", () => "herdr");
   mock.method(childProcess, "execFileSync", (_command: any, args: string[]) => {
     if (args[0] === "tab" && args[1] === "create") return JSON.stringify({ result: { root_pane: { pane_id: `pane-${++serial}` } } });
+    if (args[1] === "close") closes++;
     if (args[1] === "run") {
       const manifest = JSON.parse(fs.readFileSync(manifestFile, "utf8"));
       assert.ok(Object.values(manifest.runs).some((run: any) => run.surface === args[2] && run.phase === "dispatch-intent"));
@@ -77,6 +79,14 @@ test("spawn and closed-session resume durably record intent before terminal disp
     assert.equal(manifest.runs[child.id].entryCountBefore, 1);
     assert.ok(Object.values(manifest.outbox).every((event: any) => event.status === "handedOff"));
     assert.equal(fs.readdirSync(events).length, 2, "immutable child events retained");
+    const closesBeforeTree = closes;
+    handlers.get("session_before_tree")({}, ctx);
+    assert.equal(child.terminalActionsAllowed, false);
+    await handlers.get("session_tree")({}, ctx);
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(closes, closesBeforeTree, "losing branch custody cannot close a potentially reused pane");
+    await assert.rejects(tools.get("subagent_resume").execute("blocked", { sessionPath: saved }, undefined, undefined, ctx), /branch decision/);
+    assert.equal(dispatches, 2, "navigation never relaunches a task");
   } finally {
     handlers.get("session_shutdown")({ reason: "quit" }, ctx);
     for (const child of __test__.runningSubagents.values()) releaseSession(child.sessionFile, child.id);

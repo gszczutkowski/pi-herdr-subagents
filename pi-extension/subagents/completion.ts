@@ -110,6 +110,11 @@ function consumeExitSidecar(sessionFile: string | undefined, runId?: string, ret
   }
 }
 
+/** Artifact-only recovery must never inspect or control a stale terminal. */
+export function readRetainedCompletion(sessionFile: string, runId: string, cursor: readonly string[]): CompletionResult | null {
+  return consumeExitSidecar(sessionFile, runId, () => cursor);
+}
+
 function terminalExitCode(screen: string, runId?: string): number | null {
   if (!runId) {
     const match = screen.match(TERMINAL_SENTINEL);

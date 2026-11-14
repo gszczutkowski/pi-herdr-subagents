@@ -57,6 +57,20 @@ test("write failure parks delivery without sending or acknowledging", () => fixt
   assert.equal(state.timer, undefined); store.close();
 }));
 
+test("a post-send tombstone write failure never resends or acknowledges", () => fixture((dir) => {
+  const store = new RuntimeStore(dir, parent); store.prepare(run);
+  const state = createDeliveryState(); state.store = store;
+  const original = store.delivery.bind(store);
+  store.delivery = (id, status) => { if (status === "handedOff") throw new Error("disk failure after send"); original(id, status); };
+  let sends = 0;
+  state.api = { sendMessage() { sends++; } };
+  enqueueDelivery(state, { id: "run", lifecycle: createLifecycle(1) },
+    { customType: "subagent_result", content: "result", display: true }, () => assert.fail("ack"));
+  flushDeliveries(state);
+  assert.equal(sends, 1); assert.equal(state.pending.size, 1);
+  assert.equal(Object.values(store.snapshot().outbox)[0].status, "dispatching"); store.close();
+}));
+
 test("unknown dispatch survives reopen; tombstones cannot be replayed", () => fixture((dir) => {
   let store = new RuntimeStore(dir, parent); store.prepare(run);
   const state = createDeliveryState(); state.store = store;

@@ -11,6 +11,7 @@ import { getBehaviorConfig } from "./config.ts";
 import { createSubagentActivityRecorder } from "./activity.ts";
 import { registerSubagentAssignment } from "./assignment.ts";
 import { registerLiveContinuation } from "./live-continuation.ts";
+import { registerRecoveryIdentity } from "./recovery-identity.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -80,6 +81,7 @@ export function parseDeniedTools(rawValue: string | undefined): string[] {
 export default function (pi: ExtensionAPI) {
   registerSubagentAssignment(pi);
   registerLiveContinuation(pi);
+  registerRecoveryIdentity(pi);
 
   let toolNames: string[] = [];
   let denied: string[] = [];

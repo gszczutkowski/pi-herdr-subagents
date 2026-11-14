@@ -8,7 +8,8 @@ import { randomUUID } from "node:crypto";
 import { resolveSubagentCwd } from "./paths.ts";
 import { persistLaunchProfile, readPiLaunchProfile, resolveLaunchProfile, resumeLaunchContext } from "./launch-profile.ts";
 import { continueLiveChild } from "./live-continuation.ts";
-import { RuntimeStore } from "./runtime-store.ts";
+import { RuntimeStore, readRuntimeManifest, type RuntimeParent } from "./runtime-store.ts";
+import { reconcileRuntime } from "./runtime-recovery.ts";
 import type { SubagentLaunchContext } from "./harness/types.ts";
 import { fileURLToPath } from "node:url";
 import {
@@ -72,7 +73,7 @@ import {
   type SubagentActivityState,
 } from "./activity.ts";
 import { registerSubagentAssignmentRenderer } from "./assignment.ts";
-import { createDeliveryState, enqueueDelivery, flushDeliveries, pauseDeliveries, type DeliveryState } from "./delivery.ts";
+import { createDeliveryState, enqueueDelivery, flushDeliveries, pauseDeliveries, restoreDurableDeliveries, type DeliveryState } from "./delivery.ts";
 import {
   createLifecycle,
   formatLifecycleTransitionLine,
@@ -573,6 +574,7 @@ interface SubagentResult {
  */
 interface RunningSubagent {
   durableStore?: RuntimeStore;
+  terminalActionsAllowed?: boolean;
   id: string;
   name: string;
   task: string;
@@ -614,6 +616,8 @@ interface RunningSubagent {
 
 interface SubagentRuntime {
   store?: RuntimeStore;
+  stopRecovery?: () => void;
+  recoveryError?: string;
   runningSubagents: Map<string, RunningSubagent>;
   pi?: ExtensionAPI;
   latestCtx?: ExtensionContext;
@@ -636,6 +640,7 @@ const runningSubagents = runtime.runningSubagents;
 function durableStoreFor(ctx: ExtensionContext): RuntimeStore | undefined {
   // Legacy host/test adapters cannot claim durable recovery support.
   if (typeof ctx.sessionManager.getHeader !== "function" || typeof ctx.sessionManager.getBranch !== "function") return undefined;
+  if (runtime.recoveryError) throw new Error(runtime.recoveryError);
   if (runtime.store) {
     runtime.store.assertCustody();
     return runtime.store;
@@ -643,7 +648,7 @@ function durableStoreFor(ctx: ExtensionContext): RuntimeStore | undefined {
   const sessionFile = ctx.sessionManager.getSessionFile();
   const header = ctx.sessionManager.getHeader();
   if (!sessionFile || !header?.id) throw new Error("Durable supervision requires a saved parent session");
-  let checkpoint = ctx.sessionManager.getBranch().findLast((entry) => entry.type === "custom" && entry.customType === "subagent-custody");
+  let checkpoint: ReturnType<typeof ctx.sessionManager.getBranch>[number] | undefined;
   if (!checkpoint) {
     const branchToken = randomUUID();
     runtime.pi?.appendEntry("subagent-custody", { branchToken });
@@ -656,9 +661,74 @@ function durableStoreFor(ctx: ExtensionContext): RuntimeStore | undefined {
     sessionFile: canonicalSessionPath(sessionFile), headerId: header.id,
     branchToken: (checkpoint.data as any).branchToken, checkpoint: checkpoint.id,
   });
+  store.isCurrent = () => ownsActiveBranch(runtime.latestCtx ?? ctx, store.snapshot().parent);
   runtime.store = store;
   delivery.store = store;
   return store;
+}
+
+function ownsActiveBranch(ctx: ExtensionContext | undefined, parent: RuntimeParent): boolean {
+  try {
+    return !!ctx && canonicalSessionPath(ctx.sessionManager.getSessionFile()!) === parent.sessionFile &&
+      ctx.sessionManager.getHeader()?.id === parent.headerId &&
+      ctx.sessionManager.getBranch().some((entry) => entry.id === parent.checkpoint && entry.type === "custom" &&
+        entry.customType === "subagent-custody" && (entry.data as any)?.branchToken === parent.branchToken);
+  } catch { return false; }
+}
+
+async function recoverParentRuntime(ctx: ExtensionContext): Promise<void> {
+  if (typeof ctx.sessionManager.getHeader !== "function") return;
+  try {
+    if (runtime.store) {
+      runtime.store.isCurrent = () => ownsActiveBranch(runtime.latestCtx, runtime.store!.snapshot().parent);
+      runtime.store.assertCustody();
+      return;
+    }
+    const header = ctx.sessionManager.getHeader();
+    if (!header?.id) return;
+    const directory = join(getArtifactDir(ctx.sessionManager.getSessionDir(), header.id), "subagent-runtime");
+    const manifest = readRuntimeManifest(directory);
+    if (!manifest) return;
+    if (manifest.custodyPaused) throw new Error(`Recovery requires an explicit branch decision: ${manifest.custodyPaused}`);
+    if (!ownsActiveBranch(ctx, manifest.parent)) throw new Error("Recovery parent session/active branch mismatch; no custody inherited");
+    const store = new RuntimeStore(directory, manifest.parent);
+    runtime.store = store;
+    delivery.store = store;
+    store.isCurrent = () => ownsActiveBranch(runtime.latestCtx, manifest.parent);
+    const eventIds = new Set(ctx.sessionManager.getBranch().flatMap((entry) => {
+      const message = entry.type === "custom_message" ? entry : entry.type === "message" ? entry.message : undefined;
+      const id = (message as any)?.details?.eventId;
+      const expected = typeof id === "string" ? manifest.outbox[id]?.envelope.message : undefined;
+      return expected && (message as any)?.customType === expected.customType &&
+        JSON.stringify((message as any)?.content) === JSON.stringify(expected.content) ? [id] : [];
+    }));
+    restoreDurableDeliveries(delivery, store, eventIds);
+    const stopRecovery = await reconcileRuntime(store, (run, evidence) => {
+      const running: RunningSubagent = { ...run, durableStore: store, surface: "", interactive: false,
+        lifecycle: createLifecycle(run.startTime), runtimePlan: undefined, terminalActionsAllowed: false };
+      enqueueSubagentCompletion(running, { ...evidence, name: run.name, task: run.task,
+        summary: evidence.summary ?? evidence.errorMessage ?? "Recovered run-bound completion (no immutable summary)",
+        sessionFile: run.sessionFile, elapsed: Math.floor((Date.now() - run.startTime) / 1000) });
+    }, () => runtime.store === store && ownsActiveBranch(runtime.latestCtx, manifest.parent));
+    if (runtime.store !== store || !ownsActiveBranch(runtime.latestCtx, manifest.parent)) { stopRecovery(); return; }
+    runtime.stopRecovery = stopRecovery;
+    store.assertCustody();
+  } catch (error) {
+    if (runtime.latestCtx !== ctx) return;
+    runtime.recoveryError = `Subagent recovery paused: ${String(error)}`;
+    pauseDeliveries(delivery);
+    if (ctx.hasUI) ctx.ui.notify(runtime.recoveryError, "warning");
+  }
+}
+
+function detachRuntimeWatchers(): void {
+  runtime.stopRecovery?.();
+  runtime.stopRecovery = undefined;
+  for (const running of runningSubagents.values()) {
+    running.terminalActionsAllowed = false;
+    const owner = sessionOwners.get(canonicalSessionPath(running.sessionFile));
+    if (owner?.runId === running.id) owner.surface = undefined;
+  }
 }
 
 const delivery = runtime.delivery ??= createDeliveryState();
@@ -1013,6 +1083,8 @@ function requestSubagentInterrupt(
   interruptPaneKey: (surface: string) => void = interruptPane,
 ): { ok: true } | { error: string } {
   try {
+    if (running.terminalActionsAllowed === false) throw new Error("Terminal custody is detached/unverified");
+    running.durableStore?.assertCustody();
     interruptPaneKey(running.surface);
     return { ok: true };
   } catch (error: any) {
@@ -1385,6 +1457,11 @@ async function watchSubagent(
   signal: AbortSignal,
 ): Promise<SubagentResult> {
   const { name, task, surface, startTime, sessionFile } = running;
+  const safeClose = () => {
+    if (running.terminalActionsAllowed === false) return;
+    try { running.durableStore?.assertCustody(); } catch { return; }
+    closePane(surface);
+  };
 
   try {
     const result = await waitForCompletion(signal, {
@@ -1425,12 +1502,12 @@ async function watchSubagent(
         completionResult: result,
         surface,
         readPane,
-        closePane,
+        closePane: safeClose,
         artifactDir: dirname(running.launchScriptFile ?? running.sessionFile),
       });
 
       if (extracted) {
-        if (result.keepOpen !== true) closePane(surface);
+        if (result.keepOpen !== true) safeClose();
         running.lifecycle = result.exitCode === 0
           ? markCompleted(running.lifecycle, Date.now())
           : markFailed(running.lifecycle, result.errorMessage ?? extracted.summary, Date.now(), result.exitCode);
@@ -1493,7 +1570,7 @@ async function watchSubagent(
           : "Sub-agent exited without output";
     }
 
-    if (result.keepOpen !== true) closePane(surface);
+    if (result.keepOpen !== true) safeClose();
     running.lifecycle = result.keepOpen
       ? { ...markProcessRunning(running.lifecycle, Date.now()), hasWorked: true, turn: { kind: "waiting", startedAt: Date.now() }, activityDetail: null }
       : result.exitCode === 0
@@ -1515,7 +1592,7 @@ async function watchSubagent(
     };
   } catch (err: any) {
     try {
-      closePane(surface);
+      safeClose();
     } catch {}
     running.lifecycle = markFailed(
       running.lifecycle,
@@ -1555,11 +1632,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
   // Capture the UI context for widget updates and restore presentation for
   // subagents whose watchers survived a reload.
-  pi.on("session_start", (_event, ctx) => {
+  pi.on("session_start", async (_event, ctx) => {
     runtime.latestCtx = ctx;
     runtime.pi = pi;
-    delivery.api = pi;
-    flushDeliveries(delivery);
+    if (typeof ctx.sessionManager?.getHeader === "function") await recoverParentRuntime(ctx);
+    if (runtime.latestCtx !== ctx) return;
+    if (!runtime.recoveryError) {
+      delivery.api = pi;
+      flushDeliveries(delivery);
+    }
     runtime.modelCatalog = buildAuthenticatedModelCatalog(
       wrapPiModelRegistry(ctx.modelRegistry),
       24,
@@ -1573,6 +1654,42 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       startStatusRefresh(pi);
       updateWidget();
     }
+  });
+
+  pi.on("session_before_tree", () => {
+    runtime.store?.pauseCustody("/tree navigation: terminal custody detached; reconcile explicitly before further dispatch");
+    runtime.recoveryError = "Subagent custody paused for /tree; terminal controls disabled";
+    pauseDeliveries(delivery);
+    detachRuntimeWatchers();
+    // Navigation may replace the active branch while a probe is in flight.
+    runtime.latestCtx = undefined;
+  });
+  pi.on("session_tree", async (_event, ctx) => {
+    runtime.latestCtx = ctx;
+    // Never inherit live terminal custody after navigation. Preserve reservations
+    // and durable evidence, require an explicit restart/reconciliation decision.
+    cleanupSubagentsForShutdown("tree", runningSubagents);
+    if (runtime.store) {
+      runtime.store.close();
+      runtime.store = undefined;
+      delivery.store = undefined;
+    }
+    delivery.pending.clear();
+    delivery.handedOff.clear();
+    runtime.recoveryError = undefined;
+    await recoverParentRuntime(ctx);
+    if (runtime.latestCtx !== ctx) return;
+    if (!runtime.recoveryError) { delivery.api = pi; flushDeliveries(delivery); }
+  });
+
+  pi.registerCommand("subagents-recovery", {
+    description: "Show durable recovery/decision states (never relaunches or controls terminals)",
+    handler: async (_args, ctx) => {
+      const manifest = runtime.store?.snapshot();
+      const runs = Object.values(manifest?.runs ?? {}).map((run) => `${run.id}: ${run.reconciliation ?? run.phase}`);
+      const unknown = Object.entries(manifest?.outbox ?? {}).filter(([, event]) => event.status === "dispatching").map(([id]) => `${id}: UNKNOWN handoff; no automatic resend`);
+      ctx.ui.notify([runtime.recoveryError, ...runs, ...unknown, delivery.persistenceError].filter(Boolean).join("\n") || "No durable recovery state", "info");
+    },
   });
 
   pi.on("before_agent_start", (event) => {
@@ -1599,6 +1716,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       (globalThis as any)[STATUS_INTERVAL_KEY] = null;
     }
 
+    if (!shouldPreserveSubagentsOnShutdown((event as any).reason)) detachRuntimeWatchers();
     cleanupSubagentsForShutdown((event as any).reason, runningSubagents);
     if (!shouldPreserveSubagentsOnShutdown((event as any).reason) && runtime.store) {
       runtime.store.close();
@@ -1613,6 +1731,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       delivery.handedOff.clear();
       runtime.modelCatalog = undefined;
       runtime.agentCatalog = undefined;
+      runtime.recoveryError = undefined;
     }
   });
 
@@ -1975,6 +2094,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         if (params.autoExit !== undefined && params.autoExit !== profile.autoExit) {
           throw new Error("Resume must preserve the saved autoExit/interactivity profile. Start a new subagent to change it.");
         }
+        if (runtime.recoveryError) throw new Error(runtime.recoveryError);
+        runtime.store?.assertCustody();
         const previousOwner = sessionOwners.get(params.sessionPath);
         if (previousOwner?.surface) {
           const inspection = await inspectPane(previousOwner.surface);
@@ -1986,7 +2107,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const liveOwner = sessionOwners.get(params.sessionPath);
         if (liveOwner && runningSubagents.has(liveOwner.runId)) {
           const child = runningSubagents.get(liveOwner.runId)!;
-          const result = await continueLiveChild(liveOwner, child, params, { inspect: inspectPane, send: runInPane });
+          if (child.terminalActionsAllowed === false) throw new Error("Live continuation requires verified terminal custody");
+          const result = await continueLiveChild(liveOwner, child, params, { inspect: inspectPane, send: (surface, command) => {
+            if (child.terminalActionsAllowed === false) throw new Error("Terminal custody was detached during continuation");
+            child.durableStore?.assertCustody();
+            if (liveOwner.continuationRequestId) child.durableStore?.continuation(child.id, liveOwner.continuationRequestId);
+            runInPane(surface, command);
+          } });
           return {
             content: [{ type: "text", text: result.status === "accepted"
               ? `Session "${child.name}" continued in its existing process.`
