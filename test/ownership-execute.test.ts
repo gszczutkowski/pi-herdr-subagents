@@ -74,20 +74,28 @@ async function fixture(run: (f: any) => Promise<void>) {
   };
   persistLaunchProfile(resolveLaunchProfile(context, "pi", "read"));
   const existingOwners = new Set(sessionOwners.keys());
+  const handoffs: any[] = [];
+  let failNotifications = false;
   const tools = new Map<string, any>();
   const handlers = new Map<string, any>();
   const api: any = new Proxy({}, { get: (_target, key) => key === "registerTool" ? (tool: any) => tools.set(tool.name, tool)
     : key === "on" ? (event: string, handler: any) => handlers.set(event, handler)
+    : key === "getAllTools" ? () => []
+    : key === "sendMessage" ? (message: any) => { if (failNotifications) throw new Error("offline"); handoffs.push(message); }
     : key === "getThinkingLevel" ? () => "off" : () => {} });
   extension(api);
   const ctx = {
-    cwd: dir, model: { provider: "test", id: "model" },
+    hasUI: false, scopedModels: [], cwd: dir, model: { provider: "test", id: "model" },
     modelRegistry: { find: () => ({ provider: "test", id: "model", reasoning: true }), getAvailable: () => [{ provider: "test", id: "model" }], hasConfiguredAuth: () => true },
     sessionManager: { getSessionFile: () => session, getSessionDir: () => dir, getSessionId: () => "parent" },
   };
   const resume = (params = {}) => tools.get("subagent_resume").execute("call", { sessionPath: session, ...params }, undefined, undefined, ctx);
   const interrupt = (id: string) => tools.get("subagent_interrupt").execute("interrupt", { id }, undefined, undefined, ctx);
-  try { await run({ dir, session, ctx, resume, interrupt }); } finally {
+  try { await run({ dir, session, ctx, resume, interrupt, handoffs,
+    start: () => handlers.get("session_start")({ reason: "reload" }, ctx),
+    shutdown: () => handlers.get("session_shutdown")({ reason: "reload" }, ctx),
+    reload: () => { extension(api); handlers.get("session_start")({ reason: "reload" }, ctx); },
+    failNotifications: (value: boolean) => { failNotifications = value; } }); } finally {
     prepareFails = false;
     sendFails = false;
     onRun = () => {};
@@ -183,7 +191,9 @@ test("registered interrupt/resume preserves the live run and watcher; concurrent
   // No replacement launch: the original watcher must still consume this run's sidecar.
   assert.equal(child.lifecycle.process.completion, undefined);
   fs.writeFileSync(runCompletionFile(session, child.id), JSON.stringify({ type: "done", runId: child.id, keepOpen: true }));
-  await until(() => child.lifecycle.process.completion != null);
+  await until(() => child.hasTurnResult === true);
+  assert.equal(child.lifecycle.process.kind, "running");
+  assert.equal(child.lifecycle.turn.kind, "waiting");
   assert.equal(serial, surfacesBefore);
 }));
 
@@ -233,12 +243,14 @@ test("registered resume recovers a missing pane before selecting its tracked liv
 }));
 
 test("real resume execute: completion retains ownership, closed pane inspection unlocks fresh resume", async () => fixture(async ({ session, resume }: any) => {
+  inspect = async (pane) => JSON.stringify({ result: { pane: { pane_id: pane, agent_status: "idle" } } });
   const first = await resume();
   const owner = sessionOwners.get(session)!;
   assert.equal(owner.dispatched, true);
   fs.writeFileSync(runCompletionFile(session, first.details.id), JSON.stringify({ type: "done", runId: first.details.id, keepOpen: true }));
-  await until(() => __test__.runningSubagents.get(first.details.id)?.lifecycle?.process?.completion != null);
+  await until(() => __test__.runningSubagents.get(first.details.id)?.hasTurnResult === true);
   assert.equal(sessionOwners.get(session), owner, "logical completion is not process exit");
+  inspect = async () => JSON.stringify({ error: { code: "pane_not_found" } });
   const second = await resume();
   assert.equal(second.details.status, "started");
   assert.notEqual(second.details.id, first.details.id);
@@ -312,4 +324,84 @@ test("terminal dispatch callbacks follow preparation and preflight, but precede 
   prepareFails = false; sendFails = true;
   assert.throws(() => runScriptInPane("target", "true", { scriptPath: join(dir, "launch.sh"), onDispatch: () => { dispatched = true; } }), /ambiguous send failure/);
   assert.equal(dispatched, true);
+}));
+
+test("keepOpen first result retains watcher and owner; parent follow-up and manual turns survive reload/outbox failure", async () => fixture(async (f: any) => {
+  const { session, resume, handoffs } = f;
+  inspect = async (pane) => JSON.stringify({ result: { pane: { pane_id: pane, agent_status: "idle" } } });
+  f.start();
+  f.failNotifications(true);
+  const started = await resume();
+  const child = __test__.runningSubagents.get(started.details.id)!;
+  const owner = sessionOwners.get(session)!;
+  const abort = child.abortController;
+  const paneCount = serial;
+  const completion = (eventId: string, summary: string, keepOpen = true) => fs.writeFileSync(runCompletionFile(session, child.id),
+    JSON.stringify({ type: "done", runId: child.id, eventId, summary, keepOpen }));
+  const runtime = (globalThis as any)[Symbol.for("pi-subagents/runtime")];
+  completion("first", "first snapshot");
+  await until(() => child.hasTurnResult && runtime.delivery.pending.size === 1);
+  assert.equal(child.lifecycle.process.kind, "running");
+  assert.equal(child.lifecycle.turn.kind, "waiting");
+  assert.equal(sessionOwners.get(session), owner);
+  assert.equal(handoffs.length, 0);
+  const widget = __test__.renderSubagentWidgetLines([child], 120).join("\n");
+  assert.match(widget, /1 open/);
+  assert.match(widget, /idle/);
+  assert.doesNotMatch(widget, /1 active/);
+  const firstEnvelope = [...runtime.delivery.pending.values()][0].envelope;
+  f.shutdown();
+  // Real child bridge registration: completed (not aborted) settlement issues a
+  // fresh idle token; the parent must use the same pane/run/profile.
+  const events = new Map<string, Function>();
+  const commands = new Map<string, any>();
+  const prompts: any[] = [];
+  const env = { PI_SUBAGENT_ID: child.id, PI_SUBAGENT_SESSION: session, PI_SUBAGENT_ACTIVITY_FILE: child.activityFile };
+  const previous = Object.fromEntries(Object.keys(env).map((key) => [key, process.env[key]]));
+  Object.assign(process.env, env);
+  try {
+    registerLiveContinuation({ on: (event: string, handler: Function) => events.set(event, handler),
+      registerCommand: (name: string, command: any) => commands.set(name, command),
+      sendUserMessage: (...args: any[]) => prompts.push(args) } as any);
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  }
+  const childCtx = { isIdle: () => true, hasPendingMessages: () => false, sessionManager: { getSessionFile: () => session } };
+  events.get("agent_settled")!({ aborted: false }, childCtx);
+  onRun = (_surface, command) => {
+    const id = command.split(" ")[1];
+    commands.get(CONTINUE_COMMAND).handler(id, childCtx);
+    commands.get(CONTINUE_COMMAND).handler(id, childCtx); // duplicate terminal delivery
+  };
+  const exact = " /skill:private\n!literal\n@file\nline two ";
+  const followup = await resume({ message: exact });
+  assert.equal(followup.details.status, "continued");
+  assert.deepEqual(prompts, [[exact, { expandPromptTemplates: false }]]);
+  assert.equal(child.abortController, abort);
+  assert.equal(serial, paneCount);
+  completion("second", "follow-up snapshot");
+  await until(() => runtime.delivery.pending.size === 2);
+  assert.equal([...runtime.delivery.pending.values()][0].envelope, firstEnvelope);
+  f.failNotifications(false);
+  for (const entry of runtime.delivery.pending.values()) entry.retryAt = 0;
+  f.reload();
+  assert.deepEqual(handoffs.map((m: any) => m.details.response), ["first snapshot", "follow-up snapshot"]);
+  assert.equal(new Set(handoffs.map((m: any) => m.details.eventId)).size, 2);
+  assert.equal(runtime.delivery.pending.size, 0);
+  assert.equal(__test__.runningSubagents.get(child.id), child);
+  assert.equal(sessionOwners.get(session), owner);
+  // A manual follow-up needs no parent continuation request but still reports.
+  completion("manual", "manual snapshot");
+  await until(() => handoffs.length === 3);
+  completion("manual", "duplicate must not replace snapshot");
+  await until(() => !fs.existsSync(runCompletionFile(session, child.id)));
+  assert.equal(handoffs.length, 3);
+  assert.equal(child.abortController, abort);
+  // Closing the process ends supervision without re-sending the last result.
+  inspect = async () => JSON.stringify({ error: { code: "pane_not_found" } });
+  await until(() => !__test__.runningSubagents.has(child.id));
+  assert.equal(sessionOwners.has(session), false);
+  assert.equal(handoffs.length, 3);
 }));

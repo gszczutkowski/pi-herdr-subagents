@@ -102,7 +102,9 @@ Decyzja użytkownika: dalsza śledzona współpraca. `keepOpen` zachowuje nadzó
 - [x] Dostosować rejestr, watcher, publikację kolejnych wyników i komunikaty do wybranego modelu.
 
 Weryfikacja implementacji R5: per-turn run-bound artefakty z niezmiennym snapshotem wyniku, oddzielny lifecycle każdej dostawy w outbox, zachowany watcher i właściciel keepOpen, guarded settled-idle follow-up oraz jawna granica Pi-only. Focused delivery/continuation/resume/profile/rendering: 51/51; lint OK. Bez live herdr E2E; regresje follow-up poniżej pozostają osobnym krokiem.
-- [ ] Przetestować follow-up po pierwszym zakończeniu.
+- [x] Przetestować follow-up po pierwszym zakończeniu.
+
+Weryfikacja regresji R5: `test/keep-open.test.ts` sprawdza wielokrotną publikację dziecka (autoExit true/false), trwały wybór close:false mimo domyślnego closeOnDone:true, snapshoty i identyfikatory tur, brak podwójnej publikacji tool/settled, abort bez wyniku oraz jawne close:true. `test/ownership-execute.test.ts` przechodzi przez rzeczywiste execute resume/watcher i bridge: follow-up po pierwszym wyniku, dokładna wiadomość i dedup komendy, ręczna kolejna tura, idle/open widget, ten sam run/pane/watcher/owner, dwie niezależne dostawy zachowane przez błąd i reload, brak duplikatu oraz zamknięcie nadzoru po zniknięciu pane. Focused 63/63, lint OK; pełne npm test 348/367, te same 19 błędów bazowych (18 Claude/Python, 1 CRLF release). Dowody na mockach OS/API Pi; brak live herdr E2E i brak gwarancji odtworzenia po restarcie.
 
 Problem: terminal zostaje otwarty, ale obserwacja kończy się i wpis znika. Kolejne automatyczne wyniki nie mają obecnie pełnego kanału dostarczenia.
 
