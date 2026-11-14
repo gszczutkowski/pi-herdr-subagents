@@ -256,7 +256,7 @@ export PI_SUBAGENT_LAYOUT=split        # right-hand split
 # export PI_SUBAGENT_LAYOUT=split:down # split below
 ```
 
-Subagent tabs and panes are created without stealing keyboard focus. Launch commands target child panes by explicit ID, so focus and command delivery are independent. Note: the `interactive` option controls parent status notifications, not terminal focus.
+Subagent tabs and panes are created without stealing keyboard focus. Launch commands target child panes by explicit ID, so focus and command delivery are independent. Note: the `interactive` option is retained as metadata, not terminal focus or permission to wake on progress.
 
 ## What's Included
 
@@ -307,8 +307,7 @@ Agents default to running with `pi`, but can run inside any supported harness CL
 Claude Code completion follows the resolved `auto-exit` setting. For autonomous
 runs, its Stop hook publishes the final response even when `--resume` loads prior
 user messages or additional input was sent during the task. Non-auto-exit runs
-remain open until the Claude CLI exits; `interactive` separately controls parent
-status notifications. The hook uses `last_assistant_message` when available and
+remain open until the Claude CLI exits; `interactive` remains independent metadata; observed status changes are panel-only. The hook uses `last_assistant_message` when available and
 falls back to the last 4 MiB of transcript text on older Claude versions. Completion is published
 atomically, after saving the transcript pointer, so Pi cannot consume a partial
 result. A temporarily missing transcript does not block completion.
@@ -369,9 +368,9 @@ The widget header counts **active** vs **open**:
 
 When `activeCount === 0` (every tracked row is open), the border uses an amber accent. Process elapsed time (`MM:SS` on the left) freezes when the process reaches finalizing/completed/failed. Interrupt does **not** freeze that process clock; the interrupted state shows its own duration on the right while the process remains open.
 
-A fixed internal watchdog marks a run as `stalled` when pane inspection fails or the pane disappears without a completion sidecar; valid long-running `active` or `waiting` states do not become `stalled` just because time passes. When a run enters `stalled` or recovers from it, the parent agent receives a steer message so it can react. All other status transitions stay in the widget only.
+A fixed internal watchdog marks a run as `stalled` when pane inspection fails or the pane disappears without a completion sidecar; valid long-running `active` or `waiting` states do not become `stalled` just because time passes. All observed transitions, including `stalled` and recovery, stay in the existing process widget. Ordinary progress never creates a status-message stream or an extra parent turn. A watcher/provider error or explicit child help request is different: it still wakes the parent through the completion outbox.
 
-**Interactive subagents stay silent.** Long-running user-driven subagents (e.g. `planner`, or any `/iterate` fork) do not wake the parent session on `stalled`/`recovered` transitions — the user is working directly in the subagent's pane, and a steer message there would just burn an orchestrator turn on a no-op "still waiting" ping. The widget still updates normally, and activity snapshots are still recorded/classified regardless of the `interactive` setting. By default, agents with `auto-exit: true` are treated as autonomous and get stall pings; agents without it are treated as interactive and stay quiet. Override per-agent with `interactive: true|false` in frontmatter, or per-spawn with `interactive: true|false` on the tool call.
+**Autonomous and interactive subagents are equally quiet for observations.** The widget still refreshes and snapshots are still classified regardless of `interactive`. The compatibility flag retains its frontmatter/per-spawn defaults, but no longer opts autonomous agents into stall pings. This does not suppress results, explicit `caller_ping`, errors, keepOpen follow-up results or retry/recovery handoffs.
 
 #### Configuration
 
@@ -452,7 +451,7 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 | `task`                 | string  | required       | Task prompt for the sub-agent                                                                     |
 | `agent`                | string  | —              | Load defaults from agent definition                                                               |
 | `fork`                 | boolean | `false`        | Force the full-context fork mode for this spawn, overriding any agent `session-mode` frontmatter  |
-| `interactive`          | boolean | derived        | Mark this spawn as interactive (don't wake the parent on stall/recovery). Defaults to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit`. |
+| `interactive`          | boolean | derived        | Interactive metadata (observed stall/recovery is panel-only for every spawn). Defaults to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit`. |
 | `model`                | string  | agent, configured, or parent | Exact authenticated `provider/model-id`; resolution is tool argument → agent frontmatter → per-agent config → global config → parent |
 | `thinking`             | string  | agent or parent | Pi thinking level (`off` through `max`); resolution is tool argument → agent frontmatter → parent |
 | `systemPrompt`         | string  | —              | Append to system prompt                                                                           |
@@ -617,7 +616,7 @@ You are a specialized agent that does X...
 | `spawning`    | boolean | Set `false` to deny all subagent-spawning tools                                                                                                                                                                                                                             |
 | `deny-tools`  | string  | Comma-separated extension tool names to deny                                                                                                                                                                                                                                |
 | `auto-exit`   | boolean | Automatically complete the run after a final response — no `subagent_done` call needed. Recommended for autonomous agents (scout, worker); not for interactive ones (planner). Claude uses its Stop hook; Pi uses its settled lifecycle. Also determines the default value of `interactive` (see below). |
-| `interactive` | boolean | derived        | Override whether stall/recovery transitions wake the parent session. Defaults to the inverse of `auto-exit`: autonomous agents (`auto-exit: true`) are non-interactive and get stall pings; agents without `auto-exit` are interactive and stay quiet. Explicit values take precedence. |
+| `interactive` | boolean | derived        | Compatibility metadata, defaulting to the inverse of `auto-exit`. Explicit values take precedence. Observed stall/recovery never wakes the parent, regardless of this flag. |
 | `cwd`         | string  | Default working directory (absolute or relative to project root)                                                                                                                                                                                                            |
 | `disable-model-invocation` | boolean | Hide this agent from discovery surfaces like `subagents_list`. The agent still remains directly invokable by explicit name via `subagent({ agent: "name", ... })`. |
 
@@ -672,16 +671,9 @@ auto-exit: true
 
 ### `interactive`
 
-Controls whether status transitions (`stalled`, `recovered`) wake the parent session with a steer message.
+Retained compatibility metadata for user-driven sessions. It no longer controls parent wakeups: status transitions (`stalled`, `recovered`) are panel-only for all agents.
 
-**Default:** the inverse of `auto-exit`. Autonomous agents (`auto-exit: true`) are non-interactive and ping the parent on stall/recovery; agents without `auto-exit` are interactive and stay quiet. Bare spawns with no agent defs (e.g. `/iterate` with `fork: true`) are treated as interactive.
-
-**Why it exists:** Interactive agents can run for minutes or hours while the user thinks, types, and reads in the subagent's pane. Child snapshots still update the widget, but stalled/recovered supervision messages rarely need to wake the parent for user-driven sessions. Skipping the steer keeps the parent quiet until the child actually finishes.
-
-**When to override:**
-
-- Set `interactive: false` on an agent that doesn't auto-exit but you still want stall pings for
-- Set `interactive: true` on an autonomous agent you'd rather check on yourself
+**Default:** the inverse of `auto-exit`. Bare spawns with no agent definitions (e.g. `/iterate` with `fork: true`) are interactive. Frontmatter and per-spawn overrides still parse, but neither value enables stall pings. Results/help/errors remain actionable regardless of this flag.
 
 ```yaml
 ---

@@ -241,7 +241,9 @@ Weryfikacja: rzeczywiste registerPlanTools/store/session_start/session_tree i wi
 - [x] Model budzić dla wyników, blokad, pytań i decyzji wymagających reakcji.
 
 Weryfikacja: notification-policy.ts klasyfikuje jawne zdarzenia, delivery.ts stosuje politykę przed enqueue na produkcyjnej granicy outbox. Wyniki/ping/błędy zachowują waking steer, retry i dedup; pytanie/decyzja to kategorie polityki, nie nowe narzędzia. Testy notification-policy/delivery: 20/20; bez live herdr.
-- [ ] Zwykły postęp udostępniać w panelu lub zbiorczym skrócie zamiast strumienia powiadomień.
+- [x] Zwykły postęp udostępniać w panelu lub zbiorczym skrócie zamiast strumienia powiadomień.
+
+Weryfikacja: rzeczywisty callback status refresh nie wysyła subagent_status; aktualizuje lifecycle i istniejący widget zarówno autonomous, jak interactive, także stalled → active. Test produkcyjnej ścieżki sprawdza zmianę renderu i zero send, potem waking result/ping/error. Zachowano legacy renderer historii. Focused notification/delivery/keepOpen/recovery/panel: 35/35; bez live herdr.
 - [ ] Rozważyć niewymuszający zakończenia sesji kanał pytania/postępu dopiero po ustaleniu bezpiecznej kontynuacji żywego dziecka.
 
 ### Dopasowanie instrukcji ról

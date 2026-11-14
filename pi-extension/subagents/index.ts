@@ -61,10 +61,7 @@ import {
 } from "./session.ts";
 import {
   type SubagentStatusState,
-  capStatusLines,
   formatElapsedDuration,
-  formatStatusAggregate,
-  normalizeStatusName,
 } from "./status.ts";
 import {
   getSubagentActivityFile,
@@ -80,8 +77,6 @@ import { registerPlanCommand } from "./plan-preflight.ts";
 import { createDeliveryState, enqueueDelivery, flushDeliveries, pauseDeliveries, restoreDurableDeliveries, type DeliveryState } from "./delivery.ts";
 import {
   createLifecycle,
-  formatLifecycleTransitionLine,
-  lifecycleTransition,
   markCompleted,
   markCompletionDetected,
   markDelivery,
@@ -176,7 +171,7 @@ const SubagentParams = Type.Object({
   interactive: Type.Optional(
     Type.Boolean({
       description:
-        "Mark the subagent as interactive (long-running, user drives the conversation in its own pane). When true, the main session is not woken by status transitions (stalled/recovered) for this subagent. If omitted, falls back to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit` (agents that auto-exit are autonomous and get stall pings; agents that don't are interactive and stay quiet).",
+        "Mark the subagent as interactive (long-running, user drives the conversation in its own pane). If omitted, falls back to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit`. Observed stalled/recovered transitions are panel-only for all agents; results, help requests and errors still wake the parent.",
     }),
   ),
   resumeSessionId: Type.Optional(
@@ -441,10 +436,9 @@ function resolveLaunchBehavior(
  *   1. Explicit `interactive` tool parameter wins.
  *   2. Explicit `interactive` frontmatter field on the agent.
  *   3. Default: the inverse of `auto-exit`. Agents that auto-exit are
- *      autonomous (scout, worker, reviewer) and the parent session should be
- *      woken on stall/recovery transitions. Agents that don't auto-exit are
- *      driven by the user in their own pane (planner, iterate/fork) and
- *      stall pings are noise.
+ *      autonomous (scout, worker, reviewer). Agents that don't auto-exit are
+ *      driven by the user in their own pane (planner, iterate/fork).
+ *      This metadata no longer controls wakeups; observations are panel-only.
  *
  * When no agent defs exist at all (bare `subagent({ name, task })` call,
  * typical for `/iterate` with `fork: true`), `autoExit` is undefined and the
@@ -610,8 +604,7 @@ interface RunningSubagent {
   /** Last projected kind used to detect stalled/recovered transitions. */
   lastProjectedKind?: LifecycleProjection["kind"];
   /**
-   * When true, status transitions (stalled/recovered) do not wake the parent
-   * session via a steer message. The widget still updates locally. Used for
+   * Interactive metadata; all status transitions are panel-only. Used for
    * long-running agents where the user drives the conversation in the
    * subagent's pane (e.g. planner).
    */
@@ -1153,7 +1146,16 @@ function handleSubagentInterrupt(
   };
 }
 
-function startStatusRefresh(pi: ExtensionAPI) {
+export function refreshSubagentStatus(now = Date.now()): void {
+  for (const running of runningSubagents.values()) {
+    // Observation updates lifecycle/panel only. Inactivity is not an explicit blocker.
+    observeRunningSubagent(running, now);
+    running.lastProjectedKind = projectLifecycle(ensureLifecycle(running), now).kind;
+  }
+  updateWidget();
+}
+
+function startStatusRefresh(_pi: ExtensionAPI) {
   if (!config.status.enabled || statusInterval) return;
 
   statusInterval = setInterval(() => {
@@ -1166,52 +1168,8 @@ function startStatusRefresh(pi: ExtensionAPI) {
       return;
     }
 
-    const transitionLines: string[] = [];
-    const now = Date.now();
-    let shouldRefreshWidget = false;
+    refreshSubagentStatus();
 
-    for (const running of runningSubagents.values()) {
-      // Dual-writes lifecycle + statusState for reload hydration; steers use lifecycle only.
-      observeRunningSubagent(running, now);
-      const projection = projectLifecycle(ensureLifecycle(running), now);
-      const transition = lifecycleTransition(running.lastProjectedKind, projection.kind);
-      if (running.lastProjectedKind !== projection.kind) {
-        shouldRefreshWidget = true;
-      }
-      running.lastProjectedKind = projection.kind;
-
-      // Interactive subagents (long-running, user-driven) intentionally don't
-      // wake the parent session on stalled/recovered transitions — the user is
-      // working in the subagent's pane, and a steer message here would burn an
-      // orchestrator turn on a no-op "still waiting" ping. Widget still updates.
-      if (transition && !running.interactive) {
-        transitionLines.push(
-          formatLifecycleTransitionLine(
-            normalizeStatusName(running.name),
-            projection,
-            transition,
-            now,
-            running.startTime,
-            formatElapsedDuration,
-          ),
-        );
-      }
-    }
-
-    if (shouldRefreshWidget) updateWidget();
-
-    if (transitionLines.length > 0) {
-      const capped = capStatusLines(transitionLines, config.status.lineLimit);
-      pi.sendMessage(
-        {
-          customType: "subagent_status",
-          content: formatStatusAggregate(transitionLines, config.status.lineLimit),
-          display: true,
-          details: { lines: capped.visibleLines, overflow: capped.overflow },
-        },
-        { triggerTurn: true, deliverAs: "steer" },
-      );
-    }
   }, 1000);
 
   (globalThis as any)[STATUS_INTERVAL_KEY] = statusInterval;
