@@ -184,7 +184,9 @@ Decyzja użytkownika: własny minimalny magazyn planów i zadań w rozszerzeniu,
 - [x] Nie utrzymywać dwóch niezależnych list wymagających ręcznej synchronizacji.
 
 Weryfikacja: instrukcje planner/worker/plan używają wyłącznie rodzicielskiego `plan_read`/`plan_update`; dzieci zwracają propozycje i dowody, rodzic importuje i weryfikuje akceptację. `plan.md` pozostaje artefaktem projektu, nie drugą listą statusów. Przykłady komend odpowiadają schematowi `plan-tools.ts`; jawne attach `run` bez nieistniejącego adaptera.
-- [ ] Sprawdzać dostępność wymaganych narzędzi i umiejętności przed obietnicą pełnego workflow.
+- [x] Sprawdzać dostępność wymaganych narzędzi i umiejętności przed obietnicą pełnego workflow.
+
+Weryfikacja: `/plan` wykonuje command-time preflight aktywnych narzędzi, odkrytych ról, wymaganych przez role umiejętności i ich plików, terminala oraz rzeczywistego pliku instrukcji. Błędy wskazują naprawę; opcjonalne helpery mają opisany manualny fallback. Zarejestrowana komenda: `test/plan-preflight.test.ts`; focused preflight/role-guidance 6/6, lint exit 0. Bez live herdr.
 - [ ] Zapewnić dostęp modelu do aktualnego skrótu planu także po kompakcji; sam widget i wpisy display-only nie stanowią kontekstu modelu.
 
 Akceptacja etapu: użytkownik i agent główny potrafią jednoznacznie wskazać, co jest zaakceptowane, co jest wykonywane, co jest zablokowane i dlaczego.
