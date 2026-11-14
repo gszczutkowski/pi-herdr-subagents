@@ -1,7 +1,7 @@
 # Plan rozwoju architektury i widoczności podagentów
 
 Data: 2026-11-14
-Status: zatwierdzony do realizacji — wdrażanie punktami, osobny commit na punkt
+Status: wdrożony — 65/65 punktów; osobne commity na punkty, poprawki po przeglądach i jawne granice weryfikacji
 Zakres: pi-herdr-subagents, bieżące drzewo robocze wraz z niezacommitowanymi zmianami
 
 ## 1. Cel i główna rekomendacja
@@ -337,7 +337,9 @@ Weryfikacja: `automated-render-boundary.test.ts` łączy rzeczywiste rejestracje
 - [x] Testy live: równoległy spawn, wynik podczas reloadu, interrupt/kontynuacja/resume, wybrana semantyka keepOpen.
 
 Akceptacja rodzica: niezależnie od raportu wykonawcy sprawdzono `assertions.json` i `cleanup.json` wszystkich pięciu końcowych, uwierzytelnionych prób Pi TUI/HC oraz zgodność 60 hashy aktualnych źródeł z `source-manifest.json`. Cztery próby lifecycle potwierdzają równoległy spawn z wynikiem w rzeczywistym, instrumentowanym oknie reloadu, closed resume, dwa wyniki keepOpen w tej samej sesji i interrupt → kontynuację tego samego procesu. Cała końcowa komenda: 5/5, zero błędów i pominięć. Szczegóły i granice: `test/integration/HC-TUI-VERIFICATION.md`; prywatne dowody `.git/verification/2026-11-14-final-main-confirmation/summary.json`. Wcześniejsze nieudane próby zachowano, nie policzono ich jako zaliczonych. Dowód dotyczy Pi/HC i wskazanego modelu, nie wszystkich harnessów ani wizualnego wyglądu.
-- [ ] Testy restartu i odtworzenia nadzoru, jeśli taka gwarancja zostanie wdrożona.
+- [x] Testy restartu i odtworzenia nadzoru, jeśli taka gwarancja zostanie wdrożona.
+
+Akceptacja rodzica: piąta końcowa próba live zabijała wyłącznie własny proces rodzica, potwierdzała jego śmierć i uruchamiała nowego rodzica z tym samym plikiem sesji. Zmieniona generacja oraz świeży challenge/response oryginalnego dziecka potwierdziły artifact-only supervision; nie powstał nowy run ani drugi startup dziecka, odzyskany rodzic odrzucał sterowanie niezweryfikowanym panelem, a dwa wyniki zostały zachowane. Rodzic niezależnie sprawdził zaliczone asercje, sprzątnięcie i aktualne hashe źródeł; raport i prywatne dowody jak wyżej. Nie oznacza to exactly-once ani automatycznego ponawiania pracy. Końcowe `npm test`: 429/448, zero pominięć, te same 19 błędów bazowych (hook Claude/Python i test release/CRLF); lint i diff-check bez błędów. Pełny zestaw nie jest deklarowany jako zielony.
 - [x] Testy możliwości wspieranych harnessów; jawne odrzucanie nieobsługiwanych operacji.
 
 ## 10. Źródła i punkty odniesienia
