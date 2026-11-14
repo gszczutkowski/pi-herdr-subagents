@@ -66,6 +66,7 @@ import {
   type SubagentActivityState,
 } from "./activity.ts";
 import { registerSubagentAssignmentRenderer } from "./assignment.ts";
+import { createDeliveryState, enqueueDelivery, pauseDeliveries, type DeliveryState } from "./delivery.ts";
 import {
   createLifecycle,
   formatLifecycleTransitionLine,
@@ -606,6 +607,7 @@ interface SubagentRuntime {
   latestCtx?: ExtensionContext;
   modelCatalog?: string;
   agentCatalog?: string;
+  delivery?: DeliveryState;
 }
 
 function createSubagentRuntime(): SubagentRuntime {
@@ -617,6 +619,14 @@ const runtime: SubagentRuntime =
   (globalThis as any)[RUNTIME_KEY] ??
   ((globalThis as any)[RUNTIME_KEY] = createSubagentRuntime());
 const runningSubagents = runtime.runningSubagents;
+const delivery = runtime.delivery ??= createDeliveryState();
+
+function enqueueCompletion(running: RunningSubagent, message: Parameters<ExtensionAPI["sendMessage"]>[0]) {
+  enqueueDelivery(delivery, running, message, () => {
+    runningSubagents.delete(running.id);
+    updateWidget();
+  });
+}
 
 export function shouldPreserveSubagentsOnShutdown(reason: unknown): boolean {
   return reason === "reload";
@@ -647,6 +657,54 @@ export function shouldDeliverSubagentCompletion(
 
 export function selectCompletionApi<T>(previous: T, current: T | undefined): T {
   return current ?? previous;
+}
+
+/** Shared by spawn and resume; transport failures stay inside the outbox. */
+export function enqueueSubagentCompletion(running: RunningSubagent, result: SubagentResult): void {
+  if (!shouldDeliverSubagentCompletion(running)) return;
+  if (result.ping) {
+    const sessionRef = `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`;
+    enqueueCompletion(running, {
+      customType: "subagent_ping",
+      content: `Sub-agent "${result.ping.name}" needs help (${formatElapsed(result.elapsed)}):\n\n${result.ping.message}${sessionRef}`,
+      display: true,
+      details: {
+        name: result.ping.name, message: result.ping.message,
+        agent: running.agent, sessionFile: result.sessionFile,
+      },
+    });
+    return;
+  }
+  const base = resolveResultPresentation(result, running.name);
+  enqueueCompletion(running, {
+    customType: "subagent_result",
+    content: running.runtimePlan?.runtimeMismatch
+      ? `${base}\n\nRuntime warning: ${running.runtimePlan.runtimeMismatch}` : base,
+    display: true,
+    details: {
+      name: running.name, recipient: "Parent", task: running.task,
+      response: result.errorMessage ? `Error: ${result.errorMessage}` : result.summary,
+      keepOpen: result.keepOpen, agent: running.agent, exitCode: result.exitCode,
+      elapsed: result.elapsed, sessionFile: result.sessionFile,
+      ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+      ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
+      ...(running.runtimePlan ? { runtimePlan: running.runtimePlan } : {}),
+    },
+  });
+}
+
+export function enqueueSubagentError(running: RunningSubagent, err: unknown, resumed = false): void {
+  if (!shouldDeliverSubagentCompletion(running)) return;
+  const error = err instanceof Error ? err.message : String(err);
+  enqueueCompletion(running, {
+    customType: "subagent_result",
+    content: resumed ? `Resume error: ${error}` : `Sub-agent "${running.name}" error: ${error}`,
+    display: true,
+    details: {
+      name: running.name, recipient: "Parent", task: running.task,
+      agent: running.agent, sessionFile: running.sessionFile, error, response: error,
+    },
+  });
 }
 
 // ── Widget management ──
@@ -1375,6 +1433,7 @@ async function watchSubagent(
 export default function subagentsExtension(pi: ExtensionAPI) {
   registerSubagentAssignmentRenderer(pi);
   runtime.pi = pi;
+  delivery.api = pi;
 
   // Capture the UI context for widget updates and restore presentation for
   // subagents whose watchers survived a reload.
@@ -1418,6 +1477,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     }
 
     cleanupSubagentsForShutdown((event as any).reason, runningSubagents);
+    if (!shouldPreserveSubagentsOnShutdown((event as any).reason)) {
+      pauseDeliveries(delivery);
+      delivery.pending.clear();
+    }
   });
 
   // Tools denied via PI_DENY_TOOLS env var (set by parent agent based on frontmatter)
@@ -1509,95 +1572,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         startStatusRefresh(pi);
 
         // Fire-and-forget: start watching in background
-        watchSubagent(running, watcherAbort.signal)
-          .then((result) => {
-            if (!shouldDeliverSubagentCompletion(running)) {
-              running.lifecycle = markDelivery(running.lifecycle, "suppressed");
-              runningSubagents.delete(running.id);
-              updateWidget();
-              return;
-            }
-            running.lifecycle = markDelivery(running.lifecycle, "delivered");
-            runningSubagents.delete(running.id);
-            updateWidget();
-            const completionApi = selectCompletionApi(pi, runtime.pi);
-
-            if (result.ping) {
-              // Subagent is requesting help — steer a ping message with session path for resume
-              const sessionRef = `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`;
-              completionApi.sendMessage(
-                {
-                  customType: "subagent_ping",
-                  content: `Sub-agent "${result.ping.name}" needs help (${formatElapsed(result.elapsed)}):\n\n${result.ping.message}${sessionRef}`,
-                  display: true,
-                  details: {
-                    name: result.ping.name,
-                    message: result.ping.message,
-                    agent: running.agent,
-                    sessionFile: result.sessionFile,
-                  },
-                },
-                { triggerTurn: true, deliverAs: "steer" },
-              );
-              return;
-            }
-
-            const basePresentation = resolveResultPresentation(result, running.name);
-            const presentation = running.runtimePlan?.runtimeMismatch
-              ? `${basePresentation}\n\nRuntime warning: ${running.runtimePlan.runtimeMismatch}`
-              : basePresentation;
-
-            completionApi.sendMessage(
-              {
-                customType: "subagent_result",
-                content: presentation,
-                display: true,
-                details: {
-                  name: running.name,
-                  recipient: "Parent",
-                  task: running.task,
-                  response: result.errorMessage ? `Error: ${result.errorMessage}` : result.summary,
-                  keepOpen: result.keepOpen,
-                  agent: running.agent,
-                  exitCode: result.exitCode,
-                  elapsed: result.elapsed,
-                  sessionFile: result.sessionFile,
-                  ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
-                  ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
-                  ...(running.runtimePlan ? { runtimePlan: running.runtimePlan } : {}),
-                },
-              },
-              { triggerTurn: true, deliverAs: "steer" },
-            );
-          })
-          .catch((err) => {
-            if (!shouldDeliverSubagentCompletion(running)) {
-              running.lifecycle = markDelivery(running.lifecycle, "suppressed");
-              runningSubagents.delete(running.id);
-              updateWidget();
-              return;
-            }
-            running.lifecycle = markDelivery(running.lifecycle, "delivered");
-            runningSubagents.delete(running.id);
-            updateWidget();
-            selectCompletionApi(pi, runtime.pi).sendMessage(
-              {
-                customType: "subagent_result",
-                content: `Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`,
-                display: true,
-                details: {
-                  name: running.name,
-                  recipient: "Parent",
-                  task: running.task,
-                  agent: running.agent,
-                  sessionFile: running.sessionFile,
-                  error: err?.message ?? String(err),
-                  response: err?.message ?? String(err),
-                },
-              },
-              { triggerTurn: true, deliverAs: "steer" },
-            );
-          });
+        watchSubagent(running, watcherAbort.signal).then(
+          (result) => enqueueSubagentCompletion(running, result),
+          (err) => enqueueSubagentError(running, err),
+        );
 
         // Return immediately
         return {
@@ -1975,100 +1953,22 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const watcherAbort = new AbortController();
         running.abortController = watcherAbort;
 
-        watchSubagent(running, watcherAbort.signal)
-          .then((result) => {
-            if (!shouldDeliverSubagentCompletion(running)) {
-              running.lifecycle = markDelivery(running.lifecycle, "suppressed");
-              runningSubagents.delete(running.id);
-              updateWidget();
-              return;
+        watchSubagent(running, watcherAbort.signal).then(
+          (result) => {
+            if (!shouldDeliverSubagentCompletion(running)) return;
+            try {
+              const summary = result.ping ? result.summary
+                : findLastAssistantMessage(getNewEntries(params.sessionPath, entryCountBefore)) ??
+                  (result.errorMessage ? `Subagent error: ${result.errorMessage}`
+                    : result.exitCode !== 0 ? `Resumed session exited with code ${result.exitCode}`
+                      : "Resumed session exited without new output");
+              enqueueSubagentCompletion(running, { ...result, summary, sessionFile: params.sessionPath });
+            } catch (err) {
+              enqueueSubagentError(running, err, true);
             }
-            running.lifecycle = markDelivery(running.lifecycle, "delivered");
-            runningSubagents.delete(running.id);
-            updateWidget();
-            const completionApi = selectCompletionApi(pi, runtime.pi);
-
-            if (result.ping) {
-              const sessionRef = `\n\nSession: ${params.sessionPath}\nResume: pi --session ${params.sessionPath}`;
-              completionApi.sendMessage(
-                {
-                  customType: "subagent_ping",
-                  content: `Sub-agent "${result.ping.name}" needs help (${formatElapsed(result.elapsed)}):\n\n${result.ping.message}${sessionRef}`,
-                  display: true,
-                  details: {
-                    name: result.ping.name,
-                    message: result.ping.message,
-                    sessionFile: params.sessionPath,
-                  },
-                },
-                { triggerTurn: true, deliverAs: "steer" },
-              );
-              return;
-            }
-
-            const allEntries = getNewEntries(params.sessionPath, entryCountBefore);
-            const summary = findLastAssistantMessage(allEntries) ??
-              (result.errorMessage
-                ? `Subagent error: ${result.errorMessage}`
-                : result.exitCode !== 0
-                  ? `Resumed session exited with code ${result.exitCode}`
-                  : "Resumed session exited without new output");
-            const basePresentation = resolveResultPresentation(
-              { ...result, summary, sessionFile: params.sessionPath },
-              name,
-            );
-            const presentation = running.runtimePlan?.runtimeMismatch
-              ? `${basePresentation}\n\nRuntime warning: ${running.runtimePlan.runtimeMismatch}`
-              : basePresentation;
-
-            completionApi.sendMessage(
-              {
-                customType: "subagent_result",
-                content: presentation,
-                display: true,
-                details: {
-                  name,
-                  recipient: "Parent",
-                  task: params.message ?? "resumed session",
-                  response: result.errorMessage ? `Error: ${result.errorMessage}` : summary,
-                  keepOpen: result.keepOpen,
-                  exitCode: result.exitCode,
-                  elapsed: result.elapsed,
-                  sessionFile: params.sessionPath,
-                  ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
-                  ...(running.runtimePlan ? { runtimePlan: running.runtimePlan } : {}),
-                },
-              },
-              { triggerTurn: true, deliverAs: "steer" },
-            );
-          })
-          .catch((err) => {
-            if (!shouldDeliverSubagentCompletion(running)) {
-              running.lifecycle = markDelivery(running.lifecycle, "suppressed");
-              runningSubagents.delete(running.id);
-              updateWidget();
-              return;
-            }
-            running.lifecycle = markDelivery(running.lifecycle, "delivered");
-            runningSubagents.delete(running.id);
-            updateWidget();
-            selectCompletionApi(pi, runtime.pi).sendMessage(
-              {
-                customType: "subagent_result",
-                content: `Resume error: ${err?.message ?? String(err)}`,
-                display: true,
-                details: {
-                  name,
-                  recipient: "Parent",
-                  task: params.message ?? "resumed session",
-                  sessionFile: params.sessionPath,
-                  error: err?.message ?? String(err),
-                  response: err?.message ?? String(err),
-                },
-              },
-              { triggerTurn: true, deliverAs: "steer" },
-            );
-          });
+          },
+          (err) => enqueueSubagentError(running, err, true),
+        );
 
         return {
           content: [{ type: "text", text: `Session "${name}" resumed.` }],
