@@ -334,7 +334,7 @@ Przed uznaniem wdrożenia za zakończone:
 - [ ] Testy renderowania dla długich planów, wąskich terminali i historii wyników.
 - [ ] Testy live: równoległy spawn, wynik podczas reloadu, interrupt/kontynuacja/resume, wybrana semantyka keepOpen.
 - [ ] Testy restartu i odtworzenia nadzoru, jeśli taka gwarancja zostanie wdrożona.
-- [ ] Testy możliwości wspieranych harnessów; jawne odrzucanie nieobsługiwanych operacji.
+- [x] Testy możliwości wspieranych harnessów; jawne odrzucanie nieobsługiwanych operacji.
 
 ## 10. Źródła i punkty odniesienia
 

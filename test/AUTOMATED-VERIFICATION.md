@@ -18,7 +18,17 @@ No model or live herdr calls are needed. Each checked bullet has its own commit.
   `plan-persistence.test.ts`, `plan-branches.test.ts`, `plan-preflight.test.ts`,
   `plan-runtime.test.ts` (15 tests passed with the new seam).
 - [ ] Long / narrow / history rendering.
-- [ ] Supported harnesses and explicit rejection.
+- [x] Supported harnesses and explicit rejection.
+  New seam: `automated-harness-boundary.test.ts` exercises actual launch rejection
+  with a text assignment contract before terminal/artifact/task side effects,
+  then standalone Codex command construction and real durable artifact recovery
+  into a review-only native task. Foreign recovery is explicitly unverified and
+  never controls/relaunches a terminal; tracked continuation remains Pi-only.
+  Existing matrix/command validation: `harness-capabilities.test.ts`,
+  `harness-drivers.test.ts`, `contract-compatibility.test.ts`,
+  `launch-profile.test.ts`, `live-continuation.test.ts`, `runtime-recovery.test.ts`
+  (72 tests passed with the new seam). This is mocked transport/command and
+  artifact validation, not a claim that foreign CLIs ran live.
 
 Logs are local temporary artifacts, not committed fixtures. Full-suite green is
 not claimed: known environment Python-hook / CRLF failures are outside this scope.
