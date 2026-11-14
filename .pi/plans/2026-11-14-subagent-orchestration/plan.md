@@ -157,7 +157,9 @@ Nie utożsamiać sukcesu procesu z sukcesem zadania. Zgłoszenie wykonania przez
 
 ### Panel głównej sesji
 
-- [ ] Wyświetlać listę punktów, statusy, role/właścicieli, blokady i licznik zaakceptowanych zadań.
+- [x] Wyświetlać listę punktów, statusy, role/właścicieli, blokady i licznik zaakceptowanych zadań.
+
+Weryfikacja Panel 1: `plan-view.ts` jest czystą projekcją magazynu; natywny widget rejestrowany przez `registerPlanTools`, bez zmiany `/plan` ani tur modelu. Role/właściciele to jawne pole owner (bez zgadywania roli runtime); checkbox tylko dla accepted. Subskrypcja save/restore i odświeżanie narzędzi także po błędzie. `test/plan-view.test.ts`: 3/3, rzeczywisty SessionManager i zarejestrowane execute, osiem statusów, Unicode/wąskie terminale/theme, tree/reload/detach/uszkodzony schemat/pusta gałąź. Bez live herdr i bez adaptera caller_ping.
 - [ ] Pozostawiać zakończone zadania w planie, mimo usunięcia agentów z widgetu procesów.
 - [ ] Zachować blokadę i jej przyczynę po `caller_ping`.
 - [ ] Dla długich planów udostępnić skrót oraz rozwijaną pełną listę.

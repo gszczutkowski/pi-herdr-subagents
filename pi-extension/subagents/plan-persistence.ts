@@ -20,6 +20,15 @@ export interface PlanView {
 
 export class PlanPersistence {
   private recovery = new Map<string, string | undefined>();
+  private listeners = new Set<(sm: Manager) => void>();
+  subscribe(listener: (sm: Manager) => void): () => void {
+    this.listeners.add(listener);
+    return () => { this.listeners.delete(listener); };
+  }
+  private changed(sm: Manager): void {
+    // A failed presentation observer must not change a durable command's result.
+    for (const listener of this.listeners) { try { listener(sm); } catch { /* UI is best effort. */ } }
+  }
   private readonly append: ExtensionAPI["appendEntry"];
   private readonly child: boolean;
   constructor(append: ExtensionAPI["appendEntry"], child: boolean) { this.append = append; this.child = child; }
@@ -40,7 +49,9 @@ export class PlanPersistence {
     for (const task of view.snapshot?.tasks ?? []) {
       if (task.status === "in_progress") this.recovery.set(task.taskId, task.attempts.at(-1)?.attemptId);
     }
-    return this.read(sm);
+    const restored = this.read(sm);
+    this.changed(sm);
+    return restored;
   }
   private storageError(sm: Manager): string | undefined {
     return faults.get(this.key(sm)) ?? (this.child ? "Child sessions cannot write parent plans" :
@@ -121,8 +132,10 @@ export class PlanPersistence {
     } catch (error) {
       const message = `Plan append failed; writes disabled until explicit reconcile: ${String(error)}`;
       faults.set(this.key(sm), message);
+      this.changed(sm);
       throw new Error(message);
     }
+    this.changed(sm);
     return validated;
   }
   create(sm: Manager, expectedRevision: number, title: string): PlanSnapshot {

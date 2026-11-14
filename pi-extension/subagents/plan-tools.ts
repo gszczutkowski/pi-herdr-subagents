@@ -4,6 +4,7 @@ import { Value } from "@sinclair/typebox/value";
 import * as store from "./plan-store.ts";
 import { PlanPersistence } from "./plan-persistence.ts";
 import { registerPlanContext } from "./plan-context.ts";
+import { registerPlanView } from "./plan-view-registration.ts";
 
 const text = () => Type.String({ minLength: 1, maxLength: 8192 });
 const list = <T extends ReturnType<typeof text>>(item: T) => Type.Array(item, { maxItems: 1000 });
@@ -60,10 +61,11 @@ function response(details: unknown) {
   return { content: [{ type: "text" as const, text: output.content + (output.truncated ? "\n[Truncated; use plan_read with taskId for details]" : "") }], details };
 }
 
-/** Single persistence boundary shared by tools and the request-time context projection. */
+/** One persistence boundary for tools, request-time context and the native plan view. */
 export function registerPlanTools(pi: ExtensionAPI): PlanPersistence {
   const persistence = new PlanPersistence((type, data) => pi.appendEntry(type, data), Boolean(process.env.PI_SUBAGENT_ID || process.env.PI_SUBAGENT_SESSION));
-  const restore = (_event: unknown, ctx: ExtensionContext) => { persistence.restore(ctx.sessionManager); };
+  const refresh = registerPlanView(pi, persistence);
+  const restore = (_event: unknown, ctx: ExtensionContext) => { persistence.restore(ctx.sessionManager); refresh(ctx); };
   pi.on("session_start", restore);
   pi.on("session_tree", restore);
   pi.registerTool({
@@ -71,10 +73,12 @@ export function registerPlanTools(pi: ExtensionAPI): PlanPersistence {
     description: "Read the active branch's durable plan, revision and recovery uncertainty. Optional taskId returns full task details. No runtime liveness is implied. Output bounded to 40KB.",
     parameters: object({ taskId: Type.Optional(text()), reconcile: Type.Optional(Type.Boolean()) }),
     async execute(_id, params, _signal, _update, ctx) {
+      try {
       const view = params.reconcile ? persistence.reconcile(ctx.sessionManager) : persistence.read(ctx.sessionManager);
       const plan = view.snapshot;
       if (params.taskId && !plan?.tasks.some(task => task.taskId === params.taskId)) throw new Error("Unknown task");
       return response({ ...view, snapshot: plan ? { ...plan, tasks: params.taskId ? plan.tasks.filter(task => task.taskId === params.taskId) : plan.tasks.map(task => ({ taskId: task.taskId, title: task.title, status: task.status, statusReason: task.statusReason })) } : undefined });
+      } finally { refresh(ctx); }
     },
   });
   pi.registerTool({
@@ -82,6 +86,7 @@ export function registerPlanTools(pi: ExtensionAPI): PlanPersistence {
     description: "Parent-only revision-checked durable commands (not snapshot replacement). Read first; supply planId and expectedRevision. Criteria/artifact IDs are UUIDs supplied by caller. Attempts/runs are references only, never launches. Results require original authority. Acceptance requires review and evidence for all criteria. Definition edits invalidate acceptance. Foreign/forked or historical plans are read-only until explicit detach (new planId/authority; inherited attempts need retry). No --no-session/setup-only durability.",
     parameters: PlanUpdateParams,
     async execute(_id, params, signal, _update, ctx) {
+      try {
       signal?.throwIfAborted();
       if (!Value.Check(PlanUpdateParams, params)) throw new Error("Invalid bounded plan command");
       const c = params.command;
@@ -89,6 +94,7 @@ export function registerPlanTools(pi: ExtensionAPI): PlanPersistence {
         c.action === "detach" ? persistence.detach(ctx.sessionManager, c.planId, params.expectedRevision, c.reason) :
         persistence.mutate(ctx.sessionManager, c.planId, params.expectedRevision, (plan, context) => apply(plan, context, c), c.action === "result" ? c.origin : undefined);
       return response({ planId: snapshot.planId, revision: snapshot.revision, authority: snapshot.authority, tasks: snapshot.tasks });
+      } finally { refresh(ctx); }
     },
   });
   registerPlanContext(pi, persistence);
