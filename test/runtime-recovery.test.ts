@@ -192,7 +192,8 @@ test("durable observer preserves original settlements across reload gaps and rec
       const fresh=host(delivered);
       await observeSubagentCompletion(children[1],Promise.resolve(output(children[1])));
       const base=runCompletionFile(children[2].sessionFile,'artifact');fs.mkdirSync(base+'.events',{recursive:true});
-      fs.writeFileSync(base+'.events/evidence.json',JSON.stringify({type:'done',runId:'artifact',eventId:'evidence',summary:'retained original'}));
+      const structuredResult={status:'complete',summary:'Short recovery proposal',artifacts:[],checks:[],unmetCriterionIds:[],risks:[]};
+      fs.writeFileSync(base+'.events/evidence.json',JSON.stringify({type:'done',runId:'artifact',eventId:'evidence',summary:'Detailed retained assistant final',structuredResult}));
       assert.equal(delivered.length,0);assert.equal(stale.length,0);
       await fresh.get('session_start')({reason:'reload'},ctx);
       await fresh.get('session_start')({reason:'reload'},ctx);
@@ -203,7 +204,11 @@ test("durable observer preserves original settlements across reload gaps and rec
         const messages=delivered.filter(m=>m.details.eventId==='subagent:'+child.id+':completion:'+child.id+'-event');
         assert.equal(messages.length,1);assert.equal(messages[0].details.response,'original '+child.id);
       }
-      assert.equal(delivered.find(m=>m.details.eventId==='subagent:artifact:completion:evidence').details.response,'retained original');
+      const recovered=delivered.find(m=>m.details.eventId==='subagent:artifact:completion:evidence');
+      assert.equal(recovered.details.response,'Detailed retained assistant final');
+      assert.deepEqual(recovered.details.structuredResult,structuredResult);
+      assert.match(recovered.content,/proposal, requires parent review/);
+      assert.deepEqual(store.snapshot().outbox[recovered.details.eventId].envelope.message,recovered);
       // A real branch mismatch still fences both observer enqueue and fallback;
       // neither callback may produce an unhandled rejected observer promise.
       runtime.latestCtx={...ctx,sessionManager:{...ctx.sessionManager,getBranch:()=>[]}};

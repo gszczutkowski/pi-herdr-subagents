@@ -1552,7 +1552,7 @@ async function watchSubagent(
         return {
           name,
           task,
-          summary: result.structuredResult?.summary ?? result.summary ?? extracted.summary,
+          summary: result.summary ?? extracted.summary,
           structuredResult: result.structuredResult, resultDiagnostic: result.resultDiagnostic,
           eventId: result.eventId, sessionFile,
           exitCode: result.exitCode,
@@ -1619,7 +1619,7 @@ async function watchSubagent(
     return {
       name,
       task,
-      summary: result.structuredResult?.summary ?? result.summary ?? summary,
+      summary: result.summary ?? summary,
       structuredResult: result.structuredResult,
       resultDiagnostic: result.resultDiagnostic,
       eventId: result.eventId,

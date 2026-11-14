@@ -146,7 +146,14 @@ test("registered task-bound spawn, live/closed resume, failure isolation and res
     continuationChild = undefined;
     const structuredResult = { status: "complete" as const, summary: "Implementation proposal", artifacts: ["report.txt"],
       checks: [{ criterionIds: [criterionId], ref: "report.txt#check", outcome: "passed" as const }], unmetCriterionIds: [], risks: [] };
-    enqueueSubagentCompletion(child, { ...result(child, "turn-a"), structuredResult, keepOpen: true });
+    const { runCompletionFile } = await import("../pi-extension/subagents/run-artifacts.ts");
+    fs.writeFileSync(runCompletionFile(child.sessionFile, child.id), JSON.stringify({ type: "done", runId: child.id,
+      eventId: "turn-a", summary: "Detailed immutable assistant final text", structuredResult, keepOpen: true }));
+    const deliveryDeadline = Date.now() + 5000;
+    while (sent.length < 1 && Date.now() < deliveryDeadline) await new Promise(r => setTimeout(r, 25));
+    assert.equal(sent.length, 1, "real watcher delivers the structured completion");
+    assert.equal(sent[0].details.response, "Detailed immutable assistant final text");
+    assert.match(sent[0].content, /Detailed immutable assistant final text/);
     assert.deepEqual(sent[0].details.structuredResult, structuredResult);
     assert.match(sent[0].content, /proposal, requires parent review/);
     assert.equal(read().tasks[0].evidence.length, 0);

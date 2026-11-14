@@ -69,13 +69,24 @@ test("spawn and closed-session resume durably record intent before terminal disp
     const child = __test__.runningSubagents.get(resumed.details.id)!;
     const events = `${runCompletionFile(saved, child.id)}.events`;
     fs.mkdirSync(events, { recursive: true });
+    const structuredResult = { status: "complete", summary: "Short structured proposal", artifacts: [], checks: [], unmetCriterionIds: [], risks: [] };
     for (const [index, eventId] of ["turn-a", "turn-b"].entries()) {
-      fs.writeFileSync(join(events, `${index}.json`), JSON.stringify({ type: "done", runId: child.id, eventId, summary: eventId, keepOpen: true }));
+      fs.writeFileSync(join(events, `${index}.json`), JSON.stringify({ type: "done", runId: child.id, eventId,
+        summary: `Detailed assistant final ${eventId}`, structuredResult, keepOpen: true }));
     }
     const deadline = Date.now() + 5000;
     while (notifications.length < 2 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25));
+    assert.equal(notifications.length, 2);
+    for (const [index, notification] of notifications.entries()) {
+      assert.equal(notification.details.response, `Detailed assistant final ${["turn-a", "turn-b"][index]}`);
+      assert.deepEqual(notification.details.structuredResult, structuredResult);
+      assert.match(notification.content, /proposal, requires parent review/);
+    }
     const manifest = JSON.parse(fs.readFileSync(manifestFile, "utf8"));
     assert.equal(Object.keys(manifest.outbox).length, 2);
+    for (const notification of notifications) {
+      assert.deepEqual(manifest.outbox[notification.details.eventId].envelope.message, JSON.parse(JSON.stringify(notification)));
+    }
     assert.equal(manifest.runs[child.id].entryCountBefore, 1);
     assert.ok(Object.values(manifest.outbox).every((event: any) => event.status === "handedOff"));
     assert.equal(fs.readdirSync(events).length, 2, "immutable child events retained");
