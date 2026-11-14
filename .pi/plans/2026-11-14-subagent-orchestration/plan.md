@@ -102,7 +102,7 @@ Problem: terminal zostaje otwarty, ale obserwacja kończy się i wpis znika. Kol
 
 - [x] Dodać deklarację obsługi fork i innych operacji wymagających konkretnego harnessu.
 - [x] Odrzucać nieobsługiwane kombinacje przed utworzeniem terminala.
-- [ ] Dodać testy zgodności obietnicy dziedziczenia kontekstu z faktyczną komendą uruchomienia.
+- [x] Dodać testy zgodności obietnicy dziedziczenia kontekstu z faktyczną komendą uruchomienia.
 
 Problem: opcja fork nie zapewnia jednakowej semantyki w sterownikach Pi, Claude i Codex.
 

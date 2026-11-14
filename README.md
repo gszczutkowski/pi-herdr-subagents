@@ -459,6 +459,10 @@ Choose how a subagent session starts:
 
 `fork: true` on the tool call always forces the `fork` mode for that specific spawn. `/iterate` uses this explicit override on purpose.
 
+Pi supports all three modes by loading the selected session file. Claude, Codex, OpenCode, Grok, and generic command templates support only `standalone`: they do not consume seeded Pi JSONL. Requesting `lineage-only` or `fork` with those harnesses fails before creating a pane or session artifacts; it never silently drops the requested transfer.
+
+`resumeSessionId` is a separate native-harness operation, supported only by Claude (`--resume`) and OpenCode (`--session`). It cannot be combined with Pi session transfer. Other harnesses reject it instead of ignoring it; use `subagent_resume` for Pi session-file resume. Turn-only interrupts and structured activity snapshots remain Pi-only.
+
 ```yaml
 ---
 name: planner
