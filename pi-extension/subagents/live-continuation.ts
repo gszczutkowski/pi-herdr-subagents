@@ -81,7 +81,7 @@ interface LiveChild {
 export async function continueLiveChild(owner: SessionOwner, child: LiveChild | undefined,
   params: { message?: string; name?: string },
   transport: { inspect: (surface: string) => Promise<PaneInspection>; send: (surface: string, text: string) => void;
-    timeoutMs?: number },
+    beforeSend?: () => void; timeoutMs?: number },
 ): Promise<{ requestId: string; status: "accepted" | "pending" }> {
   if (owner.continuationRequestId) throw new Error(`Continuation ${owner.continuationRequestId} is in flight or uncertain; do not retry.`);
   if (!child || child.id !== owner.runId || child.cli !== "pi" || !child.activityFile ||
@@ -108,6 +108,7 @@ export async function continueLiveChild(owner: SessionOwner, child: LiveChild | 
     publish(join(dir, `${requestId}.request.json`), {
       runId: child.id, requestId, sessionFile: state.sessionFile, idleToken: state.idleToken, message: params.message,
     });
+    transport.beforeSend?.(); // Rejected validation is not a transport attempt.
     dispatched = true; // A throwing transport may already have submitted the input.
     try { transport.send(child.surface, continuationCommand(requestId)); } catch { /* reconcile durable acknowledgement below */ }
     const deadline = Date.now() + (transport.timeoutMs ?? 3000);

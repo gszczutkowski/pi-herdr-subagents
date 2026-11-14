@@ -2147,24 +2147,21 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         if (liveOwner && runningSubagents.has(liveOwner.runId)) {
           const child = runningSubagents.get(liveOwner.runId)!;
           if (runtime.treeSuspension || child.terminalActionsAllowed === false) throw new Error("Live continuation requires verified terminal custody");
-          const result = await continueLiveChild(liveOwner, child, params, { inspect: inspectPane, send: (surface, command) => {
+          const result = await continueLiveChild(liveOwner, child, params, { inspect: inspectPane, beforeSend: () => {
             if (runtime.treeSuspension || child.terminalActionsAllowed === false) throw new Error("Terminal custody was detached during continuation");
             child.durableStore?.assertCustody();
             // Validate after async inspection, immediately before dispatch.
-            try {
-              child.planTask = bindPlanRun(runtime.plans!, ctx, child.id, params.planTask, child.planTask);
+            child.planTask = bindPlanRun(runtime.plans!, ctx, child.id, params.planTask, child.planTask);
               if (child.planTask) {
                 if (!child.durableStore) throw new Error("Task-bound continuation requires durable custody");
                 child.durableStore.bindRun(child.id, child.planTask);
                 persistProfileBinding(child.sessionFile, child.planTask);
               }
               if (liveOwner.continuationRequestId) child.durableStore?.continuation(child.id, liveOwner.continuationRequestId);
-              runInPane(surface, command);
-            } catch (error) {
-              try { recordDispatchFailure(runtime.plans!, ctx, child.planTask, child.id, error, liveOwner.continuationRequestId); }
-              catch (importError) { runtime.planImportErrors!.set(child.id, `Continuation failed/uncertain; task import pending: ${String(importError)}`); }
-              throw error;
-            }
+          }, send: (surface, command) => {
+            // A live bridge rejection/uncertain send cannot certify that the
+            // existing healthy process or its task attempt failed.
+            runInPane(surface, command);
           } });
           return {
             content: [{ type: "text", text: result.status === "accepted"

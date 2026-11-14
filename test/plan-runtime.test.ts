@@ -22,6 +22,7 @@ test("registered task-bound spawn, live/closed resume, failure isolation and res
   const savedEnv = { ...process.env };
   const originalExec = childProcess.execFile;
   let serial = 0; let dispatches = 0; let failAppend = false; let failSend = false;
+  let liveSends = 0;
   const sm = SessionManager.create(dir, dir);
   sm.appendMessage({ role: "user", content: "Start", timestamp: Date.now() });
   const tools = new Map<string, any>(); const events = new Map<string, any[]>();
@@ -42,6 +43,7 @@ test("registered task-bound spawn, live/closed resume, failure isolation and res
       if (failSend) throw new Error("ambiguous transport");
     }
     if (continuationChild && args.some(a => a.includes("/_subagent_continue"))) {
+      liveSends++;
       const requestId = args.join(" ").match(/\/_subagent_continue ([0-9a-f-]+)/)![1];
       const cdir = continuationDir(continuationChild.activityFile);
       fs.writeFileSync(join(cdir, `${requestId}.result.json`), JSON.stringify({ runId: continuationChild.id, requestId, status: "accepted" }));
@@ -93,10 +95,19 @@ test("registered task-bound spawn, live/closed resume, failure isolation and res
     const cdir = continuationDir(child.activityFile!);
     fs.mkdirSync(cdir, { recursive: true });
     fs.writeFileSync(join(cdir, "state.json"), JSON.stringify({ runId: child.id, sessionFile: canonicalSessionPath(child.sessionFile), state: "interrupted-idle", idleToken: randomUUID() }));
+    const liveSnapshot = structuredClone(read());
+    const liveDispatches = dispatches;
+    await assert.rejects(execute("subagent_resume", { sessionPath: child.sessionFile, message: "stale", planTask: { ...selection(), expectedRevision: 0 } }), /Revision conflict/);
+    assert.deepEqual(read(), liveSnapshot);
+    assert.equal(dispatches, liveDispatches);
+    await assert.rejects(execute("subagent_resume", { sessionPath: child.sessionFile, message: "redirect", planTask: { ...selection(), attemptId: randomUUID() } }), /redirect/);
+    assert.deepEqual(read(), liveSnapshot);
+    assert.equal(dispatches, liveDispatches);
     const continued = await execute("subagent_resume", { sessionPath: `${dirname(child.sessionFile)}/./${basename(child.sessionFile)}`, message: "follow-up", planTask: selection() });
     assert.equal(continued.details.id, child.id);
     assert.equal(continued.details.status, "continued");
     assert.equal(read().revision, beforeLive, "idempotent attach does not append");
+    assert.equal(liveSends, 1, "rejected live bindings never reach transport");
     continuationChild = undefined;
     enqueueSubagentCompletion(child, { ...result(child, "turn-a"), keepOpen: true });
     assert.equal(read().tasks[0].status, "in_review");
