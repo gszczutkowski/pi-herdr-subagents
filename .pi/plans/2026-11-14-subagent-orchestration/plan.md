@@ -108,7 +108,9 @@ Problem: opcja fork nie zapewnia jednakowej semantyki w sterownikach Pi, Claude 
 
 ### Dodatkowe utwardzenie
 
-- [ ] Usunąć synchroniczne health-checki terminala z gorącej ścieżki asynchronicznego monitorowania; ograniczyć współbieżność zapytań.
+- [x] Usunąć synchroniczne health-checki terminala z gorącej ścieżki asynchronicznego monitorowania; ograniczyć współbieżność zapytań.
+
+Weryfikacja: `readPaneAsync`/`inspectPane` wykonują świeże asynchroniczne zapytania bez synchronicznego preflightu; discovery CLI również jest asynchroniczne. Wspólny limit 4 procesów obejmuje legacy herdr, hc, odczyty, inspekcje i discovery; timeout CLI wynosi 15 s. Inspekcja błędu transportu/discovery/parsowania zwraca `unavailable`, bez poprzedniego stanu `present`; synchroniczne kontrole przed uruchomieniem pozostają. `test/terminal-queries.test.ts` dodano do `npm test`: regresje transportów, awarii, retry discovery, braku sync subprocessów, współdzielonego limitu i zwalniania slotów. Focused terminal/hc 20/20, lint OK; pełne `npm test` 308/327, te same 19 błędów bazowych (18 Python/Claude hook, 1 regex CRLF release). Dowody na mockach granic OS; brak live herdr E2E.
 - [ ] Określić zachowanie przy restarcie rodzica i utrwalić manifest uruchomień oraz oczekujące wyniki, jeżeli nadzór ma być odtwarzany.
 - [ ] Przy odtwarzaniu powiązać uruchomienia z właściwą sesją/gałęzią i sprawdzić rzeczywistą obecność procesów; nie uruchamiać ponownie pracy wyłącznie na podstawie starego stanu.
 
