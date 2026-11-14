@@ -291,7 +291,9 @@ Weryfikacja: `discovery.ts` przejmuje typy, parser, name-keyed discovery i katal
 - [x] Współdzielić ścieżki spawn i resume oraz definicję manifestu uruchomienia.
 
 Weryfikacja: wspólne `prepareLaunchRun`/`registerLaunchedRun` w obu produkcyjnych ścieżkach, typ wejścia wyprowadzony z istniejącego `DurableRun`, jeden RuntimeStore i zapisany LaunchProfile. Regresja execute porównuje pola rejestru z manifestem na dysku i profilami spawn/closed resume; dotychczasowe ownership/continuation dowodzą zachowania run/pane/watchera przy interrupt. Focused runtime-execute/ownership/profile/continuation/keep-open: 31/31, zero skip; lint exit 0. Bez nowego engine ani live herdr.
-- [ ] Określić jedno miejsce zatwierdzania zmian zadania; dzieci zgłaszają wyniki zamiast niezależnie nadpisywać wspólny stan.
+- [x] Określić jedno miejsce zatwierdzania zmian zadania; dzieci zgłaszają wyniki zamiast niezależnie nadpisywać wspólny stan.
+
+Weryfikacja: audyt `plan-tools`/`plan-runtime` → ta sama instancja `PlanPersistence.mutate`, prywatny append snapshotów; nie znaleziono luki wymagającej drugiego store. `architecture-authority.test.ts` obserwuje rzeczywistą granicę narzędzi/importów, sprawdza odrzucenie child tool/import, stale revision, historical branch i starego authority z niezmienionymi bajtami pliku; wynik → review, nie accept. Focused authority/persistence/branches/runtime: 14/14, zero skip, w tym rzeczywisty lifecycle Pi z kontrolowanym providerem; lint exit 0. Granice i brak cross-process CAS/OS sandbox opisuje `ARCHITECTURE.md`.
 - [ ] Użyć natywnych mechanizmów Pi do widgetów i zapisów sesji tam, gdzie wystarczą; trwały transport wyników traktować oddzielnie od prezentacji.
 
 ## 8. Kolejność i mierzalne efekty

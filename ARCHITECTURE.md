@@ -35,3 +35,26 @@ registration: `continueLiveChild` retains the existing run, pane and watcher and
 revalidates authority in `beforeSend`. The helper is not a new execution engine.
 `test/runtime-execute.test.ts` checks both production projections against the disk
 manifest and saved profiles; ownership/continuation tests cover same-run resume.
+
+## One parent task command boundary
+
+Audit: `plan-tools.ts` routes model commands to `PlanPersistence.create`, `detach`
+and `mutate`; `plan-runtime.ts` routes attach/result/dispatch-failure imports to
+that same instance's `mutate`. `plan-store.ts` is a pure command model, not another
+store. Only persistence's private `save` appends native `pi-subagents-plan/v1`
+snapshots. Runtime envelopes carry proposals/references, not replacement snapshots.
+There was no missing production mutation route to replace.
+
+`mutate` synchronously checks writability, plan identity, original branch authority
+and expected revision, applies a bounded command, validates and appends before
+returning. A replayed event is a no-op. A child-configured persistence cannot write
+even if given the ancestor's session manager. A worker result leads to review,
+never acceptance; parent evidence/accept commands remain separate. This is local
+serialization and logical authority, not cross-process CAS or an OS sandbox.
+
+`test/architecture-authority.test.ts` spies on the actual persistence returned by
+registered tools while importing runtime events, then verifies byte-identical
+storage after stale revision, child tool/import, historical branch and original
+binding rejection. Native detach/reopen verifies the selected branch, not the
+physical JSONL tail. Existing lifecycle tests use model-issued tools through Pi's
+real session bindings with a controlled provider (no live herdr/provider claim).

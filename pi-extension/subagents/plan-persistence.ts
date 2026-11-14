@@ -154,8 +154,11 @@ export class PlanPersistence {
     const detached = detachPlan(plan, { sessionId: sm.getSessionId(), branchInstanceId: randomUUID() }, this.latest(sm)!.id, reason);
     return this.save(sm, detached);
   }
-  /** Synchronous compare-command-append serializes model mutations, including
-   * parallel execute calls. This is not cross-process storage CAS or an OS lock. */
+  /** Authoritative parent command boundary shared by plan_update and plan-runtime
+   * attach/result/failure imports. All use bounded plan-store commands; children
+   * propose results, never replace snapshots or certify their own acceptance.
+   * Synchronous compare-command-append serializes mutations in this Pi process,
+   * including parallel execute calls. Not cross-process storage CAS or an OS lock. */
   mutate(sm: Manager, planId: string, expectedRevision: number, command: (plan: PlanSnapshot, context: CommandContext) => PlanSnapshot, origin?: Authority): PlanSnapshot {
     const plan = this.requireWritable(sm).snapshot;
     if (!plan) throw new Error("No active plan");
