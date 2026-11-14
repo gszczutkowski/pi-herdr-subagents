@@ -86,7 +86,13 @@ test("registered tools and every context call share the actual persistence, with
   try {
     const events = new Map<string, Function>(); const tools = new Map<string, any>();
     let appends = 0;
-    registerPlanTools({ on: (name, handler) => events.set(name, handler), registerTool: tool => tools.set(tool.name, tool), appendEntry: (type, data) => { appends++; sm.appendCustomEntry(type, data); } } as any);
+    registerPlanTools({
+      on: (name, handler) => events.set(name, handler),
+      registerTool: tool => tools.set(tool.name, tool), registerCommand() {},
+      sendMessage() { assert.fail("Plan projection must not wake the model"); },
+      sendUserMessage() { assert.fail("Plan projection must not start a turn"); },
+      appendEntry: (type, data) => { appends++; sm.appendCustomEntry(type, data); },
+    } as any);
     const ctx = { sessionManager: sm };
     const call = (command: any, expectedRevision: number) => tools.get("plan_update").execute("id", { command, expectedRevision }, undefined, undefined, ctx);
     const first = await call({ action: "create", title: "First" }, 0);
