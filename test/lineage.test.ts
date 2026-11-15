@@ -45,7 +45,7 @@ test("fork and nested command metadata, saved profile and reopened assignment re
     const rootFile = join(dir, "root.jsonl");
     writeFileSync(rootFile, JSON.stringify({ type: "session", version: 3, id: "root", cwd: dir }) + "\n");
     const childFile = join(dir, "fork.jsonl");
-    seedSubagentSessionFile({ mode: "fork", parentSessionFile: rootFile, childSessionFile: childFile, childCwd: dir });
+    seedSubagentSessionFile({ mode: "fork", parentSessionFile: rootFile, childSessionFile: childFile, childCwd: dir, parentBranch: [] });
     const entries: any[] = [];
     const root = { getSessionId: () => "root", getSessionFile: () => rootFile, getBranch: () => entries };
     const lineage = createLineage(root, childFile, dir, dir, { checkpoint: "cp", branchToken: "token" })!;

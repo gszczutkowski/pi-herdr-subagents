@@ -2,7 +2,7 @@
 
 ## Status i zakres
 
-Dokument zapisuje ustalenia przeglądu bieżącego drzewa roboczego, obejmującego również istniejące niezacommitowane zmiany. **Żadna z poniższych napraw nie została jeszcze wykonana w ramach tego przeglądu.**
+Dokument zapisuje ustalenia przeglądu bieżącego drzewa roboczego, obejmującego również istniejące niezacommitowane zmiany. **Implementacja w toku na gałęzi `fix/subagent-repair-sequence`.** Stan zaznaczonych punktów odnosi się do testów lokalnych; testy rzeczywistych terminali herdr pozostają niewykonane (brak herdr w bieżącym środowisku).
 
 Zakres: przekazywanie kontekstu, instrukcji i wyników; uruchamianie i kończenie pracy; przerywanie, wznawianie oraz zgodność z planem rodzica. To lista usterek i kryteriów naprawy, nie zapis stanu uruchomionych agentów ani zamiennik istniejącego planu rozwoju.
 
@@ -18,8 +18,10 @@ Każda naprawa powinna zawierać test regresji odtwarzający opisany problem. Ni
 
 ## 1. Fork przekazuje historię niewłaściwej gałęzi
 
-- [ ] Naprawić wybór kontekstu przy `fork`.
-- [ ] Dodać test regresji z rozgałęzioną sesją.
+- [x] Naprawić wybór kontekstu przy `fork`.
+- [x] Dodać test regresji z rozgałęzioną sesją.
+
+Wdrożono: fork otrzymuje `getBranch()` aktywnego rodzica, zachowuje surowe wpisy i identyfikatory przed ostatnią wiadomością użytkownika (bieżąca tura delegująca nie jest dziedziczona). Bez jawnej gałęzi odrzuca operację. `test/fork-context.test.ts` sprawdza natywny kontekst Pi dla sesji liniowej, rozgałęzionej, kompakcji, retain-none i nowego korzenia. Testy fork/lineage/test.ts: 195/195 OK.
 
 **Miejsce:** `pi-extension/subagents/session.ts:22–45`, `getForkContentLines()`; wywołanie `seedSubagentSessionFile()` w `pi-extension/subagents/index.ts`.
 

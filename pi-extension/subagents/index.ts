@@ -1213,6 +1213,7 @@ async function launchSubagent(
       parentSessionFile: sessionFile,
       childSessionFile: subagentSessionFile,
       childCwd: targetCwdForSession,
+      parentBranch: ctx.sessionManager.getBranch(),
     });
   }
 

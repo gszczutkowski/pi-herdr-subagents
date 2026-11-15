@@ -484,6 +484,7 @@ describe("session.ts", () => {
         parentSessionFile: parentFile,
         childSessionFile: childFile,
         childCwd: "/tmp/fork-child-cwd",
+        parentBranch: [MODEL_CHANGE, USER_MSG, ASSISTANT_MSG] as any,
       });
 
       const entries = readFileSync(childFile, "utf8")
