@@ -221,6 +221,15 @@ Parent adds tasks for P0/P1 via `plan_update` with criteria and references, runs
 
 ---
 
+## Parent-owned subagent cleanup
+
+After receiving a subagent result and before reporting done, review the current plan and concrete remaining actions for each owned idle child. Preserve its result first. If no pending review, fixes, retry or other follow-up needs that child, use `subagent_close` with its owned id; do not leave it open for hypothetical future questions or an unrelated unfinished task.
+
+- Retain a child only for a concrete pending action or an explicit user request, and record that reason in the plan or final handoff. A missing plan or task binding alone does not authorize closure. Explicitly user-managed interactive sessions require user authorization to close.
+- Respect the existing busy-state, unsent-draft, pending-input, ownership and branch/custody guards. Never bypass them with force-kill, terminal typing or interruption of active work for cleanup.
+- If `subagent_close` is unavailable or returns rejected, pending or uncertain, report the unresolved status rather than claiming closure. Any explicit recheck must use the same id, not a polling loop.
+- This is a parent decision followed by an explicit tool call, not background automatic cleanup triggered by idle state or plan acceptance. It applies to workers, scouts and reviewers alike, including after the final review has been triaged.
+
 ## ⚠️ Completion Checklist
 
 Before reporting done:
@@ -231,3 +240,4 @@ Before reporting done:
 4. ✅ Commit handling matches project policy and user authorization (including requested per-point commits), or uncommitted paths and verification evidence are reported?
 5. ✅ Reviewer has run?
 6. ✅ Reviewer findings triaged and addressed?
+7. ✅ Every owned idle subagent closed via `subagent_close`, retained with a concrete reason, or reported with unresolved close status?

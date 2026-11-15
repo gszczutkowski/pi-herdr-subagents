@@ -22,6 +22,7 @@ export async function captureGuidanceRequests(options: {
   denied?: boolean;
   inactive?: boolean;
   hidden?: boolean;
+  closeTool?: "denied" | "inactive" | "hidden";
   scoped?: boolean;
   contributions?: boolean;
   requests?: number;
@@ -30,7 +31,7 @@ export async function captureGuidanceRequests(options: {
   const dir = mkdtempSync(join(tmpdir(), "subagent-guidance-"));
   const agentDir = join(dir, "agent");
   const previousCwd = process.cwd();
-  const envNames = ["PI_CODING_AGENT_DIR", "PI_SUBAGENT_ID", "PI_DENY_TOOLS"];
+  const envNames = ["PI_CODING_AGENT_DIR", "PI_SUBAGENT_ID", "PI_SUBAGENT_SESSION", "PI_DENY_TOOLS"];
   const previousEnv = envNames.map((name) => process.env[name]);
   let session: AgentSession | undefined;
   const requests: Array<{ prompt: string; tools: string[] }> = [];
@@ -39,10 +40,11 @@ export async function captureGuidanceRequests(options: {
     process.chdir(dir);
     process.env.PI_CODING_AGENT_DIR = agentDir;
     delete process.env.PI_SUBAGENT_ID;
+    delete process.env.PI_SUBAGENT_SESSION;
     delete process.env.PI_DENY_TOOLS;
-    if (options.denied) {
+    if (options.denied || options.closeTool === "denied") {
       process.env.PI_SUBAGENT_ID = "guidance-test-child";
-      process.env.PI_DENY_TOOLS = "subagent";
+      process.env.PI_DENY_TOOLS = [options.denied ? "subagent" : "", options.closeTool === "denied" ? "subagent_close" : ""].filter(Boolean).join(",");
     }
     mkdirSync(join(agentDir, "agents"), { recursive: true });
     writeFileSync(join(agentDir, "agents", "researcher.md"),
@@ -96,11 +98,14 @@ export async function captureGuidanceRequests(options: {
         },
         extension,
         (pi) => {
-          if (options.hidden) {
+          if (options.hidden || options.closeTool === "hidden") {
             pi.registerTool({
               name: "guidance-wrapper", label: "Wrapper", description: "Test loadout wrapper",
               parameters: Type.Object({}),
-              prepareLoadout: () => ({ hiddenDeclarations: ["subagent"] }),
+              prepareLoadout: () => ({ hiddenDeclarations: [
+                ...(options.hidden ? ["subagent"] : []),
+                ...(options.closeTool === "hidden" ? ["subagent_close"] : []),
+              ] }),
               execute: async () => ({ content: [], details: undefined }),
             });
           }
@@ -116,7 +121,10 @@ export async function captureGuidanceRequests(options: {
     ({ session } = await createAgentSession({
       cwd: dir, agentDir, resourceLoader, settingsManager,
       sessionManager: SessionManager.inMemory(),
-      ...(options.inactive ? { excludeTools: ["subagent"] } : {}),
+      excludeTools: [
+        ...(options.inactive ? ["subagent"] : []),
+        ...(options.closeTool === "inactive" ? ["subagent_close"] : []),
+      ],
     }));
     const model = session.extensionRunner!.getModelRegistry().find("guidance-test", "fast");
     assert.ok(model);

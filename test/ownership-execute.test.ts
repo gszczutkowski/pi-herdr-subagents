@@ -212,6 +212,59 @@ test("close is parent-owned, honors lifecycle denial and is not a child completi
   }
 }));
 
+test("recovered release fails closed on writers, uncertainty, custody loss and replacement tokens (Windows OS boundary)", { skip: process.platform !== "win32" }, async () => fixture(async ({ dir, session }: any) => {
+  const { RuntimeStore } = await import("../pi-extension/subagents/runtime-store.ts");
+  const { releaseRecoveredSession } = await import("../pi-extension/subagents/runtime-recovery.ts");
+  const store = new RuntimeStore(join(dir, "runtime"), { sessionFile: "parent", headerId: "parent", branchToken: "branch", checkpoint: "checkpoint" });
+  const targetPid = 98765432;
+  const cli = join(dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"))), "cli.js");
+  store.prepare({ id: "recovered", sessionFile: session, name: "Recovered", task: "task", startTime: 1, cli: "pi" });
+  const original = reserveSession(session, "recovered"); original.dispatched = true;
+  fs.writeFileSync(`${runCompletionFile(session, original.runId)}.identity.json`, JSON.stringify({
+    schema: 1, runId: original.runId, sessionFile: session, headerId: "child", nonce: "original",
+    process: { pid: targetPid, birth: "windows:2" },
+  }));
+  let scenario = "live";
+  const replacement = { runId: original.runId, dispatched: true };
+  powershellResponder = (command: string) => {
+    if (command.includes("Where-Object")) {
+      if (scenario === "uncertain") return "denied";
+      if (scenario === "replacement") sessionOwners.set(session, replacement);
+      if (scenario === "custody-loss") store.isCurrent = () => false;
+      return JSON.stringify(scenario === "writer" ? [{ pid: targetPid + 1, parentPid: 0, command: `node.exe "${cli}" --session "${session}"` }] : []);
+    }
+    if (command.includes(`-Id ${targetPid} `)) {
+      if (scenario === "denied") return "denied";
+      if (scenario === "live") return JSON.stringify({ pid: targetPid, birth: "2" });
+      // PID reuse is proof of the original's death, not whole-session closure.
+      if (scenario === "reused") return JSON.stringify({ pid: targetPid, birth: "3" });
+      return "null";
+    }
+    return JSON.stringify({ pid: targetPid + 1, birth: "3" });
+  };
+  try {
+    for (scenario of ["live", "denied"]) {
+      releaseRecoveredSession(store, session);
+      assert.equal(sessionOwners.get(session), original);
+    }
+    for (scenario of ["writer", "uncertain"]) {
+      assert.throws(() => releaseRecoveredSession(store, session), /audit is single|audit is uncertain/);
+      assert.equal(sessionOwners.get(session), original);
+    }
+    scenario = "custody-loss";
+    assert.throws(() => releaseRecoveredSession(store, session), /custody/);
+    assert.equal(sessionOwners.get(session), original);
+    store.isCurrent = () => true;
+    scenario = "replacement";
+    assert.throws(() => releaseRecoveredSession(store, session), /ownership changed/);
+    assert.equal(sessionOwners.get(session), replacement, "same-run replacement token cannot be released");
+    sessionOwners.set(session, original);
+    scenario = "reused";
+    releaseRecoveredSession(store, session);
+    assert.equal(sessionOwners.has(session), false);
+  } finally { store.close(); }
+}));
+
 test("registered audit is read only and accepts a path or an owned selector", async () => fixture(async ({ tools, ctx, session, resume }: any) => {
   const audit = tools.get("subagent_audit");
   assert.ok(audit);

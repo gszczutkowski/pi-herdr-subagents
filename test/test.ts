@@ -1926,6 +1926,56 @@ describe("completion.ts", () => {
     assert.deepEqual(result, { reason: "sentinel", exitCode: 17 });
   });
 
+  for (const type of ["done", "error", "ping"] as const) {
+    it(`prefers ${type} evidence published during the terminal sentinel read`, async () => {
+      const dir = mkdtempSync(join(tmpdir(), "completion-sentinel-race-"));
+      const sessionFile = join(dir, "child.jsonl");
+      const runId = "sentinel-race";
+      const payload = {
+        type, runId, eventId: "final-turn", summary: "Final result",
+        errorMessage: "Provider retry exhausted", name: "Worker", message: "Need help",
+        ...(type === "done" ? { structuredResult: {
+          status: "complete", summary: "Structured result", artifacts: [], checks: [],
+          unmetCriterionIds: [], risks: [],
+        } } : {}),
+      };
+      try {
+        const result = await waitForCompletion(new AbortController().signal, {
+          intervalMs: 1, sessionFile, runId,
+          readTerminalTail: async () => {
+            writeFileSync(`${sessionFile}.${runId}.exit`, JSON.stringify(payload));
+            return `__SUBAGENT_DONE_${runId}_0__`;
+          },
+        });
+        assert.equal(result.reason, type);
+        assert.equal(result.eventId, "final-turn");
+        assert.equal(result.summary, "Final result");
+        if (type === "error") assert.equal(result.exitCode, 1);
+        if (type === "done") assert.equal(result.structuredResult?.summary, "Structured result");
+        if (type === "ping") assert.equal(result.ping?.message, "Need help");
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+
+  it("preserves the terminal failure when an external marker appears during the read", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "completion-external-race-"));
+    const sentinelFile = join(dir, "done");
+    try {
+      const result = await waitForCompletion(new AbortController().signal, {
+        intervalMs: 1, sentinelFile,
+        readTerminalTail: async () => {
+          writeFileSync(sentinelFile, "output");
+          return "__SUBAGENT_DONE_17__";
+        },
+      });
+      assert.deepEqual(result, { reason: "sentinel", exitCode: 17 });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("returns when an external sentinel file appears", async () => {
     const dir = mkdtempSync(join(tmpdir(), "completion-sentinel-"));
     const sentinelFile = join(dir, "done");

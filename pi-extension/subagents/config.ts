@@ -3,6 +3,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseModelConfig, type ModelConfig } from "./model-config.ts";
 import { parseStatusConfig, type StatusConfig } from "./status.ts";
+import { parseContextProtection, type ContextProtectionConfig } from "./context-policy.ts";
 
 const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const DEFAULT_CONFIG_PATH = join(PACKAGE_ROOT, "config.json");
@@ -21,6 +22,7 @@ export interface SubagentConfig {
   models: ModelConfig;
   environment: EnvironmentConfig;
   behavior: BehaviorConfig;
+  contextProtection: ContextProtectionConfig;
 }
 
 const DEFAULT_ENVIRONMENT: EnvironmentConfig = { allowOutsideHerdr: false };
@@ -76,6 +78,7 @@ function parseSubagentConfig(raw: unknown, source = "config.json"): SubagentConf
     models: parseModelConfig(config, source),
     environment: parseEnvironmentConfig(config.environment, source),
     behavior: parseBehaviorConfig(config.behavior, source),
+    contextProtection: parseContextProtection(config.contextProtection, source),
   };
 }
 

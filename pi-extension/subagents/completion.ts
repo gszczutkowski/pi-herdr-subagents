@@ -198,7 +198,14 @@ export async function waitForCompletion(
 
     try {
       const exitCode = terminalExitCode(await options.readTerminalTail(), options.runId);
-      if (exitCode !== null) return { reason: "sentinel", exitCode };
+      if (exitCode !== null) {
+        // The terminal read is asynchronous. The child may publish its final
+        // result (or provider failure/ping) while that read is in flight. Prefer
+        // that richer evidence before falling back to the shell's exit code.
+        const racedCompletion = consumeExitSidecar(options.sessionFile, options.runId, options.retainedEventIds);
+        if (racedCompletion) return racedCompletion;
+        return { reason: "sentinel", exitCode };
+      }
     } catch {
       // Terminal reads are only sentinel/output probes; Herdr status is polled
       // independently below, even when terminal reads succeed.

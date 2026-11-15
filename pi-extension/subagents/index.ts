@@ -17,7 +17,8 @@ import { createLineage, type Lineage } from "./lineage.ts";
 import { recordHistory, registerPlanHistory } from "./history.ts";
 import { registerHistoryView } from "./history-view.ts";
 import { RuntimeStore, readRuntimeManifest, type RuntimeParent } from "./runtime-store.ts";
-import { reconcileRuntime } from "./runtime-recovery.ts";
+import { reconcileRuntime, releaseRecoveredSession } from "./runtime-recovery.ts";
+import { registerRecoveryReport, type RecoveryView } from "./recovery-report.ts";
 import type { SubagentLaunchContext } from "./harness/types.ts";
 import { fileURLToPath } from "node:url";
 import {
@@ -56,6 +57,9 @@ import {
 } from "./harness/index.ts";
 import { resolveModelDefault } from "./model-config.ts";
 import { getSubagentConfig } from "./config.ts";
+import { boundSubagentMessage } from "./result-budget.ts";
+import { registerContextGuard } from "./context-guard.ts";
+import { registerContextCheckpoint } from "./context-checkpoint.ts";
 import { getAgentConfigDir, loadAgentDefaults, discoverAgentDefinitions, buildAvailableAgentCatalog, type AgentDefaults, type SubagentSessionMode } from "./discovery.ts";
 
 import {
@@ -524,6 +528,23 @@ function ownsActiveBranch(ctx: ExtensionContext | undefined, parent: RuntimePare
   } catch { return false; }
 }
 
+/** Read only this parent's manifest, never acquire custody or scan other sessions. */
+function readRecoveryView(ctx: ExtensionContext): RecoveryView {
+  try {
+    if (typeof ctx.sessionManager.getHeader !== "function" || typeof ctx.sessionManager.getBranch !== "function") {
+      return { error: "Host lacks branch/header APIs; durable recovery unavailable" };
+    }
+    const header = ctx.sessionManager.getHeader();
+    if (!header?.id || !ctx.sessionManager.getSessionFile()) return { error: "Saved parent session unavailable" };
+    const manifest = runtime.store?.snapshot() ?? readRuntimeManifest(join(getArtifactDir(ctx.sessionManager.getSessionDir(), header.id), "subagent-runtime"));
+    if (manifest && !ownsActiveBranch(ctx, manifest.parent)) return { error: "Parent session/active branch mismatch; no recovery access" };
+    if (runtime.recoveryError) return { error: runtime.recoveryError };
+    runtime.store?.assertCustody();
+    return { manifest, paused: manifest?.custodyPaused,
+      diagnostics: [...(runtime.planImportErrors?.values() ?? []), ...(delivery.persistenceError ? [delivery.persistenceError] : [])] };
+  } catch (error) { return { error: String(error) }; }
+}
+
 async function recoverParentRuntime(ctx: ExtensionContext): Promise<void> {
   if (typeof ctx.sessionManager.getHeader !== "function") return;
   try {
@@ -596,7 +617,12 @@ function enqueueCompletion(running: RunningSubagent, message: Parameters<Extensi
   const owner = result?.eventId
     ? { id: running.id, lifecycle: { ...running.lifecycle, delivery: "pending" as const }, source: running }
     : running;
-  enqueueDelivery(delivery, owner, message, () => {
+  const bounded = boundSubagentMessage(message, {
+    artifactDir: running.durableStore?.directory ?? join(dirname(running.sessionFile), "artifacts", running.id),
+    runId: running.id, eventId: result?.eventId ?? "terminal",
+    maxReportBytes: config.contextProtection.maxReportBytes, sessionFile: running.sessionFile,
+  });
+  enqueueDelivery(delivery, owner, bounded, () => {
     if (!result?.keepOpen) runningSubagents.delete(running.id);
     updateWidget();
   }, result?.eventId);
@@ -1483,6 +1509,8 @@ async function watchSubagent(
 export default function subagentsExtension(pi: ExtensionAPI) {
   registerSubagentAssignmentRenderer(pi);
   runtime.plans = registerPlanTools(pi);
+  const checkpoints = registerContextCheckpoint(pi, runtime.plans);
+  registerContextGuard(pi, config.contextProtection, checkpoints.capture);
   const stopPlanHistory = registerPlanHistory(runtime.plans);
   runtime.planImportErrors ??= new Map();
   delivery.onEnvelope = (runId, envelope) => {
@@ -1500,6 +1528,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     for (const event of Object.values(runtime.store?.snapshot().outbox ?? {})) delivery.onEnvelope?.(event.runId, event.envelope);
   };
   pi.on("context", () => { retryPlanImports(); });
+  registerRecoveryReport(pi, readRecoveryView);
   registerHistoryView(pi, ctx => join(getArtifactDir(ctx.sessionManager.getSessionDir(), ctx.sessionManager.getSessionId()), "subagent-history"));
   // A factory API is not bound yet. Never fall back to a captured pre-reload API.
   runtime.pi = undefined; // Also invalidate the legacy global runtime field.
@@ -1513,6 +1542,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     if (typeof ctx.sessionManager?.getHeader === "function") await recoverParentRuntime(ctx);
     if (runtime.latestCtx !== ctx) return;
     retryPlanImports();
+    const recoveryView = readRecoveryView(ctx);
+    if (ctx.hasUI && Object.keys(recoveryView.manifest?.runs ?? {}).length) {
+      ctx.ui.notify(`Saved subagent assignments found (${Object.keys(recoveryView.manifest!.runs).length}). Review /subagents-recovery or subagents_recovery before explicit resume; saved evidence is not current liveness or acceptance.`, "warning");
+    }
     if (!runtime.recoveryError) {
       delivery.api = pi;
       flushDeliveries(delivery);
@@ -1578,17 +1611,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   });
   pi.on("session_tree", async (_event, ctx) => {
     await finishTreeNavigation(ctx);
-  });
-
-  pi.registerCommand("subagents-recovery", {
-    description: "Show durable recovery/decision states (never relaunches or controls terminals)",
-    handler: async (_args, ctx) => {
-      const manifest = runtime.store?.snapshot();
-      const runs = Object.values(manifest?.runs ?? {}).map((run) => `${run.id}: ${run.reconciliation ?? run.phase}`);
-      const unknown = Object.entries(manifest?.outbox ?? {}).filter(([, event]) => event.status === "dispatching").map(([id]) => `${id}: UNKNOWN handoff; no automatic resend`);
-      retryPlanImports();
-      ctx.ui.notify([runtime.recoveryError, ...runs, ...unknown, ...runtime.planImportErrors!.values(), delivery.persistenceError].filter(Boolean).join("\n") || "No durable recovery state", "info");
-    },
   });
 
   pi.on("before_agent_start", (event) => {
@@ -1927,6 +1949,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   if (shouldRegister("subagent_close")) pi.registerTool({
     name: "subagent_close", label: "Close Owned Subagent",
     description: "Explicitly request graceful shutdown of one tracked, owned, idle Pi child (id or exact name). No force kill, cancellation, terminal typing, or legacy/untracked cleanup. Closed means original PID+birth is OS-verified gone, NOT session-wide closure. Pending/uncertain retains ownership; recheck the same id.",
+    promptSnippet: "Gracefully close an owned idle Pi subagent when no concrete follow-up remains",
+    promptGuidelines: [
+      "After receiving a subagent result and before reporting done, review the current plan and concrete remaining actions for each owned idle child. Use subagent_close when no pending review, fixes, retry or other follow-up needs that child. An unrelated unfinished task or hypothetical future question is not a reason to keep it open.",
+      "Before using subagent_close, preserve the child's result. Retain a child only for a concrete pending action or an explicit user request, and record that reason in the plan or final handoff. A missing plan or task binding alone does not authorize closure; explicitly user-managed interactive sessions require user authorization to close.",
+      "Use subagent_close only for tracked owned idle Pi children, respecting busy state, unsent drafts, pending input, ownership and branch/custody guards. Never bypass these protections with force-kill, terminal typing or interruption of active work for cleanup. If subagent_close is unavailable, rejected, pending or uncertain, report the unresolved status rather than claiming closure; any explicit recheck must use the same id, not a polling loop.",
+    ],
     parameters: Type.Object({ id: Type.Optional(Type.String()), name: Type.Optional(Type.String()) }, { additionalProperties: false }),
     async execute(_id, params, _signal, _update, ctx) {
       if (params.id && params.name) throw new Error("Supply owned id OR exact name, not both");
@@ -2109,6 +2137,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           if (inspection.kind === "missing" && sessionOwners.get(params.sessionPath) === previousOwner) {
             releaseSession(params.sessionPath, previousOwner.runId);
           }
+        } else if (previousOwner && runtime.store && !runningSubagents.has(previousOwner.runId)) {
+          releaseRecoveredSession(runtime.store, params.sessionPath);
         }
         assertResumeWriters(params.sessionPath);
         const liveOwner = sessionOwners.get(params.sessionPath);

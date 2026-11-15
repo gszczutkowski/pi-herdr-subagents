@@ -106,10 +106,34 @@ presence does not prove pane-to-process binding. Recovered/uncertain session
 reservations (including continuation request IDs) are retained, not replayed.
 `/tree` detaches controls and durably pauses custody for an explicit branch decision;
 fork/new/copied sessions never inherit the old runs. Teardown after custody loss
-must not close a potentially reused pane. `/subagents-recovery` reports decisions
-and UNKNOWN handoffs; it is not a force-resend, lease-break or relaunch command.
-There is currently no automatic or built-in force-resolution of those decisions.
-No live terminal-recovery E2E guarantee is made.
+must not close a potentially reused pane. There is currently no automatic or
+built-in force-resolution of those decisions. No live terminal-recovery E2E
+guarantee is made.
+
+After terminal loss, **resume the original saved parent session and branch**.
+Startup announces recorded assignments, including runs with no plan binding;
+a replaceable, request-time context projection (4KB maximum) makes them visible
+to the model without appending reminders or starting a turn. Use
+`/subagents-recovery [runId]` or `subagents_recovery({})` for the read-only report.
+The tool accepts `{ offset, limit }` (default 10, maximum 20) or `{ runId }` for
+detail, capped at 24KB with explicitly truncated fields. Detail includes the
+first ten retained delivery excerpts. List pages give the next offset.
+
+Reports show saved task/name/run ID/session path and **saved reconciliation, not
+current liveness**. `pending` means retained for delivery, `unknown` means a
+crash may have interrupted handoff, and `handedOff` acknowledges only the handoff
+boundary. None means task acceptance. Review retained results and the original
+assignment first, then audit current process/session writers before an explicit
+`subagent_resume`. Reports never relaunch, resume, close panes, resend, acquire a
+lease, or accept work. Branch mismatch, custody failure and recovery errors fail
+closed with diagnostics; paused state does not grant control. Only this parent's
+manifest is read, never unrelated sessions.
+
+Terminal closure may kill the parent, children, or both. Saved assignments help
+recover decisions; they do **not** guarantee processes or every result survive
+terminal close. Legacy hosts without header/branch APIs report unavailable;
+legacy/missing manifests cannot reconstruct old assignments or establish that no
+unfinished work exists. Keep the original parent and child session artifacts.
 
 **Upgrade boundary:** these guarantees apply only to watchers started with the
 outbox implementation. Before upgrading from a pre-outbox release, let all
@@ -180,7 +204,8 @@ tasks. Import failure never suppresses the original result handoff: immutable
 outbox envelopes (including handed-off ones) remain retry sources after reload
 or recovery. Wrong-branch/origin imports are deferred, not redirected; select the
 original branch and reconcile any plan storage fault. `/subagents-recovery`
-reports pending import errors and retries them; context requests also retry.
+shows bounded pending-import diagnostics but is read-only and does not retry
+imports; context requests retry pending imports.
 Existing runtime writer leases, branch custody and recovery identity gates still
 apply. Recovery never relaunches work.
 
@@ -424,6 +449,8 @@ When `activeCount === 0` (every tracked row is open), the border uses an amber a
 
 A fixed internal watchdog marks a run as `stalled` when pane inspection fails or the pane disappears without a completion sidecar; valid long-running `active` or `waiting` states do not become `stalled` just because time passes. All observed transitions, including `stalled` and recovery, stay in the existing process widget. Ordinary progress never creates a status-message stream or an extra parent turn. A watcher/provider error or explicit child help request is different: it still wakes the parent through the completion outbox.
 
+Completing a turn with `close:false` (or `behavior.closeOnDone:false`) keeps activity reporting enabled for follow-up work. Child `/reload` continues the same run's last valid activity sequence, so fresh work can clear an interrupted label immediately. Completion artifacts take precedence over a shell exit marker, including artifacts published while the terminal read is in flight; provider failures and help requests must not be reduced to a successful process exit.
+
 **Autonomous and interactive subagents are equally quiet for observations.** The widget still refreshes and snapshots are still classified regardless of `interactive`. The compatibility flag retains its frontmatter/per-spawn defaults, but no longer opts autonomous agents into stall pings. This does not suppress results, explicit `caller_ping`, errors, keepOpen follow-up results or retry/recovery handoffs.
 
 #### Configuration
@@ -585,6 +612,20 @@ Only an OS probe showing the original PID + birth absent (including PID reuse) y
 
 `subagent_done({close:false})` still intentionally keeps collaboration open. Completion, assistant claims, stale PIDs and idle observations never trigger automatic cleanup. Existing owned-pane supervision remains independent of the explicit close handshake.
 
+**Parent cleanup policy:** after receiving a result and before reporting done, the
+parent checks the current plan and concrete follow-ups for each owned idle child.
+After preserving its result, it should use `subagent_close` if no pending review,
+fixes, retry or other follow-up needs that child. Keeping a session open requires a
+concrete reason recorded in the plan or final handoff, or an explicit user request;
+"just in case" and unrelated unfinished tasks are not sufficient. A missing plan
+or task binding alone is not disposal permission, and explicitly user-managed
+interactive sessions require user authorization to close. Existing busy/draft/input,
+ownership and custody checks remain authoritative. Unavailable/rejected/pending/
+uncertain close states must be reported honestly, never bypassed with force-kill,
+terminal typing or active-work interruption. This policy is delivered through the
+active `subagent_close` tool's prompt guidelines and the planning completion
+checklist; it is not a new background auto-close mechanism.
+
 ### Nonclosing question/progress channel: considered and deferred
 
 A dedicated nonclosing question channel could preserve a worker's pane while the parent decides, but it is **not implemented**. `caller_ping` still exits; it must not be advertised as a pause-and-wait tool. Ordinary progress belongs in the existing panel, not a new tool or wakeup protocol.
@@ -707,6 +748,104 @@ You are a specialized agent that does X...
 
 Discovery still resolves precedence before visibility filtering. If a project-local hidden agent has the same name as a visible global or bundled agent, the hidden project agent wins and the lower-precedence agent does not appear in `subagents_list`.
 
+### Parent context protection
+
+Three protections share a single policy: early compaction, durable working-state
+checkpoints, and bounded child reports. They are enabled by default on ordinary
+package load; no changes to your Pi settings files are made automatically.
+
+Configure `config.json` (or copy the defaults from `config.json.example`):
+
+```json
+{
+  "contextProtection": {
+    "enabled": true,
+    "reserveTokens": 50000,
+    "reservePercent": 20,
+    "keepRecentTokens": 20000,
+    "maxReportBytes": 12000
+  }
+}
+```
+
+**Early compaction.** The parent targets a reserve of the larger of 50,000 tokens
+and 20% of the model's window, capped at 40% for small models. For example, the
+128k-window threshold is 78k; a 1M-window threshold is 800k. The recent tail is
+capped at half the remaining usable window; a smaller native/per-model retention
+setting is honored between turns. `enabled:false` disables proactive compaction;
+Pi's `compaction.enabled:false` is also respected. Checkpoints and report limits
+remain available independently. `/context-guard` shows budgets and the last error;
+`/context-guard retry` clears the failed-attempt cooldown without starting a turn.
+
+Before an idle user prompt, the guard can use native compaction. During a tool
+run it instead awaits a summary at Pi's actionable `turn_end` boundary and returns
+a native compaction draft: it never calls the aborting manual compaction API from
+a running tool turn, and never schedules an extra agent turn. The latest
+assistant/tool-result batch stays together. Edited/omitted context is respected;
+truncated (`length`) responses remain Pi's recovery responsibility. Summaries must
+meaningfully shrink the prefix (at least 1,024 tokens or 2% of the window); failed
+or unusable summaries retain history and enter a three-completed-turn cooldown.
+Cancelled idle compaction also cancels submission of that pending prompt.
+
+Between-turn guard summaries use the active configured provider/model, with an
+output cap of 8,192 tokens (or the smaller model/window budget). They are additional
+billable calls. These boundary drafts do **not** emit Pi's native
+`session_before_compact`/`session_compact` notifications or use other extensions'
+custom native summarizers; native/manual/overflow compaction still does. Disable
+proactive compaction if another extension must own all summarization, and configure
+Pi's native `compaction.reserveTokens` instead.
+
+**Durable working state.** The parent should call `context_checkpoint` at milestones:
+
+```json
+{
+  "action": "save",
+  "goal": "Finish the migration without changing public behavior",
+  "decisions": ["Keep the existing database schema"],
+  "nextSteps": ["Run migration regression tests"],
+  "verification": ["Unit tests passed; integration tests not run"],
+  "refs": ["docs/migration-report.md"]
+}
+```
+
+`context_checkpoint({"action":"read"})` reads the selected branch. Saving replaces
+all five fields; each list accepts up to 12 items. Explicit state is bounded to
+6,000 UTF-8 bytes. Before native or proactive compaction, the extension captures a
+fresh bounded plan summary/pointer alongside those notes. Unchanged snapshots are
+not appended repeatedly. The existing plan remains authoritative for task state,
+revision, evidence and acceptance; checkpoints never grant authority or imply
+process liveness. Automation snapshots already saved notes and the plan—it cannot
+recover decisions the agent never recorded.
+
+Checkpoints live as native custom session entries, not repository files or chat
+messages. A replaceable request-time projection (up to 12,000 UTF-8 bytes) restores
+them after compaction/reload/reopen, independently of the conversational summary.
+Only the active branch is read. Fork-inherited notes are read-only until an
+explicit save creates local notes; children cannot save parent checkpoints.
+Ephemeral/setup-only sessions cannot promise durable checkpoints. An append failure
+cancels compaction and suppresses uncertain checkpoint content across `/reload`;
+recovery requires reopening in a fresh Pi process. Do not save secrets, credentials,
+raw conversations or full logs; use artifact references.
+
+**Bounded child reports.** Every new result, help request and error is bounded to
+`maxReportBytes` UTF-8 bytes **before** it enters the durable outbox. Oversized
+reports become a head/tail preview plus a full artifact path, with the notice
+included in the limit. Full content and details are preserved in immutable,
+content-addressed JSON files under the run's artifact/runtime directory in
+`subagent-reports/`. Read a referenced artifact with a bounded `read` if needed.
+Reports that fit are unchanged. Structured proposals and full UI details remain
+intact; transport retry, event identity and parent review/acceptance are unchanged.
+If archive storage fails, a bounded notice says so and points to the child session
+instead of claiming the report was saved. Existing outbox/history records are not
+rewritten. `maxReportBytes` accepts 1,024–50,000; other token budgets are non-negative
+safe integers and `reservePercent` accepts 5–40.
+
+These are safety margins, not a guarantee against a giant incoming user/tool
+message, many simultaneous reports, inaccurate token estimates, provider outages,
+or an oversized system prompt/indivisible tool batch. Native Pi overflow recovery
+and `/compact` remain available. Checkpoints and report artifacts are local
+same-user storage, not a secrets vault or an OS security boundary.
+
 ### `session-mode`
 
 Choose how a subagent session starts:
@@ -728,10 +867,11 @@ rather than repeatedly pasting logs or loading large images into the parent.
 
 Save handoff notes at milestones, before the context window is nearly full. Use
 Pi's native `/compact [instructions]` when needed; asking for a final summary in
-chat is another model request, not a guaranteed recovery mechanism. Automatic
-compaction belongs to Pi, not this extension. In Pi versions supporting per-model
-compaction settings, an optional project `.pi/settings.json` override can reserve
-more headroom (merge into existing settings; do not replace them):
+chat is another model request, not a guaranteed recovery mechanism. This extension
+now adds [parent context protection](#parent-context-protection) before Pi's native
+overflow recovery. Pi still owns native automatic/manual compaction. In versions
+supporting per-model compaction settings, an optional project `.pi/settings.json`
+override can also reserve more headroom (merge into existing settings; do not replace them):
 
 ```json
 {

@@ -217,7 +217,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       completionDelivered = true;
-      recorder.agentEndDone();
+      recorder.agentEndDone(keepOpen);
       if (!keepOpen) ctx.shutdown();
       return;
     }
@@ -337,7 +337,7 @@ export default function (pi: ExtensionAPI) {
       keepOpenSession = keepOpen;
       (globalThis as any)[keepOpenKey] = keepOpen;
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
-      recorder.subagentDone();
+      recorder.subagentDone(keepOpen);
       if (sessionFile) {
         writeRunCompletion({ type: "done", ...normalizeStructuredResult(params.result), ...(keepOpen ? { keepOpen: true } : {}) });
       }

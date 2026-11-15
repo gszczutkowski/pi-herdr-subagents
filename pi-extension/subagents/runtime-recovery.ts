@@ -1,7 +1,32 @@
-import { canonicalSessionPath, reserveSession, sessionOwners } from "./ownership.ts";
+import { canonicalSessionPath, releaseSession, reserveSession, sessionOwners } from "./ownership.ts";
 import { readRetainedCompletion, type CompletionResult } from "./completion.ts";
-import { verifyRecoveryChild } from "./recovery-identity.ts";
+import { readChildIdentity, verifyRecoveryChild } from "./recovery-identity.ts";
+import { probeProcess, sameProcess } from "./process-identity.ts";
+import { assertSessionWriters, auditSession } from "./session-audit.ts";
 import type { DurableRun, RuntimeStore } from "./runtime-store.ts";
+
+/** Explicit resume decision for an artifact-only reservation. Neither a retained
+ * completion nor a cached recovery outcome proves that a session is safe now.
+ * Keep this synchronous through release so concurrent resumes cannot both win. */
+export function releaseRecoveredSession(store: RuntimeStore, sessionFile: string): void {
+  store.assertCustody();
+  const path = canonicalSessionPath(sessionFile);
+  const owner = sessionOwners.get(path);
+  if (!owner || owner.surface) return;
+  const run = store.snapshot().runs[owner.runId];
+  if (!run || run.cli !== "pi" || canonicalSessionPath(run.sessionFile) !== path) return;
+  const identity = readChildIdentity(path, run.id);
+  if (!identity) return;
+  const probe = probeProcess(identity.process.pid);
+  if (probe.kind !== "absent" && !(probe.kind === "present" && !sameProcess(identity.process, probe.identity))) return;
+  // The original process may be gone while a manually opened Pi still writes.
+  // Incomplete/denied OS enumeration must not be mistaken for an empty set.
+  assertSessionWriters(auditSession(path));
+  store.assertCustody();
+  if (sessionOwners.get(path) !== owner) throw new Error("Session ownership changed during recovered resume");
+  store.reconcileRun(run.id, "exited: original process gone and session writer audit clear; explicit resume released reservation");
+  releaseSession(path, run.id);
+}
 
 /** Restart policy B. No launch builders, terminal APIs or task scripts here.
  * Reservations are synchronous, before the first identity probe/await. */

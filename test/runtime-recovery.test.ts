@@ -23,22 +23,56 @@ const processSupported = probeProcess(process.pid).kind === "present";
 function hostCode(dir: string, branch: string, file = "parent.jsonl", headerId = "parent") {
   return `import extension from ${JSON.stringify(moduleURL("index"))};
     import fs from 'node:fs';
-    const handlers=new Map(); const delivered=[]; const notices=[];
+    const handlers=new Map(); const delivered=[]; const notices=[]; const tools=new Map();
     const branch=${branch};
     const pi=new Proxy({}, {get:(_,key)=>key==='on'?(name,fn)=>handlers.set(name,fn):key==='getAllTools'?()=>[]:
+      key==='registerTool'?(tool)=>tools.set(tool.name,tool):
       key==='sendMessage'?(message)=>delivered.push(message.details.eventId):()=>{}});
     const ctx={hasUI:true,scopedModels:[],modelRegistry:{getAvailable:()=>[]},ui:{notify:(m)=>notices.push(m)},
       sessionManager:{getHeader:()=>({id:${JSON.stringify(headerId)}}),getSessionFile:()=>${JSON.stringify(join(dir, file))},getSessionDir:()=>${JSON.stringify(dir)},getBranch:()=>branch}};
     extension(pi); await handlers.get('session_start')({reason:'startup'},ctx);
     await handlers.get('session_start')({reason:'startup'},ctx);
     const runtime=globalThis[Symbol.for('pi-subagents/runtime')];
-    fs.writeFileSync(${JSON.stringify(join(dir, "observed.json"))},JSON.stringify({delivered,notices,error:runtime.recoveryError,runs:runtime.runningSubagents.size,owners:[...((await import(${JSON.stringify(moduleURL("ownership"))})).sessionOwners.values())]}));
+    const report=await tools.get('subagents_recovery').execute('report',{},undefined,undefined,ctx);
+    const projection=await handlers.get('context')({messages:[]},ctx);
+    fs.writeFileSync(${JSON.stringify(join(dir, "observed.json"))},JSON.stringify({report,projection,delivered,notices,error:runtime.recoveryError,runs:runtime.runningSubagents.size,owners:[...((await import(${JSON.stringify(moduleURL("ownership"))})).sessionOwners.values())]}));
     handlers.get('session_shutdown')({reason:'quit'},ctx);`;
 }
-function execute(code: string) {
-  const result = spawnSync(process.execPath, ["--input-type=module", "-e", code], { encoding: "utf8", timeout: 30000 });
-  assert.equal(result.status, 0, result.stderr);
+function execute(code: string, timeout = 30000) {
+  const result = spawnSync(process.execPath, ["--input-type=module", "-e", code], { encoding: "utf8", timeout });
+  assert.equal(result.status, 0, result.stderr || String(result.error ?? ""));
 }
+
+test("registered recovery tool fails closed on unavailable hosts, recovery errors and custody loss", () => {
+  const dir = mkdtempSync(join(tmpdir(), "recovery-access-"));
+  try {
+    execute(`import extension from ${JSON.stringify(moduleURL("index"))};
+      import assert from 'node:assert/strict';import fs from 'node:fs';
+      import {canonicalSessionPath} from ${JSON.stringify(moduleURL("ownership"))};
+      const tools=new Map();
+      extension(new Proxy({}, {get:(_,key)=>key==='registerTool'?tool=>tools.set(tool.name,tool):key==='getAllTools'?()=>[]:()=>{}}));
+      const runtime=globalThis[Symbol.for('pi-subagents/runtime')];
+      const dir=${JSON.stringify(dir)};
+      const branch=[{id:'c',type:'custom',customType:'subagent-custody',data:{branchToken:'b'}}];
+      const ctx={sessionManager:{getHeader:()=>({id:'parent'}),getBranch:()=>branch,getSessionFile:()=>dir+'/parent.jsonl',getSessionDir:()=>dir}};
+      const report=(context=ctx)=>tools.get('subagents_recovery').execute('read',{},undefined,undefined,context);
+      assert.match((await report({sessionManager:{}})).content[0].text,/Host lacks/);
+      assert.match((await report()).content[0].text,/Legacy.missing/);
+      const manifest={schema:1,revision:1,generation:'g',parent:{sessionFile:canonicalSessionPath(dir+'/parent.jsonl'),headerId:'parent',checkpoint:'c',branchToken:'b'},runs:{run:{id:'run',name:'private-name',task:'private-task',sessionFile:dir+'/child.jsonl',startTime:1,phase:'prepared',eventCursor:[]}},outbox:{}};
+      const directory=dir+'/artifacts/parent/subagent-runtime';fs.mkdirSync(directory,{recursive:true});
+      const file=directory+'/manifest.json';fs.writeFileSync(file,JSON.stringify({...manifest,custodyPaused:'explicit decision required'}));
+      const before=fs.readFileSync(file,'utf8');
+      assert.match((await report()).content[0].text,/Paused diagnostics only/);
+      assert.equal(fs.readFileSync(file,'utf8'),before);assert.equal(fs.existsSync(directory+'/writer'),false);
+      runtime.recoveryError='reconciliation failed';
+      let result=await report();assert.equal(result.isError,true);assert.doesNotMatch(result.content[0].text,/private-task/);
+      runtime.recoveryError=undefined;
+      runtime.store={snapshot:()=>manifest,assertCustody:()=>{throw Error('writer custody lost')}};
+      result=await report();assert.equal(result.isError,true);assert.match(result.content[0].text,/custody lost/);assert.doesNotMatch(result.content[0].text,/private-task/);
+      runtime.store=undefined;fs.writeFileSync(file,'broken');
+      result=await report();assert.equal(result.isError,true);assert.doesNotMatch(result.content[0].text,/private-task/);`);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
 
 test("fresh parent processes recover pending outbox, park UNKNOWN, honor tombstones and never launch", { skip: !processSupported }, () => {
   const dir = mkdtempSync(join(tmpdir(), "runtime-restart-"));
@@ -60,6 +94,11 @@ test("fresh parent processes recover pending outbox, park UNKNOWN, honor tombsto
     assert.equal(observed.owners[0].surface, undefined, "old pane is not authoritative");
     assert.equal(observed.owners[0].dispatched, true);
     assert.equal(observed.error, undefined);
+    assert.match(observed.report.content[0].text, /"task":"work"/);
+    assert.match(observed.report.content[0].text, /"sessionPath":/);
+    assert.match(observed.report.content[0].text, /"unknown":1/);
+    assert.match(observed.projection.messages[0].content, /"runId":"run"/);
+    assert.ok(observed.notices.some((notice: string) => notice.includes("Saved subagent assignments found")));
     execute(hostCode(dir, JSON.stringify(branch)));
     observed = JSON.parse(readFileSync(join(dir, "observed.json"), "utf8"));
     assert.deepEqual(observed.delivered, [], "repeated startup cannot replay tombstones or UNKNOWN");
@@ -77,6 +116,96 @@ test("fresh parent processes recover pending outbox, park UNKNOWN, honor tombsto
     execute(hostCode(dir, "[]"));
     observed = JSON.parse(readFileSync(join(dir, "observed.json"), "utf8"));
     assert.match(observed.error, /active branch mismatch/); assert.deepEqual(observed.delivered, []);
+    assert.equal(observed.report.isError, true);
+    assert.doesNotMatch(observed.report.content[0].text, /"task":"work"/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("fresh parent resumes an exited recovered session only after fresh process and writer checks", { skip: !processSupported }, () => {
+  const dir = mkdtempSync(join(tmpdir(), "runtime-restart-resume-"));
+  try {
+    // The original parent/process publishes identity and exits without releasing
+    // its lease. Recovery runs in a genuinely fresh process, not a module reload.
+    execute(`import {RuntimeStore} from ${JSON.stringify(moduleURL("runtime-store"))};
+      import {probeProcess} from ${JSON.stringify(moduleURL("process-identity"))};
+      import {canonicalSessionPath} from ${JSON.stringify(moduleURL("ownership"))};
+      import {runCompletionFile} from ${JSON.stringify(moduleURL("run-artifacts"))};
+      import {persistLaunchProfile,resolveLaunchProfile} from ${JSON.stringify(moduleURL("launch-profile"))};
+      import fs from 'node:fs';
+      const dir=${JSON.stringify(dir)},session=canonicalSessionPath(dir+'/child.jsonl');
+      fs.writeFileSync(dir+'/parent.jsonl',JSON.stringify({type:'session',id:'parent'})+'\\n');
+      fs.writeFileSync(session,JSON.stringify({type:'session',version:3,id:'child',cwd:dir})+'\\n');
+      const profile=resolveLaunchProfile({params:{id:'run',name:'Recovered'},
+        runtimePlan:{provider:'test',modelId:'model',model:'test/model',thinking:'off',modelSource:'parent',thinkingSource:'parent'},
+        effectiveCwd:dir,effectiveAutoExit:true,effectiveInteractive:false,taskDelivery:'artifact',
+        subagentSessionFile:session,localAgentDir:dir,denySet:new Set()},'pi','read');
+      persistLaunchProfile(profile);
+      const store=new RuntimeStore(dir+'/artifacts/parent/subagent-runtime',{
+        sessionFile:canonicalSessionPath(dir+'/parent.jsonl'),headerId:'parent',branchToken:'token',checkpoint:'checkpoint'});
+      store.prepare({id:'run',sessionFile:session,name:'Recovered',task:'work',startTime:1,cli:'pi',surface:'old-pane',profile});
+      store.phase('run','supervised');
+      const file=runCompletionFile(session,'run');
+      fs.writeFileSync(file+'.identity.json',JSON.stringify({schema:1,runId:'run',sessionFile:session,
+        headerId:'child',nonce:'original-process',process:probeProcess(process.pid).identity}));`);
+    execute(`import cp from 'node:child_process';import {syncBuiltinESMExports} from 'node:module';
+      import {promisify} from 'node:util';import fs from 'node:fs';import assert from 'node:assert/strict';
+      let surfaces=0,dispatches=0;const inspections=[];
+      const original=cp.execFileSync;
+      cp.execSync=()=> 'herdr';
+      cp.execFileSync=(command,args,...options)=>{
+        if(command==='powershell.exe')return original(command,args,...options);
+        if(args[0]==='tab'&&args[1]==='create')return JSON.stringify({result:{root_pane:{pane_id:'new-'+(++surfaces)}}});
+        if(args[1]==='run')dispatches++;
+        return '';
+      };
+      cp.execFile=Object.assign(()=>{throw new Error('unexpected transport')},{[promisify.custom]:async(_command,args)=>{
+        inspections.push(args[2]);return {stdout:JSON.stringify({result:{pane:{pane_id:'new',agent_status:'idle'}}})};
+      }});syncBuiltinESMExports();
+      process.env.HERDR_ENV='1';process.env.HERDR_WORKSPACE_ID='restart-test';process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS='0';
+      for(const key of ['HC_TERMINAL_ID','HC_TERMINAL_SOCKET','PI_DENY_TOOLS','PI_SUBAGENT_ID','PI_SUBAGENT_LAYOUT'])delete process.env[key];
+      const {default:extension}=await import(${JSON.stringify(moduleURL("index"))});
+      const {canonicalSessionPath,sessionOwners}=await import(${JSON.stringify(moduleURL("ownership"))});
+      const {runCompletionFile}=await import(${JSON.stringify(moduleURL("run-artifacts"))});
+      const {probeProcess}=await import(${JSON.stringify(moduleURL("process-identity"))});
+      const dir=${JSON.stringify(dir)},session=canonicalSessionPath(dir+'/child.jsonl');
+      const handlers=new Map(),tools=new Map();
+      extension(new Proxy({}, {get:(_,key)=>key==='on'?(name,fn)=>handlers.set(name,fn):
+        key==='registerTool'?tool=>tools.set(tool.name,tool):key==='getAllTools'?()=>[]:()=>{}}));
+      const branch=[{id:'checkpoint',type:'custom',customType:'subagent-custody',data:{branchToken:'token'}}];
+      const ctx={hasUI:false,cwd:dir,scopedModels:[],modelRegistry:{getAvailable:()=>[]},sessionManager:{
+        getHeader:()=>({id:'parent'}),getSessionId:()=> 'parent',getSessionFile:()=>dir+'/parent.jsonl',
+        getSessionDir:()=>dir,getBranch:()=>branch}};
+      await handlers.get('session_start')({reason:'startup'},ctx);
+      const runtime=globalThis[Symbol.for('pi-subagents/runtime')],owner=sessionOwners.get(session);
+      assert.equal(runtime.recoveryError,undefined);assert.equal(runtime.runningSubagents.size,0);
+      assert.equal(owner.runId,'run');assert.equal(owner.surface,undefined);
+      assert.match(runtime.store.snapshot().runs.run.reconciliation,/exited:/);
+      const resume=()=>tools.get('subagent_resume').execute('resume',{sessionPath:session},undefined,undefined,ctx);
+      const identityFile=runCompletionFile(session,'run')+'.identity.json';
+      const originalIdentity=fs.readFileSync(identityFile,'utf8'),identity=JSON.parse(originalIdentity);
+      // A cached exited decision or logical completion cannot replace a fresh
+      // probe. Missing/foreign identity and a still-live process retain custody.
+      for(const replacement of [null,{...identity,headerId:'foreign'},
+          {...identity,process:probeProcess(process.pid).identity}]){
+        if(replacement)fs.writeFileSync(identityFile,JSON.stringify(replacement));else fs.rmSync(identityFile);
+        await assert.rejects(resume(),/already owned/);
+        assert.equal(sessionOwners.get(session),owner);assert.equal(surfaces,0);assert.equal(dispatches,0);
+      }
+      fs.writeFileSync(identityFile,originalIdentity);
+      // Custody loss must not release the reservation, even with a dead child.
+      branch.length=0;await assert.rejects(resume(),/branch/);assert.equal(sessionOwners.get(session),owner);
+      branch.push({id:'checkpoint',type:'custom',customType:'subagent-custody',data:{branchToken:'token'}});
+      const attempts=await Promise.allSettled([resume(),resume()]);
+      assert.equal(attempts.filter(r=>r.status==='fulfilled').length,1);
+      assert.match(String(attempts.find(r=>r.status==='rejected').reason),/already owned/);
+      const result=attempts.find(r=>r.status==='fulfilled').value;
+      assert.equal(result.details.status,'started');assert.notEqual(result.details.id,'run');
+      assert.equal(sessionOwners.get(session).runId,result.details.id);
+      assert.equal(surfaces,1);assert.equal(dispatches,1);
+      assert.match(runtime.store.snapshot().runs.run.reconciliation,/explicit resume released/);
+      // No recovered terminal locator was inspected or used to authorize launch.
+      assert.ok(inspections.every(pane=>pane==='new-1'));
+      handlers.get('session_shutdown')({reason:'quit'},ctx);`, 120000);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

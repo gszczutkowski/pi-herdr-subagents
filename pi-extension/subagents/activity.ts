@@ -59,7 +59,8 @@ export interface SubagentActivityRecorder {
   beforeAgentStart(): void;
   agentStart(): void;
   agentEndWaiting(): void;
-  agentEndDone(): void;
+  /** Publish turn completion; keep recording when the child remains open. */
+  agentEndDone(keepOpen?: boolean): void;
   turnStart(turnIndex?: number): void;
   turnEnd(turnIndex?: number): void;
   beforeProviderRequest(): void;
@@ -71,7 +72,7 @@ export interface SubagentActivityRecorder {
   toolResult(toolCallId?: string, toolName?: string): void;
   toolExecutionEnd(toolCallId?: string, toolName?: string): void;
   callerPing(): void;
-  subagentDone(): void;
+  subagentDone(keepOpen?: boolean): void;
   sessionShutdown(reason: SubagentShutdownReason): void;
 }
 
@@ -302,12 +303,16 @@ export function createSubagentActivityRecorder(params: {
 
   const now = params.now ?? (() => Date.now());
   const createdAt = now();
+  // /reload replaces the recorder, not the supervised child. Continue the
+  // last published sequence for this run so the parent does not reject new
+  // work as stale. Do not restore transient activity or another child's state.
+  const previous = readSubagentActivityFile(activityFile, runningChildId);
   const activity: SubagentActivityState = {
     version: 1,
     runningChildId,
     createdAt,
     updatedAt: createdAt,
-    sequence: 0,
+    sequence: previous.ok ? previous.activity.sequence : 0,
     latestEvent: "session_start",
     phase: "starting",
     agentActive: false,
@@ -377,13 +382,15 @@ export function createSubagentActivityRecorder(params: {
     else scheduleFlush();
   }
 
-  function markDone(latestEvent: SubagentActivityEvent): void {
+  function markDone(latestEvent: SubagentActivityEvent, keepOpen = false): void {
     record(latestEvent, (current) => {
       current.phase = "done";
       clearActiveState(current);
       delete current.waitingSince;
     }, "immediate");
-    disable();
+    // A completed turn is not necessarily the end of this recorder's session.
+    // Preserve its sequence so follow-up work supersedes interrupted snapshots.
+    if (!keepOpen) disable();
   }
 
   return {
@@ -416,8 +423,8 @@ export function createSubagentActivityRecorder(params: {
         current.waitingSince = observedAt;
       }, "immediate");
     },
-    agentEndDone() {
-      markDone("agent_end");
+    agentEndDone(keepOpen) {
+      markDone("agent_end", keepOpen);
     },
     turnStart(turnIndex) {
       record("turn_start", (current, observedAt) => {
@@ -500,8 +507,8 @@ export function createSubagentActivityRecorder(params: {
     callerPing() {
       markDone("caller_ping");
     },
-    subagentDone() {
-      markDone("subagent_done");
+    subagentDone(keepOpen) {
+      markDone("subagent_done", keepOpen);
     },
     sessionShutdown(reason) {
       if (reason === "quit") markDone("session_shutdown");

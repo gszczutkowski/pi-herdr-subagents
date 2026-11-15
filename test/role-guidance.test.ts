@@ -78,3 +78,20 @@ test("read-only roles return reports for parent persistence without code edits",
   assert.match(plan, /Save the review response.*with `write`/);
   assert.doesNotMatch(plan, /Save your findings to:/);
 });
+
+test("planning requires an explicit parent cleanup decision after results and before completion", () => {
+  assert.match(plan, /After receiving a subagent result and before reporting done/);
+  assert.match(plan, /review the current plan and concrete remaining actions for each owned idle child/);
+  assert.match(plan, /Preserve its result first/);
+  assert.match(plan, /no pending review, fixes, retry or other follow-up needs that child/);
+  assert.match(plan, /use `subagent_close` with its owned id/);
+  assert.match(plan, /record that reason in the plan or final handoff/);
+  assert.match(plan, /missing plan or task binding alone does not authorize closure/);
+  assert.match(plan, /user-managed interactive sessions require user authorization/);
+  assert.match(plan, /unsent-draft, pending-input, ownership and branch\/custody guards/);
+  assert.match(plan, /Never bypass them with force-kill, terminal typing or interruption/);
+  assert.match(plan, /unavailable or returns rejected, pending or uncertain/);
+  assert.match(plan, /explicit recheck must use the same id, not a polling loop/);
+  assert.match(plan, /not background automatic cleanup/);
+  assert.match(plan, /7\. ✅ Every owned idle subagent closed via `subagent_close`, retained with a concrete reason, or reported with unresolved close status/);
+});

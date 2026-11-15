@@ -85,6 +85,39 @@ The Pi host UI/transport boundary is mocked; no live terminal/model is claimed.
 Installed Pi references: `docs/extensions.md`, `docs/session-format.md` and
 `examples/extensions/widget-placement.ts` (read before this boundary work).
 
+## Parent context protection
+
+`context-policy.ts` owns shared configuration and model-sized reserve/retention
+budgets. `context-guard.ts` is parent-only: idle input can await native manual
+compaction; running turns await a bounded configured-model summary and return a
+native compaction draft through Pi's actionable `turn_end` boundary. Calling
+`ctx.compact()` there would abort the run and can deadlock when awaited. Native
+length/overflow recovery is not replaced. Failed/non-shrinking summaries preserve
+history; abort signals and generation/leaf checks fence stale work. Boundary drafts
+do not emit native compaction notification hooks or invoke custom native summarizers.
+
+`context-checkpoint.ts` independently owns bounded advisory working-state notes
+and a fresh derived plan pointer/summary in native custom branch entries. It never
+mutates the plan, grants task authority, infers runtime liveness or stores raw
+conversation automatically. Native hooks and the proactive guard capture before
+compaction; request-time projection only reads. Explicit parent saves are required
+to replace fork-inherited notes. Append faults latch across reload and suppress
+uncertain content; a fresh Pi process is required for checkpoint fault recovery.
+
+`result-budget.ts` bounds new result/help/error content at `enqueueCompletion`,
+before `delivery.ts` takes its immutable outbox snapshot. Oversized original
+content and details are archived under content-addressed immutable paths; the
+bounded head/tail preview includes its reference. Full renderer/proposal details,
+event identity, outbox retry and plan acceptance semantics are unchanged. Existing
+history/outbox records are never rewritten for budgeting. Archival failure is
+reported honestly with a child-session fallback.
+
+`test/CONTEXT-PROTECTION-VERIFICATION.md` records the combined evidence and limits:
+540 configured tests pass, including deterministic real Pi scheduler/session
+integration, native retain-none checkpoint recovery, production outbox wiring,
+and inherited child-environment test isolation. No live external provider or
+herdr-terminal end-to-end protection claim is made.
+
 ## Verification limits
 
 Section 7 boundary work: discovery + existing tests 185/185; launch/ownership/
