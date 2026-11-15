@@ -132,6 +132,7 @@ test("registered task-bound spawn, live/closed resume, failure isolation and res
     const staleProfile = { ...launchProfile, assignmentContract: { ...savedContract, scope: "Stale scope" } };
     fs.writeFileSync(profilePath, JSON.stringify(staleProfile));
     await assert.rejects(execute("subagent_resume", { sessionPath: child.sessionFile, message: "stale contract", planTask: selection() }), /scope disagrees/);
+    await assert.rejects(execute("subagent_resume", { sessionPath: child.sessionFile, message: "stale inherited contract" }), /scope disagrees/);
     assert.deepEqual(read(), liveSnapshot, "contract validation never fails the healthy attempt");
     assert.equal(liveSends, 0);
     fs.writeFileSync(profilePath, JSON.stringify(launchProfile));
@@ -182,6 +183,7 @@ test("registered task-bound spawn, live/closed resume, failure isolation and res
     const beforeClosed = structuredClone(read());
     fs.writeFileSync(profilePath, JSON.stringify(staleProfile));
     await assert.rejects(execute("subagent_resume", { sessionPath: child.sessionFile, message: "stale contract", planTask: selection() }), /scope disagrees/);
+    await assert.rejects(execute("subagent_resume", { sessionPath: child.sessionFile, message: "stale inherited contract" }), /scope disagrees/);
     assert.deepEqual(read(), beforeClosed, "rejected contract never attaches/fails a closed run");
     fs.writeFileSync(profilePath, JSON.stringify(launchProfile));
     const resumed = await execute("subagent_resume", { sessionPath: child.sessionFile, message: "again", planTask: selection() });

@@ -82,7 +82,7 @@ import { registerSubagentAssignmentRenderer } from "./assignment.ts";
 import { registerPlanTools } from "./plan-tools.ts";
 import type { PlanPersistence } from "./plan-persistence.ts";
 import { AssignmentContractSchema, resolveAssignmentContract, contractTask, normalizeStructuredResult, type StructuredResult } from "./contracts.ts";
-import { PlanTaskParams, bindPlanRun, importPlanEnvelope, recordDispatchFailure, type PlanTaskBinding } from "./plan-runtime.ts";
+import { PlanTaskParams, bindPlanRun, importPlanEnvelope, recordDispatchFailure, resolveResumeContract, type PlanTaskBinding } from "./plan-runtime.ts";
 import { registerPlanCommand } from "./plan-preflight.ts";
 import { createDeliveryState, enqueueDelivery, flushDeliveries, pauseDeliveries, restoreDurableDeliveries, type DeliveryState } from "./delivery.ts";
 import {
@@ -2146,14 +2146,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         if (liveOwner && runningSubagents.has(liveOwner.runId)) {
           const child = runningSubagents.get(liveOwner.runId)!;
           if (runtime.treeSuspension || child.terminalActionsAllowed === false) throw new Error("Live continuation requires verified terminal custody");
-          const continuationContract = params.planTask ? resolveAssignmentContract(profile.assignmentContract,
-            runtime.plans!.read(ctx.sessionManager).snapshot?.tasks.find(t => t.taskId === params.planTask!.taskId)) : profile.assignmentContract;
+          const continuationContract = resolveResumeContract(runtime.plans!, ctx, profile.assignmentContract,
+            params.planTask, child.planTask ?? profile.planTask);
           const continuationParams = { ...params, message: contractTask(params.message ?? "", continuationContract) };
           const result = await continueLiveChild(liveOwner, child, continuationParams, { inspect: inspectPane, beforeSend: () => {
             if (runtime.treeSuspension || child.terminalActionsAllowed === false) throw new Error("Terminal custody was detached during continuation");
             child.durableStore?.assertCustody();
             assertResumeWriters(params.sessionPath);
             // Validate after async inspection, immediately before dispatch.
+            resolveResumeContract(runtime.plans!, ctx, continuationContract, params.planTask, child.planTask ?? profile.planTask);
             child.planTask = bindPlanRun(runtime.plans!, ctx, child.id, params.planTask, child.planTask);
             if (child.planTask) {
               if (!child.durableStore) throw new Error("Task-bound continuation requires durable custody");
@@ -2195,8 +2196,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         if ((params.planTask || profile.planTask) && !store) throw new Error("Task-bound runs require durable runtime custody");
         // Validate saved fields before attaching a run: stale contracts are not
         // silently rewritten, and rejected metadata is not a dispatch failure.
-        const assignmentContract = params.planTask ? resolveAssignmentContract(profile.assignmentContract,
-          runtime.plans!.read(ctx.sessionManager).snapshot?.tasks.find(t => t.taskId === params.planTask!.taskId)) : profile.assignmentContract;
+        const assignmentContract = resolveResumeContract(runtime.plans!, ctx, profile.assignmentContract, params.planTask, profile.planTask);
         planTask = bindPlanRun(runtime.plans!, ctx, id, params.planTask, profile.planTask);
         // Preserve the original binding, never infer authority from the selected branch.
         const resumeProfile = { ...profile, ...(planTask ? { planTask } : {}), ...(assignmentContract ? { assignmentContract } : {}) };
@@ -2238,6 +2238,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         runScriptInPane(surface, built.command, {
           onDispatch: () => {
             assertResumeWriters(params.sessionPath);
+            resolveResumeContract(runtime.plans!, ctx, assignmentContract, undefined, planTask);
             if (planTask) bindPlanRun(runtime.plans!, ctx, id, undefined, planTask);
             store?.phase(id, "dispatch-intent"); owner.dispatched = true;
           },

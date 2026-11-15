@@ -77,8 +77,10 @@ Wdrożono `terminate: true`. `test/caller-ping-loop.test.ts`: 3/3 OK, natywna p�
 
 ## 4. Resume może używać nieaktualnych wymagań zadania
 
-- [ ] Walidować kontrakt względem efektywnego powiązania z planem, również odziedziczonego z profilu.
-- [ ] Dodać testy wznowienia po zmianie definicji zadania.
+- [x] Walidować kontrakt względem efektywnego powiązania z planem, również odziedziczonego z profilu.
+- [x] Dodać testy odrzucania nieaktualnego kontraktu przy wznowieniu.
+
+Wdrożono wspólny preflight `resolveResumeContract` dla jawnego i odziedziczonego powiązania; ponowna kontrola po operacjach asynchronicznych przed wysyłką. Zarejestrowane narzędzie sprawdzone dla live i closed resume, bez zmiany planu ani wysyłki przy niezgodności. Testy plan-runtime/contracts/ownership-execute: 22/22 OK.
 
 **Miejsce:** `pi-extension/subagents/index.ts:2118–2120, 2167–2169`, ścieżki live continuation i closed-session resume.
 

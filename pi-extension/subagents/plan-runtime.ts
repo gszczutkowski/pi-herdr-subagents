@@ -3,7 +3,7 @@ import { Value } from "@sinclair/typebox/value";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { PlanPersistence } from "./plan-persistence.ts";
 import { attachRun, recordResult, type Authority, type ResultReference } from "./plan-store.ts";
-import { isStructuredResult, resultClaimDiagnostics } from "./contracts.ts";
+import { isStructuredResult, resultClaimDiagnostics, resolveAssignmentContract } from "./contracts.ts";
 import type { DeliveryEnvelope } from "./delivery.ts";
 import type { RuntimeStore, DurableRun } from "./runtime-store.ts";
 
@@ -24,6 +24,21 @@ export function isPlanTaskBinding(value: unknown): value is PlanTaskBinding {
 }
 const same = (a: PlanTaskBinding, b: PlanTaskBinding) => a.planId === b.planId && a.taskId === b.taskId &&
   a.attemptId === b.attemptId && a.authority.sessionId === b.authority.sessionId && a.authority.branchInstanceId === b.authority.branchInstanceId;
+
+/** Read-only contract preflight, including a binding inherited from a saved launch. */
+export function resolveResumeContract(persistence: PlanPersistence, ctx: ExtensionContext,
+  contract: unknown, selection?: PlanTaskSelection, saved?: PlanTaskBinding) {
+  const effective = selection ?? saved;
+  if (!effective) return resolveAssignmentContract(contract);
+  if (saved && (effective.planId !== saved.planId || effective.taskId !== saved.taskId
+    || effective.attemptId !== saved.attemptId)) throw new Error("Resume cannot redirect its original task binding");
+  const view = persistence.read(ctx.sessionManager);
+  const plan = view.snapshot;
+  if (!plan || !view.writable || plan.planId !== effective.planId) throw new Error(view.error ?? "Original writable plan is not selected");
+  const task = plan.tasks.find((task) => task.taskId === effective.taskId);
+  if (!task) throw new Error("Bound task is missing from the selected plan");
+  return resolveAssignmentContract(contract, task);
+}
 
 /** Parent-owned compare/append before transport. A saved binding can never be redirected. */
 export function bindPlanRun(persistence: PlanPersistence, ctx: ExtensionContext, runId: string,
