@@ -290,7 +290,8 @@ export default function (pi: ExtensionAPI) {
     description:
       "Send a help request to the parent agent and exit this session. " +
       "The parent will be notified with your message and can resume this session with a response. " +
-      "Use when you're stuck, need clarification, or need the parent to take action.",
+      "Use when you're stuck, need clarification, or need the parent to take action. " +
+      "Call alone, not alongside other tools: Pi stops the loop only when every result in the tool batch is terminating.",
     parameters: Type.Object({
       message: Type.String({ description: "What you need help with" }),
     }),
@@ -315,6 +316,7 @@ export default function (pi: ExtensionAPI) {
       ctx.shutdown();
       return {
         content: [{ type: "text", text: "Ping sent. Session will exit and parent will be notified." }],
+        terminate: true,
         details: {},
       };
     },

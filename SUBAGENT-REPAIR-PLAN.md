@@ -57,8 +57,10 @@ Wdrożono: jeden argument zadania; skille rozwijane w hooku wejścia dziecka z j
 
 ## 3. `caller_ping` nie zatrzymuje pętli agenta
 
-- [ ] Zakończyć pętlę po zgłoszeniu prośby o pomoc.
-- [ ] Dodać test z rzeczywistą pętlą agenta i kontrolowanym strumieniem odpowiedzi.
+- [x] Zakończyć pętlę po zgłoszeniu prośby o pomoc.
+- [x] Dodać test z rzeczywistą pętlą agenta i kontrolowanym strumieniem odpowiedzi.
+
+Wdrożono `terminate: true`. `test/caller-ping-loop.test.ts`: 3/3 OK, natywna pętla Pi, jedno niezmienne zdarzenie ping. Semantyka mieszanej grupy jest natywna: zatrzymanie bez kolejnego żądania następuje tylko gdy wszystkie wyniki są terminujące. Mieszana grupa z narzędziem nieterminującym może spowodować następne żądanie; opis narzędzia wymaga wywoływania `caller_ping` osobno.
 
 **Miejsce:** `pi-extension/subagents/subagent-done.ts:313–317`, wynik narzędzia `caller_ping`.
 
