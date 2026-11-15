@@ -9,6 +9,7 @@ import type {
 import type { ResolvedRuntimePlan } from "../../runtime-routing.ts";
 import { ASSIGNMENT_ENV, type SubagentAssignment } from "../../assignment.ts";
 import { getSubagentActivityFile } from "../../activity.ts";
+import { INITIAL_SKILLS_ENV } from "../../initial-skills.ts";
 
 const SUBAGENT_CONTROL_TOOLS = ["caller_ping", "subagent_done"] as const;
 
@@ -33,19 +34,9 @@ export function buildPiPromptArgs(params: {
   taskDelivery: "direct" | "artifact";
   taskArg: string;
 }): string[] {
-  const skillPrompts = (params.effectiveSkills ?? "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .map((skill) => `/skill:${skill}`);
-
-  const needsSeparator = params.taskDelivery === "artifact" && skillPrompts.length > 0;
-
-  return [
-    ...(needsSeparator ? [""] : []),
-    ...skillPrompts,
-    params.taskArg,
-  ];
+  // Skills expand inside the child input hook, in the same task input. CLI
+  // positional messages are separate turns and must never carry startup skills.
+  return [params.taskArg];
 }
 
 export class PiHarnessDriver implements HarnessDriver {
@@ -158,6 +149,7 @@ export class PiHarnessDriver implements HarnessDriver {
     }
 
     const effectiveSkills = params.skills ?? agentDefs?.skills;
+    envParts.push(`${INITIAL_SKILLS_ENV}=${shellQuote(context.resume ? "" : effectiveSkills ?? "")}`);
     const assignment: SubagentAssignment = {
       version: 1,
       ...(profile.planTask ? { planTask: profile.planTask } : {}),

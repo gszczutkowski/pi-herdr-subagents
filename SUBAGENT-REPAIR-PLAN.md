@@ -36,8 +36,10 @@ Wdrożono: fork otrzymuje `getBranch()` aktywnego rodzica, zachowuje surowe wpis
 
 ## 2. Skille i zadanie są wykonywane jako osobne tury
 
-- [ ] Przekazywać wymagane skille razem z właściwym zadaniem.
-- [ ] Sprawdzić kolejność rzeczywistych żądań do modelu oraz auto-exit.
+- [x] Przekazywać wymagane skille razem z właściwym zadaniem.
+- [x] Sprawdzić kolejność rzeczywistych żądań do modelu oraz auto-exit.
+
+Wdrożono: jeden argument zadania; skille rozwijane w hooku wejścia dziecka z jego faktycznie odkrytych zasobów. Brak wymaganego skilla blokuje zadanie i publikuje błąd. Test natywnego CLI parsera/plików i Pi AgentSession sprawdza dwa skille + zadanie w pierwszym żądaniu oraz auto-exit, bez dodatkowych tur. Zestaw skills/assignment/launch-profile/test.ts: 209/209 OK.
 
 **Miejsce:** `pi-extension/subagents/harness/drivers/pi.ts:31–48`, `buildPiPromptArgs()`.
 

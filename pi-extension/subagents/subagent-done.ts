@@ -14,6 +14,7 @@ import { registerLiveContinuation } from "./live-continuation.ts";
 import { StructuredResultSchema, normalizeStructuredResult, prepareCompletionArguments } from "./contracts.ts";
 import { registerRecoveryIdentity } from "./recovery-identity.ts";
 import { registerCloseControl } from "./close-control.ts";
+import { registerInitialSkills } from "./initial-skills.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -81,6 +82,7 @@ export function parseDeniedTools(rawValue: string | undefined): string[] {
 }
 
 export default function (pi: ExtensionAPI) {
+  registerInitialSkills(pi);
   registerSubagentAssignment(pi);
   registerLiveContinuation(pi);
   registerRecoveryIdentity(pi);

@@ -1281,10 +1281,10 @@ describe("subagent discovery", () => {
     assert.equal(testApi.buildSubagentToolAllowlist(""), null);
   });
 
-  it("buildPiPromptArgs inserts separator for artifact-backed launches with skills", () => {
+  it("buildPiPromptArgs uses one artifact input even with multiple skills", () => {
     assert.deepEqual(
       testApi.buildPiPromptArgs({ effectiveSkills: "review,lint", taskDelivery: "artifact", taskArg: "@artifact.md" }),
-      ["", "/skill:review", "/skill:lint", "@artifact.md"],
+      ["@artifact.md"],
     );
   });
 
@@ -1295,10 +1295,10 @@ describe("subagent discovery", () => {
     );
   });
 
-  it("buildPiPromptArgs omits separator for direct launches with skills", () => {
+  it("buildPiPromptArgs uses one direct task input with skills", () => {
     assert.deepEqual(
       testApi.buildPiPromptArgs({ effectiveSkills: "review", taskDelivery: "direct", taskArg: "do the task" }),
-      ["/skill:review", "do the task"],
+      ["do the task"],
     );
   });
 
