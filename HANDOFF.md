@@ -4,9 +4,11 @@
 
 - Repository: `E:/Repositories/pi-herdr-subagents`, branch `main`.
 - Implementation HEAD before this handoff: `e0101da`.
-- Changes are committed locally; no push was performed.
-- The original orchestration plan is complete (65/65). The remaining work below concerns the later `subagent_audit` / `subagent_close` follow-up, not unfinished original-plan features.
-- **The final parent review of the latest hardening has NOT been performed.** Do not describe worker-reported results as independently accepted.
+- Original implementation and handoff were committed locally; no push was performed.
+- The original orchestration plan is complete (65/65).
+- **Final parent review completed on 2026-11-15:** no actionable safety findings. All six recorded production source hashes match the retained strict HC journey; its assertions and cleanup were independently read. All 18 retained owned test terminals were independently confirmed missing, and the original child PID is absent.
+- The parent's first full test run exposed two Windows load-sensitive RPC startup/process-probe failures (475/477). Limiting test-file concurrency to four resolved contention without changing production code, safety assertions or timeouts. Both worker and parent reruns passed **477/477, zero skips**; parent lint and diff checks passed.
+- Private final review: `.git/verification/parent-close-final-review.json`; parent test log: `.git/verification/parent-final-tests-concurrency4.log`. No fresh live HC journey was required because production source hashes are unchanged.
 
 ## Already completed: the user's legacy session
 
@@ -36,21 +38,21 @@ Key production files:
 - `pi-extension/subagents/recovery-identity.ts`
 - `pi-extension/subagents/live-continuation.ts`
 
-The initial review of `b0b6f03` / `204a9cb` required changes: the installed `dist/bundle/cli.js` was missed, unsaved editor drafts were not protected, and the CLOSE watcher could keep disposed SDK hosts alive. The parent also identified rejection reservations that could lock a healthy child and a race between normal watcher cleanup and close-result validation. The worker reports these are now fixed; review the final implementation, not only the original two commits.
+The initial review of `b0b6f03` / `204a9cb` required changes: the installed `dist/bundle/cli.js` was missed, unsaved editor drafts were not protected, and the CLOSE watcher could keep disposed SDK hosts alive. The parent also identified rejection reservations that could lock a healthy child and a race between normal watcher cleanup and close-result validation. The final implementation, not only the original two commits, has now been reviewed; no actionable findings remain.
 
-## Remaining work, in order
+## Final verification checklist (completed)
 
-1. **Review the complete final hardening.** Check installed package-declared CLI bins and aliases; conservative audit uncertainty; self/ancestor and PID-birth protection; live draft safety; watcher unref/lifecycle cleanup; release of only matching definitively rejected requests; mutual exclusion with continuation; and natural watcher removal racing verified exit. Branch/lease/task-binding fences must remain intact, and replacement owners must never be released.
-2. **Independently verify the final evidence and source hashes.** Read `test/integration/HC-CLOSE-VERIFICATION.md`, the final journey's `assertions.json` / `cleanup.json`, and `.git/verification/close-hardening/independent-check.json`. Confirm the hashes against the current tree. Private evidence contains paths/session output; do not upload it.
-3. **Rerun automated checks:** `npm test`, `npm run lint`, and `git diff --check`. The worker reports **477/477 tests passed**, but the parent has not rerun this final state. The earlier Python/CRLF failures were already fixed; they are not an accepted ongoing exception.
-4. If review or evidence requires another live run, use only newly owned background HC terminals and the opt-in command below. Never interact with unrelated user terminals or repeat the legacy cleanup.
-5. Fix any findings in separate corrective commits, then give the user a concise final report. If everything is sound, no further feature expansion is required.
+1. **Completed: review the complete final hardening.** Check installed package-declared CLI bins and aliases; conservative audit uncertainty; self/ancestor and PID-birth protection; live draft safety; watcher unref/lifecycle cleanup; release of only matching definitively rejected requests; mutual exclusion with continuation; and natural watcher removal racing verified exit. Branch/lease/task-binding fences must remain intact, and replacement owners must never be released.
+2. **Completed: independently verify the final evidence and source hashes.** Read `test/integration/HC-CLOSE-VERIFICATION.md`, the final journey's `assertions.json` / `cleanup.json`, and `.git/verification/close-hardening/independent-check.json`. Confirm the hashes against the current tree. Private evidence contains paths/session output; do not upload it.
+3. **Completed: rerun automated checks:** `npm test` (**477/477**, zero skips), `npm run lint`, and `git diff --check`. Test concurrency is capped at four to avoid Windows OS-probe/startup contention. The initial failing run remains retained; no ongoing exception is accepted.
+4. No additional live run was required. Future live checks must use only newly owned background HC terminals and the opt-in command below. Never interact with unrelated user terminals or repeat the legacy cleanup.
+5. No production safety correction or feature expansion is required. The test-runner reliability change and generic long-session guidance are follow-up changes.
 
-## Reported live proof (pending parent acceptance)
+## Retained live proof (independently accepted within stated limits)
 
 Report: `test/integration/HC-CLOSE-VERIFICATION.md`.
 
-The worker reports one authenticated HC Pi TUI journey passed: sole-owner audit, unsent draft rejection without shutdown, continuation after rejection, successful verified close during real watcher cleanup, identical receipt on recheck, no extra child model turn, and cleanup of all 18 owned test terminals across retained attempts.
+The independently inspected retained evidence records one authenticated HC Pi TUI journey passing: sole-owner audit, unsent draft rejection without shutdown, continuation after rejection, successful verified close during real watcher cleanup, identical receipt on recheck, no extra child model turn, and cleanup of all 18 owned test terminals across retained attempts.
 
 ```bash
 PI_TEST_HC_TUI=1 node --test --test-reporter=tap --test-concurrency=1 \

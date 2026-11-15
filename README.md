@@ -719,6 +719,38 @@ Choose how a subagent session starts:
 
 `fork: true` on the tool call always forces the `fork` mode for that specific spawn. `/iterate` uses this explicit override on purpose.
 
+#### Long sessions and handoffs
+
+Fork inherits conversation context; it is **not** a context reset. For bounded tasks,
+prefer `standalone` or `lineage-only` with a concise assignment and relevant artifact
+paths. Keep full reports in files and return short findings, checks and blockers
+rather than repeatedly pasting logs or loading large images into the parent.
+
+Save handoff notes at milestones, before the context window is nearly full. Use
+Pi's native `/compact [instructions]` when needed; asking for a final summary in
+chat is another model request, not a guaranteed recovery mechanism. Automatic
+compaction belongs to Pi, not this extension. In Pi versions supporting per-model
+compaction settings, an optional project `.pi/settings.json` override can reserve
+more headroom (merge into existing settings; do not replace them):
+
+```json
+{
+  "compaction": {
+    "enabled": true,
+    "modelOverrides": {
+      "openai-codex/gpt-6.1-sol": { "reserveTokens": 65536 }
+    }
+  }
+}
+```
+
+Choose the exact provider/model key and a reserve below its actual context window;
+Pi triggers above `contextWindow - reserveTokens`. This reduces context pressure,
+but cannot prevent provider failures or user cancellation. An empty `aborted`
+response does not identify the cancellation source or prove context overflow.
+Check the session and Pi diagnostics before retrying: do not automatically replay
+subagent results or relaunch work whose model consumption is unknown.
+
 Pi supports all three modes by loading the selected session file. Claude, Codex, OpenCode, Grok, and generic command templates support only `standalone`: they do not consume seeded Pi JSONL. Requesting `lineage-only` or `fork` with those harnesses fails before creating a pane or session artifacts; it never silently drops the requested transfer.
 
 `resumeSessionId` is a separate native-harness operation, supported only by Claude (`--resume`) and OpenCode (`--session`). It cannot be combined with Pi session transfer. Other harnesses reject it instead of ignoring it; use `subagent_resume` for Pi session-file resume. Turn-only interrupts and structured activity snapshots remain Pi-only.
