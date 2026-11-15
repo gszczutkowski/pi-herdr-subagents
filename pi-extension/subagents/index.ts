@@ -2006,7 +2006,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           throw new Error("Close replacement ownership changed; replacement retained.");
         }
       };
-      const result: CloseResult = await closeOwnedChild(owner, child, { validate, validateClosed });
+      const result: CloseResult = await closeOwnedChild(owner, child, { validate, validateClosed,
+        continuationSettled: (requestId) => { validate(); store?.settleContinuation(child.id, requestId); } });
       if (result.status === "closed") {
         // Give the existing supervisor a bounded chance to retire this run.
         // OS death is already proven; map cleanup is not itself exit evidence.
@@ -2149,7 +2150,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           const continuationContract = resolveResumeContract(runtime.plans!, ctx, profile.assignmentContract,
             params.planTask, child.planTask ?? profile.planTask);
           const continuationParams = { ...params, message: contractTask(params.message ?? "", continuationContract) };
-          const result = await continueLiveChild(liveOwner, child, continuationParams, { inspect: inspectPane, beforeSend: () => {
+          const result = await continueLiveChild(liveOwner, child, continuationParams, { inspect: inspectPane,
+            settled: (requestId) => {
+              if (runtime.treeSuspension || child.terminalActionsAllowed === false
+                || sessionOwners.get(params.sessionPath) !== liveOwner) throw new Error("Continuation custody changed");
+              child.durableStore?.settleContinuation(child.id, requestId);
+            }, beforeSend: () => {
             if (runtime.treeSuspension || child.terminalActionsAllowed === false) throw new Error("Terminal custody was detached during continuation");
             child.durableStore?.assertCustody();
             assertResumeWriters(params.sessionPath);

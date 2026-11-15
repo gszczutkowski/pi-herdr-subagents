@@ -261,6 +261,16 @@ export class RuntimeStore {
     this.commit(next);
   }
 
+  settleContinuation(id: string, requestId: string): void {
+    const next = this.snapshot();
+    const run = next.runs[id];
+    if (!run) throw new Error("Unrecorded continuation owner");
+    if (!run.continuationRequestId) return;
+    if (run.continuationRequestId !== requestId) throw new Error("Continuation request ownership changed");
+    delete run.continuationRequestId;
+    this.commit(next);
+  }
+
   reconcileRun(id: string, reconciliation: string): void {
     const next = this.snapshot();
     if (!next.runs[id]) throw new Error("Unrecorded run");

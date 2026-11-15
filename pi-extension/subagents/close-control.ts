@@ -4,6 +4,7 @@ import { existsSync, linkSync, mkdirSync, readFileSync, readdirSync, rmSync, wat
 import { join } from "node:path";
 import { canonicalSessionPath, type SessionOwner } from "./ownership.ts";
 import { readChildIdentity } from "./recovery-identity.ts";
+import { reconcileContinuation } from "./live-continuation.ts";
 import { auditSession, assertSessionWriters, type SessionAudit } from "./session-audit.ts";
 import { isProtectedProcess, probeProcess, sameProcess, type ProcessIdentity, type ProcessProbe } from "./process-identity.ts";
 
@@ -109,6 +110,7 @@ interface CloseTransport {
    * removed the original owner only AFTER verified original process death. */
   validateClosed?: (original: ProcessIdentity) => void;
   timeoutMs?: number;
+  continuationSettled?: (requestId: string) => void;
   audit?: (path: string) => SessionAudit;
   probe?: (pid: number) => ProcessProbe;
   protected?: (pid: number) => boolean | undefined;
@@ -119,6 +121,7 @@ interface CloseTransport {
 export async function closeOwnedChild(owner: SessionOwner, child: CloseChild, transport: CloseTransport): Promise<CloseResult> {
   transport.validate();
   if (owner.runId !== child.id || child.cli !== "pi" || !child.activityFile) throw new Error("Only tracked owned Pi children support close; legacy/untracked processes require manual cleanup.");
+  reconcileContinuation(owner, child, transport.continuationSettled);
   if (owner.continuationRequestId) throw new Error("Continuation is pending; closing would race active work.");
   const identity = readChildIdentity(child.sessionFile, child.id);
   if (!identity) throw new Error("Child lacks verified process identity/CLOSE support. Reload/update the child and finish a turn, or close it manually.");

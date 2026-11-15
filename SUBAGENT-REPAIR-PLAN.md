@@ -95,8 +95,10 @@ Wdrożono wspólny preflight `resolveResumeContract` dla jawnego i odziedziczone
 
 ## 5. Spóźnione potwierdzenie blokuje kolejne resume i close
 
-- [ ] Uzgadniać stan istniejącego żądania po spóźnionym potwierdzeniu.
-- [ ] Dodać test akceptacji i odrzucenia po timeoutcie, także po reloadzie.
+- [x] Uzgadniać stan istniejącego żądania po spóźnionym potwierdzeniu.
+- [x] Dodać test akceptacji i odrzucenia po timeoutcie, także po reloadzie.
+
+Wdrożono `reconcileContinuation`: walidacja żądania, sesji, runId, tokenu i potwierdzenia (przy akceptacji także trwałego claim). Rozstrzygnięcie zapisuje się przed zwolnieniem blokady. Resume, close i odzyskiwanie używają wspólnego uzgadniania; recheck resume zwraca wynik pierwotnego żądania bez wysyłania nowej wiadomości. Testy late-continuation: 5/5 OK; istniejące live/recovery/close/store: 37/37 OK.
 
 **Miejsce:** `pi-extension/subagents/live-continuation.ts:145–160`; blokada w `pi-extension/subagents/close-control.ts:122`.
 

@@ -4,6 +4,7 @@ import { readChildIdentity, verifyRecoveryChild } from "./recovery-identity.ts";
 import { probeProcess, sameProcess } from "./process-identity.ts";
 import { assertSessionWriters, auditSession } from "./session-audit.ts";
 import type { DurableRun, RuntimeStore } from "./runtime-store.ts";
+import { reconcileContinuation } from "./live-continuation.ts";
 
 /** Explicit resume decision for an artifact-only reservation. Neither a retained
  * completion nor a cached recovery outcome proves that a session is safe now.
@@ -58,6 +59,10 @@ export async function reconcileRuntime(
   const current = () => !stopped && isCurrent();
   const verified = new Set<string>();
   const harvest = (run: DurableRun) => {
+    if (!current()) return;
+    store.assertCustody();
+    const owner = sessionOwners.get(canonicalSessionPath(run.sessionFile));
+    if (owner?.runId === run.id) reconcileContinuation(owner, run, (requestId) => store.settleContinuation(run.id, requestId));
     // Drain only immutable run-bound evidence, never terminal output or transcript
     // tails from another invocation. The outbox transaction advances the cursor.
     for (;;) {

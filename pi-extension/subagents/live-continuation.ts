@@ -73,7 +73,8 @@ export function registerLiveContinuation(pi: ExtensionAPI): void {
       // A durable claim survives reload; even an ambiguous dispatch must never be replayed.
       if (existsSync(claimFile) || existsSync(resultFile)) return;
       const request = read(join(dir, `${requestId}.request.json`));
-      const reject = (reason: string) => publish(resultFile, { runId, requestId, status: "rejected", reason });
+      const reject = (reason: string) => publish(resultFile, { runId, requestId, sessionFile,
+        idleToken: request?.idleToken, status: "rejected", reason });
       if (request?.runId !== runId || request?.requestId !== requestId ||
           request?.sessionFile !== sessionFile || canonicalSessionPath(ctx.sessionManager.getSessionFile() ?? "") !== sessionFile ||
           typeof request?.message !== "string" || !request.message.trim()) {
@@ -90,7 +91,7 @@ export function registerLiveContinuation(pi: ExtensionAPI): void {
       // Publish once to a distinct acknowledgement path: replacing a claim that a
       // parent is reading can fail on Windows. Never remove the durable claim.
       // Accepted means the API call returned, not exactly-once model execution.
-      publish(resultFile, { runId, requestId, status: "accepted" });
+      publish(resultFile, { runId, requestId, sessionFile, idleToken: request.idleToken, status: "accepted" });
   }
   pi.registerCommand(CONTINUE_COMMAND, {
     description: "Private run-bound continuation transport (manual compatibility)",
@@ -103,14 +104,47 @@ interface LiveChild {
   activityFile?: string; lifecycle: SubagentLifecycle; hasTurnResult?: boolean;
 }
 
+/** Reconcile an existing request only. No transport, replay, or new request is possible here. */
+export function reconcileContinuation(owner: SessionOwner,
+  child: { id: string; sessionFile: string; activityFile?: string },
+  persist?: (requestId: string) => void,
+): { requestId: string; status: "accepted" | "rejected"; reason?: string } | undefined {
+  const requestId = owner.continuationRequestId;
+  if (!requestId || !uuid.test(requestId) || owner.runId !== child.id || !child.activityFile) return;
+  const dir = continuationDir(child.activityFile);
+  const request = read(join(dir, `${requestId}.request.json`));
+  const result = read(join(dir, `${requestId}.result.json`));
+  const sessionFile = canonicalSessionPath(child.sessionFile);
+  if (request?.runId !== child.id || request?.requestId !== requestId || request?.sessionFile !== sessionFile
+    || !uuid.test(request?.idleToken) || typeof request?.message !== "string" || !request.message.trim()
+    || result?.runId !== child.id || result?.requestId !== requestId || result?.sessionFile !== sessionFile
+    || result?.idleToken !== request.idleToken || !["accepted", "rejected"].includes(result?.status)) return;
+  if (result.status === "accepted") {
+    const claim = read(join(dir, `${requestId}.claim.json`));
+    if (claim?.runId !== child.id || claim?.requestId !== requestId || claim?.status !== "dispatching") return;
+  }
+  // Persist resolution before dropping the in-memory fence. A failed durable
+  // write leaves the original reservation intact for an explicit recheck.
+  persist?.(requestId);
+  if (owner.continuationRequestId !== requestId) throw new Error("Continuation ownership changed during reconciliation");
+  delete owner.continuationRequestId;
+  return { requestId, status: result.status, ...(typeof result.reason === "string" ? { reason: result.reason } : {}) };
+}
+
 /** Reserve synchronously before inspection/transport awaits; never launch a replacement on failure. */
 export async function continueLiveChild(owner: SessionOwner, child: LiveChild | undefined,
   params: { message?: string; name?: string },
   transport: { inspect: (surface: string) => Promise<PaneInspection>; send?: (surface: string, text: string) => void;
-    beforeSend?: () => void; timeoutMs?: number },
+    beforeSend?: () => void; settled?: (requestId: string) => void; timeoutMs?: number },
 ): Promise<{ requestId: string; status: "accepted" | "pending" }> {
   if (owner.closeRequestId) throw new Error(`Close ${owner.closeRequestId} is pending/retained; do not continue or relaunch this process.`);
-  if (owner.continuationRequestId) throw new Error(`Continuation ${owner.continuationRequestId} is in flight or uncertain; do not retry.`);
+  if (owner.continuationRequestId) {
+    if (!child) throw new Error("Pending continuation has no tracked child");
+    const previous = reconcileContinuation(owner, child, transport.settled);
+    if (!previous) throw new Error(`Continuation ${owner.continuationRequestId} is in flight or uncertain; do not retry.`);
+    if (previous.status === "rejected") throw new Error(`Child rejected continuation: ${previous.reason}`);
+    return previous; // A recheck never dispatches the newly supplied message.
+  }
   if (!child || child.id !== owner.runId || child.cli !== "pi" || !child.activityFile ||
       child.lifecycle.process.kind !== "running" || !(child.lifecycle.turn.kind === "interrupted" || (child.hasTurnResult && child.lifecycle.turn.kind === "waiting"))) {
     throw new Error("Owned session is not a tracked interrupted or settled idle live Pi child; close its process before closed-session resume.");
@@ -144,14 +178,9 @@ export async function continueLiveChild(owner: SessionOwner, child: LiveChild | 
     });
     const deadline = Date.now() + (transport.timeoutMs ?? 3000);
     do {
-      const result = read(join(dir, `${requestId}.result.json`));
-      if (result?.runId === child.id && result?.requestId === requestId) {
-        if (result.status === "accepted") { delete owner.continuationRequestId; return { requestId, status: "accepted" }; }
-        if (result.status === "rejected") {
-          dispatched = false;
-          throw new Error(`Child rejected continuation: ${result.reason}`);
-        }
-      }
+      const result = reconcileContinuation(owner, child, transport.settled);
+      if (result?.status === "accepted") return { requestId, status: "accepted" };
+      if (result?.status === "rejected") throw new Error(`Child rejected continuation: ${result.reason}`);
       if (Date.now() >= deadline) break;
       await new Promise((resolve) => setTimeout(resolve, 25));
     } while (Date.now() <= deadline);
