@@ -7,12 +7,16 @@ import type {
 } from "../types.ts";
 import type { ResolvedRuntimePlan } from "../../runtime-routing.ts";
 import { extractPaneSummary } from "../pane-summary.ts";
+import { resolveRoleInstructions } from "../../role-instructions.ts";
+import { shellComment } from "../../shell.ts";
 
 export class GenericHarnessDriver implements HarnessDriver {
   readonly id: string;
   readonly name: string;
   readonly hasActivitySnapshots = false;
   readonly supportsTurnInterrupt = false;
+  readonly supportedSessionModes = ["standalone"] as const;
+  readonly supportsNativeResume = false;
 
   constructor(cliId = "generic", displayName?: string) {
     this.id = cliId;
@@ -32,35 +36,31 @@ export class GenericHarnessDriver implements HarnessDriver {
       surface,
       shellQuote,
       inheritsConversationContext,
-      roleBlock,
       modeHint,
       summaryInstruction,
     } = context;
 
+    const sp = context.identity ?? resolveRoleInstructions(agentDefs?.body, params.systemPrompt);
+    const template = agentDefs?.commandTemplate;
+    // Templates have no standard system-prompt flag; carry the role in the task.
     const fullTask = inheritsConversationContext
       ? params.task
-      : `${roleBlock ?? ""}\n\n${modeHint ?? ""}\n\n${params.task}\n\n${summaryInstruction ?? ""}`;
-
-    const template = agentDefs?.commandTemplate;
+      : `${template && sp ? `${sp}\n\n` : ""}${modeHint ?? ""}\n\n${params.task}\n\n${summaryInstruction ?? ""}`;
     let commandBody: string;
 
     if (template) {
-      // Replace template variables. Replacement values are passed via a
-      // replacer function (not a string) so that "$$", "$&", etc. in
-      // untrusted task/model/cwd text are inserted literally instead of
-      // being interpreted as String.replace() special patterns.
-      const quotedModel = effectiveModel ? shellQuote(effectiveModel) : "";
-      const quotedTask = shellQuote(fullTask);
-      const quotedCwd = effectiveCwd ? shellQuote(effectiveCwd) : ".";
-      const quotedName = shellQuote(params.name);
-      const quotedId = shellQuote(params.id);
-      commandBody = template
-        .replace(/\{model\}/g, () => quotedModel)
-        .replace(/\{task\}/g, () => quotedTask)
-        .replace(/\{prompt\}/g, () => quotedTask)
-        .replace(/\{cwd\}/g, () => quotedCwd)
-        .replace(/\{name\}/g, () => quotedName)
-        .replace(/\{id\}/g, () => quotedId);
+      // The template is executable configuration; its values are quoted data.
+      // One scan of the original template prevents placeholders inside inserted
+      // values from being expanded again. A callback also keeps $$/$& literal.
+      const values: Record<string, string> = {
+        model: effectiveModel ? shellQuote(effectiveModel) : "",
+        task: shellQuote(fullTask),
+        prompt: shellQuote(fullTask),
+        cwd: effectiveCwd ? shellQuote(effectiveCwd) : ".",
+        name: shellQuote(params.name),
+        id: shellQuote(params.id),
+      };
+      commandBody = template.replace(/\{(model|task|prompt|cwd|name|id)\}/g, (_match, key: string) => values[key]);
     } else {
       const binary = this.id === "generic" ? (agentDefs?.cli ?? "subagent") : this.id;
       const cmdParts: string[] = [binary];
@@ -69,7 +69,6 @@ export class GenericHarnessDriver implements HarnessDriver {
         cmdParts.push("--model", shellQuote(effectiveModel));
       }
 
-      const sp = params.systemPrompt ?? agentDefs?.body;
       if (sp) {
         cmdParts.push("--system-prompt", shellQuote(sp));
       }
@@ -79,16 +78,16 @@ export class GenericHarnessDriver implements HarnessDriver {
     }
 
     const cdPrefix = effectiveCwd ? `cd ${shellQuote(effectiveCwd)} && ` : "";
-    const command = `${cdPrefix}${commandBody}; echo '__SUBAGENT_DONE_'$?'__'`;
+    const command = `${cdPrefix}${commandBody}; echo '__SUBAGENT_DONE_${params.id}_'$?'__'`;
 
     return {
       command,
       cli: this.id,
       launchScriptPreamble: [
-        `# ${this.name} subagent launch script for ${params.name}`,
-        `# Generated: ${new Date().toISOString()}`,
-        `# Surface: ${surface}`,
-      ],
+        `${this.name} subagent launch script for ${params.name}`,
+        `Generated: ${new Date().toISOString()}`,
+        `Surface: ${surface}`,
+      ].map(shellComment),
     };
   }
 

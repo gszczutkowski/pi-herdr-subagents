@@ -44,6 +44,39 @@ describe("provider-bound subagent guidance", () => {
     });
   }
 
+  it("delivers parent cleanup policy once per request, including after reload", async () => {
+    const requests = await captureGuidanceRequests({ requests: 2, reloadBetweenRequests: true });
+    for (const { prompt, tools } of requests) {
+      assert.ok(tools.includes("subagent_close"));
+      assert.equal(prompt.split("After receiving a subagent result and before reporting done").length - 1, 1);
+      assert.match(prompt, /review the current plan and concrete remaining actions/);
+      assert.match(prompt, /Use subagent_close when no pending review, fixes, retry or other follow-up needs that child/);
+      assert.match(prompt, /preserve the child's result/);
+      assert.match(prompt, /record that reason in the plan or final handoff/);
+      assert.match(prompt, /missing plan or task binding alone does not authorize closure/);
+      assert.match(prompt, /user-managed interactive sessions require user authorization/);
+      assert.match(prompt, /unsent drafts, pending input, ownership and branch\/custody guards/);
+      assert.match(prompt, /unavailable, rejected, pending or uncertain/);
+      assert.match(prompt, /same id, not a polling loop/);
+    }
+  });
+
+  it("retains cleanup guidance for existing children when spawning is inactive", async () => {
+    const [{ prompt, tools }] = await captureGuidanceRequests({ inactive: true });
+    assert.ok(!tools.includes("subagent"));
+    assert.ok(tools.includes("subagent_close"));
+    assert.match(prompt, /After receiving a subagent result and before reporting done/);
+  });
+
+  for (const mode of ["denied", "inactive", "hidden"] as const) {
+    it(`does not instruct closure when subagent_close is ${mode}`, async () => {
+      const [{ prompt, tools }] = await captureGuidanceRequests({ closeTool: mode });
+      assert.ok(!tools.includes("subagent_close"));
+      assert.doesNotMatch(prompt, /After receiving a subagent result and before reporting done/);
+      assert.doesNotMatch(prompt, /Gracefully close an owned idle Pi subagent when no concrete follow-up remains/);
+    });
+  }
+
   it("retains earlier and later extensions' guideline contributions", async () => {
     const requests = await captureGuidanceRequests({ contributions: true, requests: 2 });
     for (const { prompt } of requests) {

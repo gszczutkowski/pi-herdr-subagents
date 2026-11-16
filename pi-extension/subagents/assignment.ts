@@ -2,12 +2,17 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
+import { isPlanTaskBinding, type PlanTaskBinding } from "./plan-runtime.ts";
+import { isAssignmentContract, type AssignmentContract } from "./contracts.ts";
 import { framedMessage } from "./frame.ts";
+import { isLineage, type Lineage } from "./lineage.ts";
 
 export const ASSIGNMENT_ENTRY_TYPE = "subagent-assignment";
 export const ASSIGNMENT_ENV = "PI_SUBAGENT_ASSIGNMENT_FILE";
 
 export interface SubagentAssignment {
+  planTask?: PlanTaskBinding;
+  assignmentContract?: AssignmentContract;
   version: 1;
   childId: string;
   sessionFile: string;
@@ -16,15 +21,19 @@ export interface SubagentAssignment {
   role: string;
   task: string;
   skills: string[];
+  lineage?: Lineage;
 }
 
 export function isSubagentAssignment(value: unknown): value is SubagentAssignment {
   if (!value || typeof value !== "object") return false;
   const data = value as SubagentAssignment;
   return data.version === 1
+    && (data.planTask === undefined || isPlanTaskBinding(data.planTask))
+    && (data.assignmentContract === undefined || isAssignmentContract(data.assignmentContract))
     && [data.childId, data.sessionFile, data.sender, data.recipient, data.role, data.task]
       .every((field) => typeof field === "string")
-    && Array.isArray(data.skills) && data.skills.every((skill) => typeof skill === "string");
+    && Array.isArray(data.skills) && data.skills.every((skill) => typeof skill === "string")
+    && (data.lineage === undefined || isLineage(data.lineage));
 }
 
 const registeredRenderers = new WeakSet<ExtensionAPI>();
@@ -40,10 +49,12 @@ export function registerSubagentAssignmentRenderer(pi: ExtensionAPI): void {
       `Sender: ${data.sender}`,
       `Recipient: ${data.recipient}`,
       `Role: ${data.role}`,
+      ...(data.planTask ? [`Plan: ${data.planTask.planId} / Task: ${data.planTask.taskId} / Attempt: ${data.planTask.attemptId} / Run: ${data.childId}`] : []),
       ...(data.skills.length ? [`Skills: ${data.skills.join(", ")}`] : []),
       "",
       "Task:",
       data.task,
+      ...(data.assignmentContract ? ["", "Assignment contract:", JSON.stringify(data.assignmentContract, null, 2)] : []),
     ].join("\n"), (text) => theme.bg("customMessageBg", text));
   });
 }

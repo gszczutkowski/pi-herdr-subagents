@@ -1,5 +1,5 @@
 import { copyFileSync, existsSync, mkdirSync, readFileSync, unlinkSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import type {
   HarnessDriver,
   SubagentLaunchContext,
@@ -9,6 +9,8 @@ import type {
 } from "../types.ts";
 import type { ResolvedRuntimePlan, ThinkingLevel } from "../../runtime-routing.ts";
 import { extractPaneSummary } from "../pane-summary.ts";
+import { resolveRoleInstructions } from "../../role-instructions.ts";
+import { shellComment } from "../../shell.ts";
 
 const CLAUDE_SESSIONS_DIR = join(
   process.env.HOME ?? "/tmp",
@@ -22,7 +24,7 @@ function copyClaudeSession(sentinelFile: string): string | null {
     const transcriptPath = readFileSync(transcriptFile, "utf-8").trim();
     if (!transcriptPath || !existsSync(transcriptPath)) return null;
     mkdirSync(CLAUDE_SESSIONS_DIR, { recursive: true });
-    const filename = transcriptPath.split("/").pop() ?? `claude-${Date.now()}.jsonl`;
+    const filename = basename(transcriptPath);
     const dest = join(CLAUDE_SESSIONS_DIR, filename);
     copyFileSync(transcriptPath, dest);
     return filename;
@@ -36,6 +38,8 @@ export class ClaudeHarnessDriver implements HarnessDriver {
   readonly name = "Claude Code";
   readonly hasActivitySnapshots = false;
   readonly supportsTurnInterrupt = false;
+  readonly supportedSessionModes = ["standalone"] as const;
+  readonly supportsNativeResume = true;
 
   formatModel(runtimePlan: Pick<ResolvedRuntimePlan, "model" | "modelId" | "provider">): string {
     return runtimePlan.modelId;
@@ -77,7 +81,7 @@ export class ClaudeHarnessDriver implements HarnessDriver {
       cmdParts.push("--model", shellQuote(effectiveModel));
     }
 
-    const sp = params.systemPrompt ?? agentDefs?.body;
+    const sp = context.identity ?? resolveRoleInstructions(agentDefs?.body, params.systemPrompt);
     if (sp) {
       cmdParts.push("--append-system-prompt", shellQuote(sp));
     }
@@ -90,17 +94,17 @@ export class ClaudeHarnessDriver implements HarnessDriver {
     cmdParts.push(shellQuote(params.task));
 
     const cdPrefix = effectiveCwd ? `cd ${shellQuote(effectiveCwd)} && ` : "";
-    const command = `${cdPrefix}${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+    const command = `${cdPrefix}${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_${params.id}_'$?'__'`;
 
     return {
       command,
       sentinelFile,
       cli: "claude",
       launchScriptPreamble: [
-        `# Claude Code subagent launch script for ${params.name}`,
-        `# Generated: ${new Date().toISOString()}`,
-        `# Surface: ${surface}`,
-      ],
+        `Claude Code subagent launch script for ${params.name}`,
+        `Generated: ${new Date().toISOString()}`,
+        `Surface: ${surface}`,
+      ].map(shellComment),
     };
   }
 

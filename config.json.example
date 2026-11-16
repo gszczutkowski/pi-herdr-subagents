@@ -10,5 +10,13 @@
   },
   "models": {
     "agents": {}
+  },
+  "contextProtection": {
+    "enabled": true,
+    "reserveTokens": 50000,
+    "reservePercent": 20,
+    "keepRecentTokens": 20000,
+    "maxReportBytes": 12000,
+    "providerPayloadWarningBytes": {}
   }
 }

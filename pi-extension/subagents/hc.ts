@@ -1,10 +1,34 @@
 import { execFile, execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
+import { access } from "node:fs/promises";
+import { TERMINAL_QUERY_TIMEOUT_MS, withTerminalQuery } from "./terminal-queries.ts";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
-const CLI_OPTIONS = { encoding: "utf8" as const, timeout: 15_000, windowsHide: true };
+const CLI_OPTIONS = { encoding: "utf8" as const, timeout: TERMINAL_QUERY_TIMEOUT_MS, windowsHide: true };
+
+/** Async discovery for monitor paths: never spawn a synchronous lookup process. */
+export async function findExecutableAsync(command: string): Promise<string | null> {
+  try {
+    const { stdout } = await withTerminalQuery(() => process.platform === "win32"
+      ? execFileAsync("where.exe", [command], CLI_OPTIONS)
+      : execFileAsync("sh", ["-c", 'command -v "$1"', "sh", command], CLI_OPTIONS));
+    return stdout.trim().split(/\r?\n/)[0] || null;
+  } catch {
+    return null;
+  }
+}
+
+export async function findHcExecutableAsync(): Promise<string | null> {
+  const onPath = await findExecutableAsync("hc");
+  if (onPath) return onPath;
+  if (process.platform === "win32" && process.env.LOCALAPPDATA) {
+    const installed = join(process.env.LOCALAPPDATA, "Programs", "herdr-core", "hc.exe");
+    try { await access(installed); return installed; } catch { /* Not installed. */ }
+  }
+  return null;
+}
 
 /** Resolve a real executable, not a shell alias (Node launches without a shell). */
 export function findExecutable(command: string): string | null {
@@ -136,11 +160,11 @@ export class HcClient {
   }
 
   readAsync(terminal: string, lines: number): Promise<string> {
-    return this.executeAsync(["read", terminal, "--lines", String(lines)]);
+    return withTerminalQuery(() => this.executeAsync(["read", terminal, "--lines", String(lines)]));
   }
 
   async inspect(terminal: string): Promise<HcInspection> {
-    try { return parseHcInspection(await this.executeAsync(["get", terminal]), terminal); }
+    try { return parseHcInspection(await withTerminalQuery(() => this.executeAsync(["get", terminal])), terminal); }
     catch (error) { return parseHcError(error); }
   }
 

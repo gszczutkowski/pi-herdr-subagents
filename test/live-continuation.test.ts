@@ -1,0 +1,382 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
+import { spawnSync } from "node:child_process";
+import { pathToFileURL } from "node:url";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { CONTINUE_COMMAND, continuationCommand, continuationDir, continueLiveChild, registerLiveContinuation } from "../pi-extension/subagents/live-continuation.ts";
+import { canonicalSessionPath, type SessionOwner } from "../pi-extension/subagents/ownership.ts";
+import { createLifecycle, markInterruptRequested, markProcessRunning } from "../pi-extension/subagents/lifecycle.ts";
+
+function fixture() {
+  const dir = mkdtempSync(join(tmpdir(), "live-continuation-"));
+  const runId = randomUUID();
+  const sessionFile = join(dir, "session.jsonl");
+  writeFileSync(sessionFile, "");
+  const activityFile = join(dir, "activity.json");
+  const env = { PI_SUBAGENT_ID: runId, PI_SUBAGENT_SESSION: sessionFile, PI_SUBAGENT_ACTIVITY_FILE: activityFile };
+  const previous = Object.fromEntries(Object.keys(env).map((key) => [key, process.env[key]]));
+  Object.assign(process.env, env);
+  const events = new Map<string, Function>();
+  const commands = new Map<string, any>();
+  const sent: any[] = [];
+  let idle = true;
+  let pending = false;
+  let failDispatch = false;
+  const ctx = { isIdle: () => idle, hasPendingMessages: () => pending,
+    sessionManager: { getSessionFile: () => sessionFile } };
+  const pi = { on: (name: string, handler: Function) => events.set(name, handler),
+    registerCommand: (name: string, command: any) => commands.set(name, command),
+    sendUserMessage: (...args: any[]) => { sent.push(args); if (failDispatch) throw new Error("API dispatch ambiguous"); } };
+  registerLiveContinuation(pi as any);
+  const child = { id: runId, name: "Worker", cli: "pi", sessionFile, activityFile, surface: "same-pane",
+    lifecycle: markInterruptRequested(markProcessRunning(createLifecycle(1), 2), 3),
+    abortController: new AbortController(), watcher: Promise.resolve(), task: "original" };
+  const owner: SessionOwner = { runId, surface: child.surface, dispatched: true };
+  const invoke = (text: string) => {
+    const [command, requestId] = text.split(" ");
+    assert.equal(command, `/${CONTINUE_COMMAND}`);
+    commands.get(CONTINUE_COMMAND).handler(requestId, ctx);
+  };
+  const transport = { inspect: async () => ({ kind: "present", agentStatus: "idle", observedAt: Date.now() } as const),
+    send: (_surface: string, _text: string) => { assert.fail("Terminal transport must never be used"); }, timeoutMs: 1000 };
+  events.get("session_start")!({}, ctx);
+  return { dir, runId, sessionFile, activityFile, child, owner, events, sent, commands, ctx, invoke, transport,
+    settle: (aborted = true) => events.get("agent_settled")!({ aborted }, ctx),
+    idle: (value: boolean) => { idle = value; }, pending: (value: boolean) => { pending = value; },
+    failDispatch: () => { failDispatch = true; },
+    cleanup: () => {
+      events.get("session_shutdown")!({}, ctx);
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
+      rmSync(dir, { recursive: true, force: true });
+    } };
+}
+
+test("native watcher callbacks contain ENOSPC/EACCES/EIO even when diagnostics also fail; claimed dispatch never replays", () => {
+  const url = pathToFileURL(resolve("pi-extension/subagents/live-continuation.ts")).href;
+  for (const code of ["ENOSPC", "EACCES", "EIO"]) {
+    const result = spawnSync(process.execPath, ["--input-type=module", "-e", `
+      import fs from 'node:fs';import {syncBuiltinESMExports} from 'node:module';
+      import assert from 'node:assert/strict';import {tmpdir} from 'node:os';import {join} from 'node:path';import {randomUUID} from 'node:crypto';
+      const dir=fs.mkdtempSync(join(tmpdir(),'continuation-io-')),session=join(dir,'child.jsonl'),activity=join(dir,'activity');
+      fs.writeFileSync(session,'');Object.assign(process.env,{PI_SUBAGENT_ID:'run',PI_SUBAGENT_SESSION:session,PI_SUBAGENT_ACTIVITY_FILE:activity});
+      let notify,watchError,closed=0,unref=0,fail=false,sends=0;
+      const write=fs.writeFileSync;fs.writeFileSync=(...args)=>{if(fail)throw Object.assign(Error('${code}'),{code:'${code}'});return write(...args);};
+      fs.watch=(_dir,fn)=>{notify=fn;return {close(){closed++},unref(){unref++},on(_event,fn){watchError=fn}}};syncBuiltinESMExports();
+      const {registerLiveContinuation,CONTINUE_COMMAND,continuationDir}=await import(${JSON.stringify(url)});
+      const hooks=new Map(),commands=new Map(),notices=[];
+      const ctx={hasUI:true,ui:{notify:m=>notices.push(m)},isIdle:()=>true,hasPendingMessages:()=>false,sessionManager:{getSessionFile:()=>session}};
+      registerLiveContinuation({on:(n,f)=>hooks.set(n,f),registerCommand:(n,c)=>commands.set(n,c),sendUserMessage:()=>{sends++;fail=true;throw Error('ambiguous dispatch')}});
+      try {
+        hooks.get('session_start')({},ctx);hooks.get('agent_settled')({aborted:true},ctx);
+        const state=JSON.parse(fs.readFileSync(join(continuationDir(activity),'state.json'),'utf8')),requestId=randomUUID();
+        const name=requestId+'.request.json';write(join(continuationDir(activity),name),JSON.stringify({runId:'run',sessionFile:state.sessionFile,requestId,idleToken:state.idleToken,message:'literal'}));
+        assert.doesNotThrow(()=>notify('rename',name));assert.equal(sends,1);assert.ok(closed);
+        assert.ok(notices.some(m=>/paused|uncertain/i.test(m)),'I/O failure must remain visible when disk diagnostics fail');
+        fail=false;hooks.get('session_start')({},ctx);hooks.get('agent_settled')({aborted:true},ctx);
+        commands.get(CONTINUE_COMMAND).handler(requestId,ctx);assert.equal(sends,1,'claim survives storage recovery and reload');
+        fail=true;assert.doesNotThrow(()=>watchError(Object.assign(Error('${code}'),{code:'${code}'})));
+        assert.ok(unref,'watcher must not keep an SDK host alive');
+      } finally {fail=false;hooks.get('session_shutdown')({},ctx);fs.rmSync(dir,{recursive:true,force:true});}
+    `], { encoding: "utf8", timeout: 15000 });
+    assert.equal(result.status, 0, `${code}: ${result.stderr}`);
+  }
+});
+
+test("interrupted settled child receives exact hostile text via API, reusing all live resources", async () => {
+  const f = fixture();
+  try {
+    f.settle();
+    const before = { ...f.child };
+    const message = "  /subagent_done\n!echo unsafe\n@private.txt\n/skill:secret\n${shell}; ' \"\n\r\n ";
+    const result = await continueLiveChild(f.owner, f.child, { message }, f.transport);
+    const command = continuationCommand(result.requestId);
+    assert.equal(result.status, "accepted");
+    assert.deepEqual(f.sent, [[message, { expandPromptTemplates: false }]]);
+    assert.deepEqual(f.child, before); // same run, pane, activity, abort, watcher, config and task
+    f.invoke(command);
+    assert.equal(f.sent.length, 1);
+    assert.equal(f.owner.continuationRequestId, undefined);
+    const dir = continuationDir(f.activityFile);
+    assert.equal(JSON.parse(readFileSync(join(dir, `${result.requestId}.result.json`), "utf8")).status, "accepted");
+    assert.equal(JSON.parse(readFileSync(join(dir, `${result.requestId}.claim.json`), "utf8")).status, "dispatching");
+    // Real duplicate filesystem notification/request, not only a manual command.
+    const requestPath = join(dir, `${result.requestId}.request.json`);
+    writeFileSync(requestPath, readFileSync(requestPath));
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.equal(f.sent.length, 1);
+  } finally { f.cleanup(); }
+});
+
+test("HC done requires a fresh child settled token, never coarse done alone", async () => {
+  const f = fixture();
+  try {
+    const transport = { ...f.transport, inspect: async () => ({ kind: "present", agentStatus: "done", observedAt: Date.now() } as const) };
+    await assert.rejects(continueLiveChild(f.owner, f.child, { message: "x" }, transport), /not confirmed settled/);
+    f.settle();
+    assert.equal((await continueLiveChild(f.owner, f.child, { message: "x" }, transport)).status, "accepted");
+    assert.equal(f.sent.length, 1);
+    await assert.rejects(continueLiveChild(f.owner, f.child, { message: "x" }, transport), /not confirmed settled/);
+    assert.equal(f.sent.length, 1);
+  } finally { f.cleanup(); }
+});
+
+test("manual Escape reconciles a waiting parent without inventing a completed result", async () => {
+  const f = fixture();
+  try {
+    f.child.lifecycle = { ...f.child.lifecycle, turn: { kind: "waiting", startedAt: 4 } };
+    f.settle(false);
+    await assert.rejects(continueLiveChild(f.owner, f.child, { message: "x" }, f.transport), /not confirmed an interrupted/);
+    f.settle(true);
+    assert.equal((await continueLiveChild(f.owner, f.child, { message: "manual escape follow-up" }, f.transport)).status, "accepted");
+    assert.equal(f.sent.length, 1);
+    f.events.get("agent_start")!({}, f.ctx);
+    await assert.rejects(continueLiveChild(f.owner, f.child, { message: "stale" }, f.transport), /not confirmed settled/);
+    assert.equal(f.sent.length, 1);
+  } finally { f.cleanup(); }
+});
+
+test("only a fresh interrupted-idle capability can override a stale active parent label", async () => {
+  const f = fixture();
+  try {
+    f.child.lifecycle = { ...f.child.lifecycle, turn: { kind: "active", source: "activity", startedAt: 4 } };
+    await assert.rejects(continueLiveChild(f.owner, f.child, { message: "busy must not dispatch" }, f.transport), /not confirmed settled/);
+    f.settle(false);
+    await assert.rejects(continueLiveChild(f.owner, f.child, { message: "ordinary idle cannot override active" }, f.transport), /active parent/);
+    assert.equal(f.sent.length, 0);
+    f.settle(true);
+    const result = await continueLiveChild(f.owner, f.child, { message: "confirmed interrupted follow-up" }, f.transport);
+    assert.equal(result.status, "accepted");
+    assert.equal(f.sent.length, 1);
+    assert.deepEqual(f.sent[0], ["confirmed interrupted follow-up", { expandPromptTemplates: false }]);
+    f.events.get("before_agent_start")!({}, f.ctx);
+    await assert.rejects(continueLiveChild(f.owner, f.child, { message: "expired must not dispatch" }, f.transport), /not confirmed settled/);
+    assert.equal(f.sent.length, 1);
+  } finally { f.cleanup(); }
+});
+
+test("foreign, malformed and busy child state cannot authorize continuation", async () => {
+  const f = fixture();
+  try {
+    f.settle();
+    const dir = continuationDir(f.activityFile);
+    const path = join(dir, "state.json");
+    const state = JSON.parse(readFileSync(path, "utf8"));
+    for (const patch of [{ runId: randomUUID() }, { sessionFile: "foreign" }, { state: "busy" }, { idleToken: "stale" }]) {
+      writeFileSync(path, JSON.stringify({ ...state, ...patch }));
+      await assert.rejects(continueLiveChild(f.owner, f.child, { message: "must not dispatch" }, f.transport), /not confirmed settled/);
+      assert.equal(f.owner.continuationRequestId, undefined);
+      assert.equal(readdirSync(dir).some(name => name.endsWith(".request.json")), false);
+    }
+    assert.equal(f.sent.length, 0);
+  } finally { f.cleanup(); }
+});
+
+test("reservation happens before asynchronous inspection; concurrent resumes cannot duplicate", async () => {
+  const f = fixture();
+  try {
+    f.settle();
+    let release!: Function;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const first = continueLiveChild(f.owner, f.child, { message: "one" }, {
+      ...f.transport, inspect: async () => { await gate; return f.transport.inspect(); },
+    });
+    assert.ok(f.owner.continuationRequestId);
+    await assert.rejects(continueLiveChild(f.owner, f.child, { message: "two" }, f.transport), /in flight/);
+    release();
+    assert.equal((await first).status, "accepted");
+    assert.equal(f.sent.length, 1);
+  } finally { f.cleanup(); }
+});
+
+test("starting, active without aborted proof, finalizing, unknown and non-Pi owners reject without dispatch", async () => {
+  const f = fixture();
+  try {
+    f.settle(false); // Ordinary idle is deliberately insufficient to override active.
+    const original = f.child.lifecycle;
+    for (const processKind of ["starting", "finalizing", "completed", "failed"]) {
+      f.child.lifecycle = { ...original, process: { ...original.process, kind: processKind } as any };
+      await assert.rejects(continueLiveChild(f.owner, f.child, { message: "x" }, f.transport), /not a tracked interrupted/);
+    }
+    for (const kind of ["active", "starting", "unknown"]) {
+      f.child.lifecycle = { ...original, turn: { kind } as any };
+      await assert.rejects(continueLiveChild(f.owner, f.child, { message: "x" }, f.transport));
+    }
+    f.child.lifecycle = original;
+    f.child.cli = "claude";
+    await assert.rejects(continueLiveChild(f.owner, f.child, { message: "x" }, f.transport));
+    assert.equal(f.sent.length, 0);
+  } finally { f.cleanup(); }
+});
+
+test("requires exact nonempty message and immutable name; Escape to idle uses existing child settlement",  async () => {
+  const f = fixture();
+  try {
+    for (const message of [undefined, "", " \n\t"]) {
+      await assert.rejects(continueLiveChild(f.owner, f.child, { message }, f.transport), /nonempty/);
+    }
+    await assert.rejects(continueLiveChild(f.owner, f.child, { message: "x", name: "Other" }, f.transport), /cannot change/);
+    for (const event of ["session_start", "before_agent_start", "agent_start"]) {
+      f.events.get(event)!({}, f.ctx);
+      await assert.rejects(continueLiveChild(f.owner, f.child, { message: "x" }, f.transport), /not confirmed settled/);
+    }
+    f.settle(false);
+    assert.equal((await continueLiveChild(f.owner, f.child, { message: "x" }, f.transport)).status, "accepted",
+      "Escape to an already idle child does not require a new aborted settlement");
+    f.settle();
+    f.idle(false);
+    await assert.rejects(continueLiveChild(f.owner, f.child, { message: "x" }, f.transport), /Child rejected/);
+    assert.equal(f.owner.continuationRequestId, undefined);
+    assert.equal(f.sent.length, 1);
+  } finally { f.cleanup(); }
+});
+
+test("unknown/missing pane never continues; failed transport retains uncertainty and never falls back to spawn", async () => {
+  const f = fixture();
+  try {
+    f.settle();
+    for (const kind of ["unavailable", "missing"]) {
+      await assert.rejects(continueLiveChild(f.owner, f.child, { message: "x" }, {
+        ...f.transport, inspect: async () => ({ kind } as any),
+      }), /not confirmed idle/);
+      assert.equal(f.owner.continuationRequestId, undefined);
+    }
+    const result = await continueLiveChild(f.owner, f.child, { message: "x" }, {
+      ...f.transport, timeoutMs: 0,
+    });
+    assert.equal(result.status, "pending");
+    await assert.rejects(continueLiveChild(f.owner, f.child, { message: "retry" }, f.transport), /uncertain/);
+    assert.equal(f.sent.length, 0);
+  } finally { f.cleanup(); }
+});
+
+test("state changes during inspection and pending child messages fail closed", async () => {
+  const f = fixture();
+  try {
+    f.settle();
+    const before = f.child.lifecycle;
+    await assert.rejects(continueLiveChild(f.owner, f.child, { message: "x" }, {
+      ...f.transport, inspect: async () => {
+        f.child.lifecycle = { ...before, turn: { kind: "unknown" } };
+        return f.transport.inspect();
+      },
+    }), /changed state/);
+    f.child.lifecycle = before;
+    f.pending(true);
+    await assert.rejects(continueLiveChild(f.owner, f.child, { message: "x" }, f.transport), /Child rejected/);
+    assert.equal(f.sent.length, 0);
+  } finally { f.cleanup(); }
+});
+
+test("ambiguous API dispatch is durably claimed and cannot replay", async () => {
+  const f = fixture();
+  try {
+    f.settle();
+    const result = await continueLiveChild(f.owner, f.child, { message: "x" }, {
+      ...f.transport, timeoutMs: 0, beforeSend: () => {
+        const requestId = f.owner.continuationRequestId!;
+        writeFileSync(join(continuationDir(f.activityFile), `${requestId}.result.json`),
+          JSON.stringify({ runId: f.runId, requestId, status: "dispatching" }));
+      },
+    });
+    assert.equal(result.status, "pending");
+    f.invoke(continuationCommand(result.requestId));
+    assert.equal(f.sent.length, 0);
+  } finally { f.cleanup(); }
+});
+
+test("throwing API dispatch retains a separate durable claim across child reload", async () => {
+  const f = fixture();
+  try {
+    f.settle();
+    f.failDispatch();
+    const result = await continueLiveChild(f.owner, f.child, { message: "x" }, { ...f.transport, timeoutMs: 100 });
+    assert.equal(result.status, "pending");
+    assert.equal(f.sent.length, 1);
+    f.events.get("session_start")!({}, f.ctx);
+    f.settle();
+    f.invoke(continuationCommand(result.requestId));
+    assert.equal(f.sent.length, 1);
+    await assert.rejects(continueLiveChild(f.owner, f.child, { message: "retry" }, f.transport), /uncertain/);
+  } finally { f.cleanup(); }
+});
+
+test("custody validation precedes publication; unsupported children never get terminal fallback", async () => {
+  const f = fixture();
+  try {
+    f.settle();
+    const dir = continuationDir(f.activityFile);
+    await assert.rejects(continueLiveChild(f.owner, f.child, { message: "x" }, {
+      ...f.transport, beforeSend: () => { throw new Error("custody lost"); },
+    }), /custody lost/);
+    assert.equal(readdirSync(dir).some(name => name.endsWith(".request.json")), false);
+    assert.equal(f.owner.continuationRequestId, undefined);
+    const stateFile = join(dir, "state.json");
+    const state = JSON.parse(readFileSync(stateFile, "utf8"));
+    delete state.transport;
+    writeFileSync(stateFile, JSON.stringify(state));
+    await assert.rejects(continueLiveChild(f.owner, f.child, { message: "x" }, f.transport), /Update\/reload/);
+    assert.equal(f.sent.length, 0);
+  } finally { f.cleanup(); }
+});
+
+test("watcher starts only in session_start and stops on shutdown/reload; stale tokens reject", async () => {
+  const f = fixture();
+  try {
+    f.settle();
+    const dir = continuationDir(f.activityFile);
+    const state = JSON.parse(readFileSync(join(dir, "state.json"), "utf8"));
+    f.events.get("session_shutdown")!({}, f.ctx);
+    const requestId = randomUUID();
+    const request = { runId: f.runId, sessionFile: canonicalSessionPath(f.sessionFile), requestId, idleToken: state.idleToken, message: "x" };
+    writeFileSync(join(dir, `${requestId}.request.json`), JSON.stringify(request));
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.equal(f.sent.length, 0);
+    f.events.get("session_start")!({}, f.ctx);
+    // Replacing a session invalidates old settled evidence, including queued files.
+    f.invoke(continuationCommand(requestId));
+    assert.equal(JSON.parse(readFileSync(join(dir, `${requestId}.result.json`), "utf8")).status, "rejected");
+    f.settle();
+    assert.equal((await continueLiveChild(f.owner, f.child, { message: "new" }, f.transport)).status, "accepted");
+    assert.equal(f.sent.length, 1);
+  } finally { f.cleanup(); }
+});
+
+test("artifact acknowledgement needs no terminal send", async () => {
+  const f = fixture();
+  try {
+    f.settle();
+    const result = await continueLiveChild(f.owner, f.child, { message: "x" }, {
+      ...f.transport, send: (_surface, text) => { f.invoke(text); throw new Error("lost reply"); },
+    });
+    assert.equal(result.status, "accepted");
+    assert.equal(f.sent.length, 1);
+  } finally { f.cleanup(); }
+});
+
+test("child validates identity, token, payload and request IDs; rejection is durable", () => {
+  const f = fixture();
+  try {
+    f.settle();
+    const dir = continuationDir(f.activityFile);
+    const state = JSON.parse(readFileSync(join(dir, "state.json"), "utf8"));
+    for (const patch of [{ runId: "foreign" }, { sessionFile: "foreign" }, { idleToken: randomUUID() },
+      { message: " " }, { requestId: randomUUID() }, { message: 42 }]) {
+      const requestId = randomUUID();
+      writeFileSync(join(dir, `${requestId}.request.json`), JSON.stringify({ runId: f.runId, requestId,
+        sessionFile: canonicalSessionPath(f.sessionFile), idleToken: state.idleToken, message: "x", ...patch }));
+      f.invoke(continuationCommand(requestId));
+      assert.equal(JSON.parse(readFileSync(join(dir, `${requestId}.result.json`), "utf8")).status, "rejected");
+      f.invoke(continuationCommand(requestId));
+    }
+    for (const invalid of ["../escape", "id\n!shell", "@file", `${randomUUID()} extra`]) {
+      assert.throws(() => continuationCommand(invalid));
+      f.commands.get(CONTINUE_COMMAND).handler(invalid, f.ctx);
+    }
+    assert.equal(f.sent.length, 0);
+  } finally { f.cleanup(); }
+});

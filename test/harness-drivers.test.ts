@@ -1,11 +1,16 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { createAgentSession, DefaultResourceLoader, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
+import subagentDoneExtension from "../pi-extension/subagents/subagent-done.ts";
+import { getSubagentActivityFile } from "../pi-extension/subagents/activity.ts";
+import { __test__ as parentHarness } from "../pi-extension/subagents/index.ts";
 import {
   getHarnessDriver,
   registerHarnessDriver,
+  validateHarnessLaunch,
   PiHarnessDriver,
   ClaudeHarnessDriver,
   OpenCodeHarnessDriver,
@@ -108,6 +113,27 @@ describe("Harness Drivers Registry", () => {
   });
 });
 
+describe("harness launch validation", () => {
+  it("rejects unsupported transfers and ignored native resume requests", () => {
+    assert.throws(() => validateHarnessLaunch(getHarnessDriver("claude"), "fork"), /does not support session mode "fork"/);
+    assert.throws(() => validateHarnessLaunch(getHarnessDriver("codex"), "lineage-only"), /does not support session mode "lineage-only"/);
+    assert.throws(() => validateHarnessLaunch(getHarnessDriver("pi"), "standalone", "native-id"), /does not support resumeSessionId/);
+    assert.doesNotThrow(() => validateHarnessLaunch(getHarnessDriver("pi"), "fork"));
+    assert.doesNotThrow(() => validateHarnessLaunch(getHarnessDriver("claude"), "standalone", "native-id"));
+  });
+});
+
+describe("declared harness capabilities", () => {
+  it("limits Pi session transfer to Pi and native resume to commands that forward it", () => {
+    for (const cli of ["pi", "claude", "codex", "opencode", "grok", "aider"]) {
+      const driver = getHarnessDriver(cli);
+      assert.deepEqual(driver.supportedSessionModes, cli === "pi"
+        ? ["standalone", "lineage-only", "fork"] : ["standalone"]);
+      assert.equal(driver.supportsNativeResume, ["claude", "opencode"].includes(cli));
+    }
+  });
+});
+
 describe("Pi Harness Driver", () => {
   const driver = new PiHarnessDriver();
 
@@ -134,8 +160,114 @@ describe("Pi Harness Driver", () => {
     assert.ok(built.command.includes("pi --session '/tmp/sessions/subagent.jsonl'"));
     assert.ok(built.command.includes("--model 'anthropic/claude-sonnet-4-5'"));
     assert.ok(built.command.includes("--thinking 'high'"));
-    assert.ok(built.command.includes("echo '__SUBAGENT_DONE_'$?'__'"));
+    assert.ok(built.command.includes(`echo '__SUBAGENT_DONE_${ctx.params.id}_'$?'__'`));
   });
+});
+
+describe("Pi activity path contract", () => {
+  it("boots the child writer at the generated path and exposes its tool snapshot to the parent", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-activity-contract-"));
+    const envNames = ["PI_SUBAGENT_ID", "PI_SUBAGENT_SESSION", "PI_SUBAGENT_ACTIVITY_FILE", "PI_SUBAGENT_AUTO_EXIT", "PI_SUBAGENT_ASSIGNMENT_FILE"];
+    const previous = envNames.map((name) => process.env[name]);
+    let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
+    try {
+      const context = createMockLaunchContext({ artifactDir: join(dir, "artifacts with spaces") });
+      const built = new PiHarnessDriver().buildCommand(context);
+      const childActivityFile = /PI_SUBAGENT_ACTIVITY_FILE='([^']+)'/.exec(built.command)?.[1];
+      const childId = /PI_SUBAGENT_ID='([^']+)'/.exec(built.command)?.[1];
+      const parentActivityFile = getSubagentActivityFile(context.artifactDir, context.params.id);
+      assert.equal(childActivityFile, parentActivityFile);
+      assert.equal(childId, context.params.id);
+      // Use the launch environment, not the parent's expected path, for the child.
+      process.env.PI_SUBAGENT_ID = childId;
+      process.env.PI_SUBAGENT_ACTIVITY_FILE = childActivityFile;
+      process.env.PI_SUBAGENT_AUTO_EXIT = "0";
+      // This fixture exercises activity, not the calling agent's control session.
+      // Inherited continuation resources must not survive session.dispose().
+      delete process.env.PI_SUBAGENT_SESSION;
+      delete process.env.PI_SUBAGENT_ASSIGNMENT_FILE;
+      const settingsManager = SettingsManager.inMemory({});
+      const loader = new DefaultResourceLoader({
+        cwd: dir, agentDir: dir, settingsManager, noSkills: true, noPromptTemplates: true,
+        noThemes: true, noContextFiles: true, extensionFactories: [subagentDoneExtension],
+      });
+      await loader.reload();
+      ({ session } = await createAgentSession({
+        cwd: dir, agentDir: dir, resourceLoader: loader, settingsManager,
+        sessionManager: SessionManager.create(dir, dir),
+      }));
+      const errors: unknown[] = [];
+      await session.bindExtensions({ onError: (error) => errors.push(error) });
+      await session.extensionRunner!.emit({
+        type: "tool_execution_start", toolCallId: "contract-tool-call", toolName: "read", args: { path: "README.md" },
+      });
+      const running: any = {
+        id: context.params.id, name: "worker", task: context.params.task, cli: "pi",
+        surface: "unused", startTime: Date.now(), sessionFile: context.subagentSessionFile,
+        interactive: false, activityFile: parentActivityFile,
+      };
+      parentHarness.observeRunningSubagent(running);
+      assert.deepEqual(running.activityRead, { ok: true });
+      assert.equal(running.activity.latestEvent, "tool_execution_start");
+      assert.equal(running.activity.activeScope, "tool");
+      assert.equal(running.activity.toolName, "read");
+      assert.equal(running.activity.toolCallId, "contract-tool-call");
+      assert.equal(running.lifecycle.turn.kind, "active");
+      assert.deepEqual(errors, []);
+    } finally {
+      session?.dispose();
+      envNames.forEach((name, index) => {
+        if (previous[index] === undefined) delete process.env[name];
+        else process.env[name] = previous[index];
+      });
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("parallel launch input artifacts", () => {
+  for (const systemPromptMode of ["append", "replace"] as const) {
+    it(`preserves same-name tasks, ${systemPromptMode} prompts, and assignment cards in the same second`, async (t) => {
+      t.mock.timers.enable({ apis: ["Date"], now: new Date("2026-11-14T12:00:00.000Z") });
+      const artifactDir = mkdtempSync(join(tmpdir(), "parallel-launch-inputs-"));
+      try {
+        const driver = new PiHarnessDriver();
+        const launches = await Promise.all(["run-a", "run-b"].map(async (id) => {
+          const context = createMockLaunchContext({
+            artifactDir,
+            params: { id, name: "Same Worker", task: `TASK_${id}\nExact  whitespace 日本語` },
+            taskDelivery: "artifact",
+            identityInSystemPrompt: true,
+            identity: `SYSTEM_${id}`,
+            systemPromptMode,
+          });
+          const built = driver.buildCommand(context);
+          const taskFile = /'@([^']+)'/.exec(built.command)?.[1];
+          const systemFile = /--(?:append-system-prompt|system-prompt) '([^']+)'/.exec(built.command)?.[1];
+          const assignmentFile = /PI_SUBAGENT_ASSIGNMENT_FILE='([^']+)'/.exec(built.command)?.[1];
+          assert.ok(taskFile);
+          assert.ok(systemFile);
+          assert.ok(assignmentFile);
+          return { context, taskFile, systemFile, assignmentFile };
+        }));
+        for (const field of ["taskFile", "systemFile", "assignmentFile"] as const) {
+          assert.notEqual(launches[0][field], launches[1][field]);
+        }
+        // Read only after both launches have written, as delayed children do.
+        for (const { context, taskFile, systemFile, assignmentFile } of launches) {
+          assert.ok(taskFile.includes(context.params.id));
+          assert.ok(systemFile.includes(context.params.id));
+          const assignment = JSON.parse(readFileSync(assignmentFile, "utf8"));
+          assert.equal(assignment.task, context.params.task);
+          assert.equal(assignment.childId, context.params.id);
+          assert.equal(readFileSync(taskFile, "utf8"), `\n\n\n\n${assignment.task}\n\n`);
+          assert.equal(readFileSync(systemFile, "utf8"), context.identity);
+        }
+      } finally {
+        rmSync(artifactDir, { recursive: true, force: true });
+      }
+    });
+  }
 });
 
 describe("OpenCode Harness Driver", () => {
@@ -156,7 +288,7 @@ describe("OpenCode Harness Driver", () => {
 
     assert.equal(built.cli, "opencode");
     assert.ok(built.command.startsWith("cd '/tmp/project' && opencode run --model 'anthropic/claude-3-5-sonnet'"));
-    assert.ok(built.command.includes("echo '__SUBAGENT_DONE_'$?'__'"));
+    assert.ok(built.command.includes(`echo '__SUBAGENT_DONE_${ctx.params.id}_'$?'__'`));
   });
 
   it("extracts output from terminal pane buffer", async () => {
@@ -201,7 +333,7 @@ describe("Codex Harness Driver", () => {
 
     assert.equal(built.cli, "codex");
     assert.ok(built.command.startsWith("cd '/tmp/project' && codex --model 'o3-mini' --reasoning-effort 'high'"));
-    assert.ok(built.command.includes("echo '__SUBAGENT_DONE_'$?'__'"));
+    assert.ok(built.command.includes(`echo '__SUBAGENT_DONE_${ctx.params.id}_'$?'__'`));
   });
 
   it("extracts output from terminal pane buffer", async () => {
@@ -238,7 +370,7 @@ describe("Grok Harness Driver", () => {
 
     assert.equal(built.cli, "grok");
     assert.ok(built.command.startsWith("cd '/tmp/project' && grok --model 'grok-3'"));
-    assert.ok(built.command.includes("echo '__SUBAGENT_DONE_'$?'__'"));
+    assert.ok(built.command.includes(`echo '__SUBAGENT_DONE_${ctx.params.id}_'$?'__'`));
   });
 
   it("extracts output from terminal pane buffer", async () => {
@@ -365,7 +497,7 @@ describe("Generic Harness Driver & Templates", () => {
 
     const built = driver.buildCommand(ctx);
     assert.ok(built.command.includes("gemini run --model 'gemini-2.5-pro' --prompt 'Analyze the repository structure' --dir '/workspace/my-app'"));
-    assert.ok(built.command.includes("echo '__SUBAGENT_DONE_'$?'__'"));
+    assert.ok(built.command.includes(`echo '__SUBAGENT_DONE_${ctx.params.id}_'$?'__'`));
   });
 
   it("falls back to bare binary execution when no commandTemplate is provided", () => {
@@ -409,4 +541,33 @@ describe("Generic Harness Driver & Templates", () => {
     assert.ok(result);
     assert.equal(result.summary, "aider exited with code 1");
   });
+});
+
+describe("external harness role composition", () => {
+  for (const cli of ["claude", "opencode", "codex", "grok", "custom", "custom-template"]) {
+    it(`${cli} delivers the named body and explicit instructions once each`, () => {
+      const context = createMockLaunchContext({
+        params: { id: "role-run", name: "Role", task: "ROLE_TASK", systemPrompt: "EXPLICIT_INSTRUCTIONS" },
+        agentDefs: { name: "Named", body: "NAMED_INSTRUCTIONS",
+          ...(cli === "custom-template" ? { commandTemplate: "custom {task}" } : {}) },
+        inheritsConversationContext: false,
+        roleBlock: "NAMED_INSTRUCTIONS\n\nEXPLICIT_INSTRUCTIONS",
+      });
+      const command = getHarnessDriver(cli).buildCommand(context).command;
+      assert.equal(command.split("NAMED_INSTRUCTIONS").length - 1, 1);
+      assert.equal(command.split("EXPLICIT_INSTRUCTIONS").length - 1, 1);
+      assert.ok(command.indexOf("NAMED_INSTRUCTIONS") < command.indexOf("EXPLICIT_INSTRUCTIONS"));
+    });
+  }
+});
+
+describe("run-bound harness completion", () => {
+  for (const cli of ["pi", "claude", "codex", "opencode", "grok", "custom"]) {
+    it(`${cli} emits only its run-qualified shell trailer`, () => {
+      const ctx = createMockLaunchContext();
+      const built = getHarnessDriver(cli).buildCommand(ctx);
+      assert.ok(built.command.includes(`echo '__SUBAGENT_DONE_${ctx.params.id}_'$?'__'`));
+      assert.ok(!built.command.includes("echo '__SUBAGENT_DONE_'$?'__'"));
+    });
+  }
 });

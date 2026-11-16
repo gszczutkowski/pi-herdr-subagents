@@ -1,4 +1,5 @@
 export * from "./types.ts";
+export * from "./capabilities.ts";
 export * from "./registry.ts";
 export * from "./drivers/pi.ts";
 export * from "./drivers/claude.ts";

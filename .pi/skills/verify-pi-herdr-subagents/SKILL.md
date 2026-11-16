@@ -7,7 +7,39 @@ description: Load when proving pi-herdr-subagents behavior through real Pi termi
 
 Read [features/README.md](features/README.md), then the relevant feature recipe. The primary surface is the Pi TUI: tools, slash commands, child tabs, and async completion messages. Unit-testable modules are secondary; there is no web server, port, database, migration, or seed service.
 
-## Launch
+## HC TUI journeys (opt-in authenticated model requests)
+
+When `HC_TERMINAL_ID` and `HC_TERMINAL_SOCKET` are present but legacy `herdr`/`HERDR_ENV` are absent, **do not** claim the legacy helper passed. Use:
+
+```bash
+PI_TEST_HC_TUI=1 node --test --test-concurrency=1 test/integration/hc-tui.test.ts > "$TEMP/hc-tui.log" 2>&1
+```
+
+This is separate from `PI_TEST_HC_LIVE=1 node --test test/hc-live.test.ts`, which starts no model and proves terminal transport only. Normal `npm test` does not run either opt-in live journey. A skipped test is not live evidence.
+
+`hc send` adds `<hc>` provenance tags around messages; the harness uses literal `hc keys` for `/reload` so it runs Pi's slash command rather than sending a tagged model prompt. Production continuation commands still go through production transport and must pass on their own; the test does not bypass or repair that path.
+
+The HC harness uses production `HcClient` and terminal script dispatch, `hc run --bg --no-notify`, exact owned terminal IDs, a unique empty scratch project and seeded `verify-worker` (auto-exit) / `verify-open` (non-auto-exit). It never focuses or sends input to the current user's terminal. A scratch PATH wrapper pins the project's local Pi CLI and applies `-ne`, a test-only native auth bridge and observer to parent and child. The isolated scratch agent profile grants only its exact scratch role source; no global approvals/settings are edited. The auth bridge resolves the original credential store through public `ModelRuntime`, without copying credentials. The parent explicitly loads this worktree's `index.ts`, and the child loads production `subagent-done.ts`. The observer records real lifecycle/tool/header/process evidence; it never calls orchestration tools or supplies model responses.
+
+Default model is exact `openai-codex/gpt-6.1-sol`; override only with an exact authenticated `PI_TEST_MODEL`. The parent requests `--thinking off`; this model clamps it to minimal and production child routing rejects explicit off, so the seed uses supported minimal. Readiness requires an exact generated assistant token and observed `mode: tui`, not an open shell. Provider/startup failures block the journey.
+
+Current bounded workflow evidence and its exact seven-journey selection command:
+`test/integration/HC-WORKFLOW-VERIFICATION.md`. This is not full ten-journey acceptance:
+manual HC named-key Escape failed, and extra authenticated same-batch done/ping
+attempts failed the model-input precondition. Never count those paths as passing
+through guarded abort or sequential tools. Guarded `subagent_interrupt` uses a
+child-issued active capability and public `ctx.abort()`, not HC keys or generic
+`hc interrupt` (which can choose Ctrl+C). Request acknowledgement and correlated
+aborted settlement remain separate. The idle `/new` journey runs only after
+confirmed guarded abort, not during active work.
+
+The original independent lifecycle tests require overlapping child bash gates, distinct run/session IDs, completion inside the actual reload shutdown/start interval, two parent results, closed-session resume history, same-process live continuation after aborted settlement, and two keep-open results with distinct event IDs. Each gets a fresh parent so one failed journey does not conceal the others. The observer deliberately holds the real reload shutdown interval open for 20 seconds; this proves delivery across an instrumented reload window, not a natural timing frequency claim. The restart test revalidates the recorded parent PID/birth and excludes self/ancestors before intentionally killing that test process, verifies OS death before starting the same saved session, requires fresh-generation verified-live artifact-only recovery, no child relaunch, disabled recovered controls, and two retained results. No exactly-once or terminal-adoption claim is made.
+
+The additional `owned audit draft rejection resume and close` journey proves the registered audit and close tools against a real keep-open Pi TUI child: sole audited PID/birth, a draft typed after idle publication rejects without a claim/shutdown, same-process continuation after rejection, then a fresh close returning `closed` after normal watcher removal, OS PID absence, no extra child model turn, and an idempotent receipt. It quits the owned parent gracefully. The observer only reads close custody transitions; it does not fabricate model replies or OS probes. RPC's editor getter is a default, not verifiable live draft state, so RPC CLOSE now fails closed; RPC fixtures are not TUI proof. See `test/integration/HC-CLOSE-VERIFICATION.md`.
+
+Run final acceptance from MAIN in the repository root so private artifacts live under root `.git/verification/`, not disposable `.git/worktrees/<name>/verification/`. Preserve earlier worktree evidence there before removing a worktree. Each run records entrypoint and core source hashes/commit/model/versions, launch scripts, timestamped actions, real parent/child sessions, observer events, terminal text captures, marker copies, assertions and cleanup. Text captures are not image screenshots or proof of colors/layout. Always inspect `assertions.json` and `cleanup.json`; a log saying a test ran is not a pass. Cleanup attempts every verifiable owned terminal independently, even after one damaged launch artifact. Unresolved custody is recorded and makes `allMissing` false; it never grants permission to close an unverified terminal. Scratch is retained on failure for diagnostics. Evidence may contain local paths, prompts and model output: never upload it or include credentials. A test constructor/preflight error before terminal creation can have only partial evidence.
+
+## Launch (legacy herdr helper)
 
 From the repository root, inside herdr:
 

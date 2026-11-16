@@ -7,12 +7,16 @@ import type {
 } from "../types.ts";
 import type { ResolvedRuntimePlan } from "../../runtime-routing.ts";
 import { extractPaneSummary } from "../pane-summary.ts";
+import { resolveRoleInstructions } from "../../role-instructions.ts";
+import { shellComment } from "../../shell.ts";
 
 export class GrokHarnessDriver implements HarnessDriver {
   readonly id = "grok";
   readonly name = "Grok";
   readonly hasActivitySnapshots = false;
   readonly supportsTurnInterrupt = false;
+  readonly supportedSessionModes = ["standalone"] as const;
+  readonly supportsNativeResume = false;
 
   formatModel(runtimePlan: Pick<ResolvedRuntimePlan, "model" | "modelId" | "provider">): string {
     return runtimePlan.modelId;
@@ -27,14 +31,13 @@ export class GrokHarnessDriver implements HarnessDriver {
       surface,
       shellQuote,
       inheritsConversationContext,
-      roleBlock,
       modeHint,
       summaryInstruction,
     } = context;
 
     const fullTask = inheritsConversationContext
       ? params.task
-      : `${roleBlock ?? ""}\n\n${modeHint ?? ""}\n\n${params.task}\n\n${summaryInstruction ?? ""}`;
+      : `${modeHint ?? ""}\n\n${params.task}\n\n${summaryInstruction ?? ""}`;
 
     const cmdParts: string[] = ["grok"];
 
@@ -42,7 +45,7 @@ export class GrokHarnessDriver implements HarnessDriver {
       cmdParts.push("--model", shellQuote(effectiveModel));
     }
 
-    const sp = params.systemPrompt ?? agentDefs?.body;
+    const sp = context.identity ?? resolveRoleInstructions(agentDefs?.body, params.systemPrompt);
     if (sp) {
       cmdParts.push("--system-prompt", shellQuote(sp));
     }
@@ -50,16 +53,16 @@ export class GrokHarnessDriver implements HarnessDriver {
     cmdParts.push(shellQuote(fullTask));
 
     const cdPrefix = effectiveCwd ? `cd ${shellQuote(effectiveCwd)} && ` : "";
-    const command = `${cdPrefix}${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+    const command = `${cdPrefix}${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_${params.id}_'$?'__'`;
 
     return {
       command,
       cli: "grok",
       launchScriptPreamble: [
-        `# Grok subagent launch script for ${params.name}`,
-        `# Generated: ${new Date().toISOString()}`,
-        `# Surface: ${surface}`,
-      ],
+        `Grok subagent launch script for ${params.name}`,
+        `Generated: ${new Date().toISOString()}`,
+        `Surface: ${surface}`,
+      ].map(shellComment),
     };
   }
 

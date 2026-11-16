@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
 import { waitForCompletion } from "../pi-extension/subagents/completion.ts";
 import { ClaudeHarnessDriver } from "../pi-extension/subagents/harness/drivers/claude.ts";
+import { findBashExecutable } from "../pi-extension/subagents/hc.ts";
 
 const hook = fileURLToPath(new URL("../pi-extension/subagents/plugin/hooks/on-stop.sh", import.meta.url));
 const user = (content: unknown) => ({ type: "user", message: { role: "user", content } });
@@ -23,8 +24,8 @@ function fixture(entries: unknown[], run: (paths: { dir: string; sentinel: strin
   }
 }
 
-function runHook(sentinel: string | undefined, payload: unknown, autoExit: string | undefined = "1") {
-  const env = { ...process.env };
+function runHook(sentinel: string | undefined, payload: unknown, autoExit: string | undefined = "1", overrides: NodeJS.ProcessEnv = {}) {
+  const env = { ...process.env, ...overrides };
   delete env.PI_CLAUDE_SENTINEL;
   delete env.PI_CLAUDE_AUTO_EXIT;
   if (sentinel !== undefined) env.PI_CLAUDE_SENTINEL = sentinel;
@@ -50,6 +51,17 @@ describe("Claude Stop completion hook", () => {
       });
     });
   }
+
+  it("preserves UTF-8 and LF bytes regardless of console encoding", () => {
+    fixture([], ({ sentinel, transcript }) => {
+      const summary = "Zażółć gęślą jaźń ✓ 漢字 🧪\nSecond line\n";
+      runHook(sentinel, { transcript_path: transcript, last_assistant_message: summary }, "1", {
+        PYTHONIOENCODING: "cp1250", PYTHONUTF8: "0", LC_ALL: "C",
+      });
+      assert.deepEqual(readFileSync(sentinel), Buffer.from(summary, "utf8"));
+      assert.deepEqual(readFileSync(`${sentinel}.transcript`), Buffer.from(`${transcript}\n`, "utf8"));
+    });
+  });
 
   it("publishes the hook result even when the transcript is temporarily unavailable", () => {
     fixture([], ({ sentinel, dir }) => {
@@ -182,4 +194,41 @@ describe("Claude Stop completion hook", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+});
+
+describe("Claude hook interpreter selection", () => {
+  for (const [name, available, selected] of [
+    ["prefers a working python3", ["python3", "python", "py"], "python3"],
+    ["falls back past a broken python3 alias", ["python"], "python"],
+    ["supports the Windows py -3 launcher", ["py"], "py"],
+    ["reports missing Python without pretending completion", [], undefined],
+  ] as const) {
+    it(name, () => {
+      const dir = mkdtempSync(join(tmpdir(), "claude-python-selection-"));
+      try {
+        const bin = join(dir, "bin"); mkdirSync(bin);
+        for (const candidate of ["python3", "python", "py"]) {
+          const valid = (available as readonly string[]).includes(candidate);
+          writeFileSync(join(bin, candidate), `#!/bin/bash\nif [[ "$*" == *sys.version_info* ]]; then exit ${valid ? 0 : 49}; fi\nprintf '%s\\n' '${candidate}' "$@" > "$PI_INTERPRETER_RECORD"\n`, { mode: 0o755 });
+        }
+        const bash = findBashExecutable(); assert.ok(bash, "Bash is required to run the Claude hook");
+        const pathKey = Object.keys(process.env).find(key => key.toLowerCase() === "path") ?? "PATH";
+        const env: NodeJS.ProcessEnv = { ...process.env, PI_CLAUDE_SENTINEL: "unused", PI_INTERPRETER_RECORD: "interpreter.txt" };
+        env[pathKey] = `${bin}${delimiter}${process.env[pathKey] ?? ""}`;
+        const result = spawnSync(bash, [hook], { cwd: dir, env, input: "{}", encoding: "utf8", timeout: 5_000 });
+        assert.equal(result.error, undefined);
+        assert.equal(result.status, selected ? 0 : 127, result.stderr);
+        if (selected) {
+          const args = readFileSync(join(dir, "interpreter.txt"), "utf8").trim().split(/\r?\n/);
+          assert.equal(args.shift(), selected);
+          if (selected === "py") assert.equal(args.shift(), "-3");
+          assert.deepEqual(args.slice(0, 2), ["-X", "utf8"]);
+          assert.match(args.at(-1)!, /on-stop\.py$/);
+        } else {
+          assert.match(result.stderr, /requires Python 3\.8\+/);
+          assert.equal(existsSync(join(dir, "interpreter.txt")), false);
+        }
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+  }
 });

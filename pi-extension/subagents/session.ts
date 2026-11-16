@@ -1,6 +1,7 @@
 import { appendFileSync, copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { randomBytes, randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
+import type { SessionEntry as NativeSessionEntry } from "@earendil-works/pi-coding-agent";
 
 export interface SessionEntry {
   type: string;
@@ -19,30 +20,20 @@ export interface MessageEntry extends SessionEntry {
 
 export type SeededSubagentSessionMode = "lineage-only" | "fork";
 
-function getForkContentLines(parentSessionFile: string): string[] {
-  const raw = readFileSync(parentSessionFile, "utf8");
-  const lines = raw.split("\n").filter((line) => line.trim());
-
-  let truncateAt = lines.length;
-  for (let i = lines.length - 1; i >= 0; i--) {
-    try {
-      const entry = JSON.parse(lines[i]);
-      if (entry.type === "message" && entry.message?.role === "user") {
-        truncateAt = i;
-        break;
-      }
-    } catch {
-      // ignore malformed lines
+function getForkContentLines(branch: readonly NativeSessionEntry[]): string[] {
+  // Fork immediately before the latest user prompt on the selected path. The
+  // delegating turn is supplied as a fresh child task, not inherited half-run.
+  // Keep raw path entries (including compaction/context edits and their IDs),
+  // letting Pi rebuild its own context rather than flattening model messages.
+  let truncateAt = branch.length;
+  for (let i = branch.length - 1; i >= 0; i--) {
+    const entry = branch[i];
+    if (entry.type === "message" && entry.message.role === "user") {
+      truncateAt = i;
+      break;
     }
   }
-
-  return lines.slice(0, truncateAt).filter((line) => {
-    try {
-      return JSON.parse(line).type !== "session";
-    } catch {
-      return true;
-    }
-  });
+  return branch.slice(0, truncateAt).map((entry) => JSON.stringify(entry));
 }
 
 export function seedSubagentSessionFile(params: {
@@ -50,7 +41,11 @@ export function seedSubagentSessionFile(params: {
   parentSessionFile: string;
   childSessionFile: string;
   childCwd: string;
+  parentBranch?: readonly NativeSessionEntry[];
 }): void {
+  if (params.mode === "fork" && !params.parentBranch) {
+    throw new Error("Fork requires the active parent branch, not physical session-file order");
+  }
   const header = {
     type: "session",
     version: 3,
@@ -60,7 +55,7 @@ export function seedSubagentSessionFile(params: {
     parentSession: params.parentSessionFile,
   };
   const contentLines =
-    params.mode === "fork" ? getForkContentLines(params.parentSessionFile) : [];
+    params.mode === "fork" ? getForkContentLines(params.parentBranch!) : [];
   const lines = [JSON.stringify(header), ...contentLines];
 
   mkdirSync(dirname(params.childSessionFile), { recursive: true });

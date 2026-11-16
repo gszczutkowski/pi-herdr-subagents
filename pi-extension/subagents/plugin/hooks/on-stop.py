@@ -10,7 +10,8 @@ def atomic_write(path, content):
     temporary = None
     try:
         with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", errors="replace", dir=os.path.dirname(path) or ".",
+            mode="w", encoding="utf-8", errors="replace", newline="\n",
+            dir=os.path.dirname(path) or ".",
             prefix=os.path.basename(path) + ".", suffix=".tmp", delete=False,
         ) as output:
             temporary = output.name
@@ -67,7 +68,8 @@ def main():
     if not sentinel:
         return
     try:
-        payload = json.load(sys.stdin)
+        # Hook input is JSON bytes, independent of Windows console code pages.
+        payload = json.load(sys.stdin.buffer)
     except (ValueError, UnicodeError):
         return
     if not isinstance(payload, dict) or payload.get("stop_hook_active") is True:

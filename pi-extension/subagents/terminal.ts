@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { bashPath, findBashExecutable } from "./hc.ts";
 import { dirname, join } from "node:path";
+import { shellComment } from "./shell.ts";
 import {
   closeHerdrSurface,
   createHerdrSurface,
@@ -91,8 +92,11 @@ export function renameCurrentWorkspace(title: string): void {
   renameHerdrWorkspace(title);
 }
 
-export function runInPane(paneId: PaneId, command: string): void {
+export function runInPane(paneId: PaneId, command: string, onDispatch?: () => void): void {
   assertTerminalAvailable();
+  // Everything before this boundary is definite preparation failure. Once the
+  // send starts, an error cannot prove that the child did not receive it.
+  onDispatch?.();
   sendHerdrCommand(paneId, command);
 }
 
@@ -104,7 +108,7 @@ export function interruptPane(paneId: PaneId): void {
 export function runScriptInPane(
   paneId: PaneId,
   command: string,
-  options?: { scriptPath?: string; scriptPreamble?: string },
+  options?: { scriptPath?: string; scriptPreamble?: string; onDispatch?: () => void },
 ): string {
   const scriptPath =
     options?.scriptPath ??
@@ -126,13 +130,15 @@ export function runScriptInPane(
     const tools = process.platform === "win32" && existsSync(gitTools) ? gitTools : dirname(bash);
     scriptLines.push(`export PATH=${shellQuote(bashPath(tools))}:${shellQuote(bashPath(process.env.PATH ?? ""))}:"$PATH"`);
   }
-  if (options?.scriptPreamble) scriptLines.push(options.scriptPreamble.trimEnd());
+  // Treat preambles from built-in and third-party drivers alike as metadata.
+  // Executable setup belongs in command, not in interpolated comments.
+  if (options?.scriptPreamble) scriptLines.push(shellComment(options.scriptPreamble.trimEnd()));
   scriptLines.push(command);
   writeFileSync(scriptPath, `${scriptLines.join("\n")}\n`, { mode: 0o755 });
 
   // A core-created Bash may inherit a Windows PATH without /usr/bin. Resolve
   // the interpreter from the orchestrator instead of relying on that shell.
-  runInPane(paneId, `${shellQuote(bashPath(bash))} ${shellQuote(scriptPath)}`);
+  runInPane(paneId, `${shellQuote(bashPath(bash))} ${shellQuote(scriptPath)}`, options?.onDispatch);
   return scriptPath;
 }
 
@@ -142,14 +148,12 @@ export function readPane(paneId: PaneId, lines = 50): string {
 }
 
 export async function readPaneAsync(paneId: PaneId, lines = 50): Promise<string> {
-  assertTerminalAvailable();
   return readHerdrScreenAsync(paneId, lines);
 }
 
 export type { PaneInspection, HerdrAgentStatus } from "./lifecycle.ts";
 
 export async function inspectPane(paneId: PaneId): Promise<import("./lifecycle.ts").PaneInspection> {
-  assertTerminalAvailable();
   const result = await inspectHerdrPane(paneId);
   if (result.kind === "present") {
     return { kind: "present", observedAt: Date.now(), ...result };

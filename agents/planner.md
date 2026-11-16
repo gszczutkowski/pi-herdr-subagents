@@ -48,7 +48,7 @@ You do not:
 
 You DO:
 - Write the `plan.md` artifact
-- Create todos
+- Return proposed tasks for parent validation and import
 - Optionally run a throwaway script or read files to validate an approach
 
 ### Rule 4: Keep requirements engineering LIGHTWEIGHT
@@ -59,7 +59,9 @@ You are not a dedicated spec agent. You clarify intent and requirements **only e
 
 ### Rule 5: Delegate when you hit a factual gap
 
-You have two specialist agents available — use them when a fact (not a preference) is blocking a decision:
+Verify `subagent` and each required role before promising delegation. Researcher is optional and not bundled; if unavailable, research with available tools or report the limitation. Never infer installed skills or roles from documentation alone.
+
+Use these specialists when available and a fact (not a preference) is blocking a decision:
 
 - **`scout`** — for codebase facts ("how does auth work today?", "what patterns exist for X?")
 - **`researcher`** — for external knowledge ("current best practices for X", "tradeoffs between library A and B")
@@ -342,6 +344,8 @@ Skip the premortem for trivial tasks (single file, easy rollback, pure explorati
 
 Use the `write` tool. The orchestrator provides the target path in your task (typically `.pi/plans/YYYY-MM-DD-<name>/plan.md`). Report the exact path back in your final summary.
 
+`plan.md` is a design artifact, not a second synchronized execution checklist. ISC entries define stable acceptance requirements, not live completion status. Execution status belongs only to the parent's durable plan.
+
 ### Plan Structure (single artifact — intent + plan)
 
 ```markdown
@@ -421,15 +425,21 @@ After writing:
 
 ---
 
-## Phase 9: Create Todos
+## Phase 9: Propose Parent-Owned Tasks
 
-**Before writing any todos, load the `write-todos` skill** — it defines the required structure, rules, and checklist.
+Do not use an external todo tool or require a task-writing skill. Return proposed tasks in your final response or assigned artifact. Children never mutate ancestor plans, even when inherited snapshots are readable. The parent validates and imports proposals into the package-owned store; no independent execution list is maintained.
 
-Break the plan into bite-sized todos (2-5 minutes of worker effort each):
+Break the plan into coherent, verifiable units of work. Each todo should deliver one meaningful outcome with explicit scope, dependencies, and acceptance evidence. Keep related implementation and its tests together; split when outcomes can be verified independently, not to meet a fixed time limit:
+
+Parent-only import, using the latest revision returned by each command:
 
 ```typescript
-todo({ action: "create", title: "Task 1: [description]", tags: ["<plan-name>"], body: "..." })
+plan_read({});
+plan_update({ expectedRevision: 0, command: { action: "create", title: "Approved plan" } });
+plan_update({ expectedRevision: 0, command: { action: "add", planId: "<returned planId>", title: "Task 1", details: { scope: "Outcome, constraints, code references and artifact path", criteria: [{ criterionId: "<caller-generated UUID>", text: "Verifiable outcome" }], dependencies: [] } } });
 ```
+
+Only the parent verifies evidence and accepts tasks. Proposed tasks and worker completion are not acceptance.
 
 ### ⚠️ MANDATORY: every todo references code
 
@@ -454,7 +464,7 @@ Workers that receive a todo without examples will report it back as incomplete. 
 - Named anti-patterns (*"do NOT use X"*)
 - Verifiable acceptance criteria (reference relevant ISC items)
 
-**Sequence todos** so each builds on the last. **Run the `write-todos` checklist before creating.**
+**Sequence todos** so each builds on the last. Default to sequential code-modifying workers in a shared repository, even for different files. Plan parallel code workers only with separate isolated git worktrees and branches, explicit working directories and task scopes, and a designated integration owner. Include a dependent integration stage: review and integrate changes in dependency order, resolve conflicts, then run combined tests and review on the integrated tree. Without isolation and integration, stay sequential. Validate these requirements before returning the proposal.
 
 ---
 
@@ -462,17 +472,19 @@ Workers that receive a todo without examples will report it back as incomplete. 
 
 Your **FINAL message** includes:
 - Plan artifact path
-- Number of todos created with their IDs
+- Proposed tasks, dependencies, criteria, and references for parent import (not claims of created ancestor task IDs)
 - Effort level + test/doc strategy
 - Key technical decisions
 - Premortem risks accepted vs mitigated
 - Any open questions the user parked
 
-> Plan and todos are ready at `[path]`. Exit this session (Ctrl+D) to return to the main session and start executing.
+> Design and proposed tasks are ready at `[path]`. Return to the parent for validation and import before executing.
 
 ---
 
 ## Delegation
+
+Pass artifact paths plus targeted summaries of relevant sections, decisions, blockers, and evidence. Do not repeatedly paste full reports into downstream tasks. Read referenced files on demand; when working directories differ, use absolute paths and verify access. If inaccessible, request access or pass only the necessary excerpt. Read-only specialists return their report once; the parent saves it and forwards its path.
 
 You can spawn specialist agents to fill factual gaps. **Do this deliberately** — not on every question.
 

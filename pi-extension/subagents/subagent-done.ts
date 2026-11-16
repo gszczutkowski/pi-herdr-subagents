@@ -3,13 +3,19 @@
  * - Shows agent identity + available tools as a styled widget above the editor (toggle with Ctrl+J)
  * - Provides a `subagent_done` tool for autonomous agents to self-terminate
  */
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { writeFileSync } from "node:fs";
+import { assertCompletionSession, beginCompletionTurn, CompletionSessionMismatch, prepareRunCompletion, publishRunCompletion, type PreparedRunCompletion } from "./run-artifacts.ts";
 import { getBehaviorConfig } from "./config.ts";
 import { createSubagentActivityRecorder } from "./activity.ts";
 import { registerSubagentAssignment } from "./assignment.ts";
+import { registerLiveContinuation } from "./live-continuation.ts";
+import { StructuredResultSchema, normalizeStructuredResult, prepareCompletionArguments } from "./contracts.ts";
+import { registerRecoveryIdentity } from "./recovery-identity.ts";
+import { registerCloseControl } from "./close-control.ts";
+import { registerInterruptControl } from "./interrupt-control.ts";
+import { registerInitialSkills } from "./initial-skills.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -77,7 +83,25 @@ export function parseDeniedTools(rawValue: string | undefined): string[] {
 }
 
 export default function (pi: ExtensionAPI) {
+  registerInitialSkills(pi, (errorMessage, ctx) => {
+    try {
+      assertCompletionSession(ctx.sessionManager);
+      beginCompletionTurn(ctx.sessionManager);
+      const completion = prepareRunCompletion({ type: "error", errorMessage, stopReason: "error" }, ctx.sessionManager);
+      if (completion) {
+        currentCompletion = { completion, intent: { type: "done", payload: {}, keepOpen: false }, attempts: 0 };
+        pending.push(currentCompletion);
+        retryPending(ctx);
+      }
+    } catch (error) {
+      notice(ctx, `Bootstrap completion pending/detached: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  });
   registerSubagentAssignment(pi);
+  registerLiveContinuation(pi);
+  registerRecoveryIdentity(pi);
+  registerInterruptControl(pi);
+  registerCloseControl(pi);
 
   let toolNames: string[] = [];
   let denied: string[] = [];
@@ -88,6 +112,9 @@ export default function (pi: ExtensionAPI) {
   const subagentAgent = process.env.PI_SUBAGENT_AGENT ?? "";
   const deniedToolsValue = process.env.PI_DENY_TOOLS;
   const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1";
+  // Keeping a child open opts the session into collaboration, not just one turn.
+  const keepOpenKey = Symbol.for(`pi-subagents/keep-open/${process.env.PI_SUBAGENT_ID ?? "legacy"}`);
+  let keepOpenSession = (globalThis as any)[keepOpenKey] ?? (!autoExit || !getBehaviorConfig().closeOnDone);
   const recorder = createSubagentActivityRecorder({
     runningChildId: process.env.PI_SUBAGENT_ID,
     activityFile: process.env.PI_SUBAGENT_ACTIVITY_FILE,
@@ -147,11 +174,71 @@ export default function (pi: ExtensionAPI) {
   let userTookOver = false;
   let agentStarted = false;
   let latestAgentMessages: any[] | undefined;
-  let completionDelivered = false;
+  let completionStaged = false;
+  type Intent = { type: "done" | "ping"; payload: object; keepOpen: boolean; batch?: number; failures?: string[] };
+  let intent: Intent | undefined;
+  let toolBatch = 0;
+  let turnFailures: string[] = [];
+  interface Pending { completion: PreparedRunCompletion; intent: Intent; attempts: number }
+  const pendingKey = Symbol.for(`pi-subagents/pending-completion/v1/${process.env.PI_SUBAGENT_ID ?? "legacy"}/${process.env.PI_SUBAGENT_SESSION ?? ""}`);
+  const pending: Pending[] = (globalThis as any)[pendingKey] ??= [];
+  let currentCompletion: Pending | undefined;
+  let retryTimer: ReturnType<typeof setTimeout> | undefined;
+  const retryDelays = [100, 500, 1000];
+  const stopRetry = () => { if (retryTimer) clearTimeout(retryTimer); retryTimer = undefined; };
+  const notice = (ctx: ExtensionContext, message: string) => {
+    ctx.ui?.setStatus?.("subagent-completion", message);
+    ctx.ui?.notify?.(message, "warning");
+    if (!ctx.hasUI) console.error(`[subagent completion] ${message}`);
+  };
+  const retryPending = (ctx: ExtensionContext) => {
+    stopRetry();
+    // Do not make a closeable result visible while a subsequent turn is busy.
+    // before_agent_start cancels timers; agent_settled resumes this queue.
+    if (!pending.length || !ctx.isIdle() || ctx.hasPendingMessages()) return;
+    for (const item of pending.slice()) {
+      if (item.attempts > retryDelays.length) continue;
+      try {
+        item.attempts++;
+        publishRunCompletion(item.completion, ctx.sessionManager);
+        pending.splice(pending.indexOf(item), 1);
+        if (item === currentCompletion) {
+          if (item.intent.type === "ping") recorder.callerPing();
+          else recorder.agentEndDone(item.intent.keepOpen);
+          if (!item.intent.keepOpen) ctx.shutdown();
+        }
+        ctx.ui?.setStatus?.("subagent-completion", pending.length ? "Completion pending" : undefined);
+      } catch (error) {
+        const paused = error instanceof CompletionSessionMismatch;
+        if (paused) item.attempts = retryDelays.length + 1;
+        const exhausted = item.attempts > retryDelays.length;
+        notice(ctx, `Completion pending: ${error instanceof Error ? error.message : String(error)}. ${exhausted
+          ? "Automatic retry paused; use /subagent_retry_completion in the supervised session."
+          : `Retry ${item.attempts}/${retryDelays.length} scheduled.`}`);
+      }
+    }
+    const next = pending.find(item => item.attempts <= retryDelays.length);
+    if (next) {
+      retryTimer = setTimeout(() => { retryTimer = undefined; retryPending(ctx); }, retryDelays[Math.max(0, next.attempts - 1)]);
+      retryTimer.unref?.();
+    }
+  };
+
+  pi.registerCommand("subagent_retry_completion", {
+    description: "Retry pending settled results without starting a model turn",
+    handler: async (_args, ctx) => {
+      for (const item of pending) item.attempts = 0;
+      retryPending(ctx);
+    },
+  });
 
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
     recorder.sessionStart();
+    if (process.env.PI_SUBAGENT_SESSION) {
+      try { assertCompletionSession(ctx.sessionManager); retryPending(ctx); }
+      catch (error) { notice(ctx, `Supervision detached: ${error instanceof Error ? error.message : String(error)}`); }
+    }
     const tools = pi.getAllTools();
     toolNames = tools.map((t) => t.name).sort();
     denied = parseDeniedTools(deniedToolsValue);
@@ -167,7 +254,14 @@ export default function (pi: ExtensionAPI) {
     userTookOver = true;
   });
 
-  pi.on("before_agent_start", () => {
+  pi.on("before_agent_start", (_event, ctx) => {
+    beginCompletionTurn(ctx.sessionManager);
+    stopRetry();
+    completionStaged = false;
+    currentCompletion = undefined;
+    intent = undefined;
+    turnFailures = [];
+    latestAgentMessages = undefined;
     recorder.beforeAgentStart();
   });
 
@@ -184,42 +278,49 @@ export default function (pi: ExtensionAPI) {
     recorder.agentEndWaiting();
   });
 
-  pi.on("agent_settled", (_event, ctx) => {
-    const shouldExit = autoExit
-      && shouldAutoExitOnAgentEnd(userTookOver, latestAgentMessages);
-
-    if (shouldExit && !completionDelivered) {
-      const keepOpen = !getBehaviorConfig().closeOnDone;
-      // Surface stopReason: "error" turns (auto-retry exhausted, provider
-      // overload, etc.) to the parent via the .exit sidecar so the watcher
-      // can report a clear failure with the underlying error message.
-      const sessionFile = process.env.PI_SUBAGENT_SESSION;
-      if (sessionFile) {
-        try {
-          writeFileSync(
-            `${sessionFile}.exit`,
-            JSON.stringify({ ...buildCompletionSidecar(latestAgentMessages), ...(keepOpen ? { keepOpen: true } : {}) }),
-          );
-        } catch {
-          // Best effort — the watcher can still detect the terminal sentinel
-          // or the pane status if the completion sidecar cannot be written.
-        }
+  pi.on("agent_settled", (event, ctx) => {
+    // Cancellation may drain a trailing turn_start after agent_end. Only this
+    // final boundary can overwrite it with an authoritative non-active snapshot.
+    if (ctx.isIdle()) recorder.agentEndWaiting();
+    const natural = !event.aborted && shouldAutoExitOnAgentEnd(userTookOver, latestAgentMessages);
+    if (!completionStaged && (intent || natural)) {
+      // Ping wins over done in any mixed batch, independent of execution order.
+      // Done wins over auto completion. Resolve final text only here, after all
+      // siblings, retries, queued messages and boundary continuations finished.
+      const requested = intent ?? { type: "done" as const, payload: buildCompletionSidecar(latestAgentMessages), keepOpen: keepOpenSession };
+      // Escape and session replacement abort outgoing work. Preserve the child:
+      // even a previously staged close/ping cannot close the replacement session.
+      const selected = event.aborted ? { ...requested, type: "done" as const, keepOpen: true } : requested;
+      if (selected.type === "done" && !event.aborted) {
+        keepOpenSession = selected.keepOpen;
+        (globalThis as any)[keepOpenKey] = keepOpenSession;
       }
-
-      completionDelivered = true;
-      recorder.agentEndDone();
-      if (!keepOpen) ctx.shutdown();
-      return;
+      const providerError = findLatestAssistantError(latestAgentMessages)?.errorMessage;
+      const failure = [event.aborted ? "Supervised turn aborted before settlement." : "", ...(intent?.failures ?? turnFailures), providerError].filter(Boolean).join("\n");
+      let payload: object = selected.payload;
+      if (failure) {
+        payload = selected.type === "ping"
+          ? { ...payload, message: `${(payload as { message: string }).message}\nSettlement warning: ${failure}` }
+          : { ...payload, type: "error", errorMessage: failure, stopReason: event.aborted ? "aborted" : "error" };
+      }
+      try {
+        const completion = prepareRunCompletion({ ...payload, ...(selected.keepOpen ? { keepOpen: true } : {}) }, ctx.sessionManager);
+        if (completion) {
+          currentCompletion = { completion, intent: selected, attempts: 0 };
+          pending.push(currentCompletion);
+        }
+        completionStaged = true;
+      } catch (error) {
+        notice(ctx, `Completion not published: ${error instanceof Error ? error.message : String(error)}`);
+      }
     }
-
-    if (autoExit) {
-      // Reset any recorded manual input marker. Auto-exit is decided by whether
-      // the latest settled agent run completed normally, not by who initiated it.
-      userTookOver = false;
-    }
+    retryPending(ctx);
+    if (autoExit) userTookOver = false;
   });
 
   pi.on("turn_start", (event) => {
+    toolBatch++;
+    turnFailures = []; // A successfully recovered earlier tool error is not terminal failure.
     recorder.turnStart((event as any).turnIndex);
   });
 
@@ -256,10 +357,17 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_execution_end", (event) => {
+    if (event.isError && !event.parentToolCallId) {
+      const text = (event.result as any)?.content?.filter((part: any) => part.type === "text").map((part: any) => part.text).join("\n");
+      const failure = `Tool ${event.toolName} failed: ${text || "unknown tool error"}`;
+      turnFailures.push(failure);
+      if (intent?.batch === toolBatch) intent.failures!.push(failure);
+    }
     recorder.toolExecutionEnd((event as any).toolCallId, (event as any).toolName);
   });
 
   pi.on("session_shutdown", (event) => {
+    stopRetry();
     recorder.sessionShutdown((event as any).reason);
   });
 
@@ -276,9 +384,10 @@ export default function (pi: ExtensionAPI) {
     name: "caller_ping",
     label: "Caller Ping",
     description:
-      "Send a help request to the parent agent and exit this session. " +
-      "The parent will be notified with your message and can resume this session with a response. " +
-      "Use when you're stuck, need clarification, or need the parent to take action.",
+      "Stage a help request to the parent and close after the agent settles and publication succeeds. " +
+      "The parent can resume this session with a response. Use when stuck or needing a decision. " +
+      "Prefer calling alone: non-terminating siblings require another model request. " +
+      "In a mixed caller_ping/subagent_done batch, ping takes precedence; sibling failures are reported at settlement.",
     parameters: Type.Object({
       message: Type.String({ description: "What you need help with" }),
     }),
@@ -291,17 +400,16 @@ export default function (pi: ExtensionAPI) {
         );
       }
 
-      recorder.callerPing();
+      assertCompletionSession(ctx.sessionManager);
       const exitData = {
         type: "ping" as const,
         name: process.env.PI_SUBAGENT_NAME ?? "subagent",
         message: params.message,
       };
-      writeFileSync(`${sessionFile}.exit`, JSON.stringify(exitData));
-
-      ctx.shutdown();
+      if (intent?.type !== "ping") intent = { type: "ping", payload: exitData, keepOpen: false, batch: toolBatch, failures: [...turnFailures] };
       return {
-        content: [{ type: "text", text: "Ping sent. Session will exit and parent will be notified." }],
+        content: [{ type: "text", text: "Ping staged. The parent is notified and shutdown requested only after settlement and successful publication." }],
+        terminate: true,
         details: {},
       };
     },
@@ -309,30 +417,30 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerTool({
     name: "subagent_done",
+    prepareArguments: prepareCompletionArguments,
     label: "Subagent Done",
     description:
       "Call this tool when you have completed your task. " +
-      "It returns your results to the main session and optionally closes this session. " +
-      "Your LAST assistant message before calling this becomes the summary returned to the caller.",
+      "It stages this turn's results for the immediate parent at agent settlement, then optionally closes after publication succeeds. " +
+      "Optionally provide a structured result (worker proposals only, never acceptance). Otherwise your last assistant text from the current supervised task and active branch becomes the summary (explicitly reports no text if this task emitted none).",
     parameters: Type.Object({
+      result: Type.Optional(StructuredResultSchema),
       close: Type.Optional(Type.Boolean({
         description: "False leaves this session and its pane open for follow-up. True closes it. Omitting it uses behavior.closeOnDone.",
       })),
-    }),
+    }, { additionalProperties: false }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const keepOpen = !(params.close ?? getBehaviorConfig().closeOnDone);
-      const sessionFile = process.env.PI_SUBAGENT_SESSION;
-      recorder.subagentDone();
-      if (sessionFile) {
-        writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done", ...(keepOpen ? { keepOpen: true } : {}) }));
+      assertCompletionSession(ctx.sessionManager);
+      const keepOpen = params.close === undefined ? keepOpenSession : !params.close;
+      if (!intent) {
+        intent = { type: "done", payload: { type: "done", ...normalizeStructuredResult(params.result) }, keepOpen, batch: toolBatch, failures: [...turnFailures] };
       }
-      completionDelivered = true;
-      if (!keepOpen) ctx.shutdown();
       return {
         content: [{ type: "text", text: keepOpen
-          ? "Result delivered. This session and its pane stay open for follow-up."
-          : "Shutting down subagent session." }],
-        details: {},
+          ? "Result staged for settlement. This session remains supervised for follow-up after publication."
+          : "Result staged. Shutdown is requested only after settlement and successful publication." }],
+        terminate: true,
+        details: normalizeStructuredResult(params.result),
       };
     },
   });

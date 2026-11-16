@@ -1,10 +1,14 @@
 import type { ResolvedRuntimePlan, ThinkingLevel } from "../runtime-routing.ts";
 import type { CompletionResult } from "../completion.ts";
 
+/** standalone: fresh context; lineage-only: parent link without messages; fork: seeded Pi history. */
+export type HarnessSessionMode = "standalone" | "lineage-only" | "fork";
+
 export interface SubagentLaunchParams {
   id: string;
   name: string;
   task: string;
+  assignmentContract?: import("../contracts.ts").AssignmentContract;
   agent?: string;
   cwd?: string;
   systemPrompt?: string;
@@ -28,9 +32,19 @@ export interface AgentDefinition {
   commandTemplate?: string;
   body?: string;
   disableModelInvocation?: boolean;
+  source?: "package" | "global" | "project";
+  sourcePath?: string;
+  sourceHash?: string;
+  sourceCwd?: string;
 }
 
 export interface SubagentLaunchContext {
+  /** Closed-session reopen: deliver only the new message, never the original task/skills. */
+  resume?: boolean;
+  /** Current parent's denial, applied without rewriting a saved profile. */
+  denyProjectConfig?: boolean;
+  launchProfile?: import("../launch-profile.ts").LaunchProfile;
+  lineage?: import("../lineage.ts").Lineage;
   params: SubagentLaunchParams;
   agentDefs?: AgentDefinition | null;
   runtimePlan: ResolvedRuntimePlan;
@@ -101,6 +115,15 @@ export interface HarnessDriver {
 
   /** Human-readable display name (e.g. "Claude Code", "OpenCode", "Codex", "Grok", "Pi") */
   readonly name: string;
+
+  /** Session transfer modes actually consumed by the generated command. Missing means standalone only. */
+  readonly supportedSessionModes?: readonly HarnessSessionMode[];
+
+  /** Whether resumeSessionId is forwarded to this harness's native resume command. */
+  readonly supportsNativeResume?: boolean;
+
+  /** Repeated settled-turn results and owned live follow-up. Missing means unsupported. */
+  readonly supportsTrackedKeepOpen?: boolean;
 
   /** Format the model reference for this CLI */
   formatModel(runtimePlan: Pick<ResolvedRuntimePlan, "model" | "modelId" | "provider">): string;

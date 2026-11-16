@@ -207,14 +207,12 @@ describe("structured subagent assignment", () => {
       const metadataFile = join(dir, `context/subagent-assignment-${data.childId}.json`);
       assert.ok(command.includes(`${ASSIGNMENT_ENV}='${metadataFile}'`));
       assert.deepEqual(JSON.parse(readFileSync(metadataFile, "utf8")), data);
-      assert.ok(command.includes("'/skill:review' '/skill:lint'"));
-      if (taskDelivery === "direct") {
-        assert.equal(command.split(data.task).length - 1, 1);
-      } else {
-        const taskPath = command.match(/'@([^']+\.md)'/)![1];
-        assert.equal(readFileSync(taskPath, "utf8"), `ROLE\n\nMODE\n\n${data.task}\n\nSUMMARY`);
-        assert.equal(command.includes(data.task), false);
-      }
+      assert.ok(command.includes("PI_SUBAGENT_INITIAL_SKILLS='review, lint'"));
+      assert.ok(!command.includes("'/skill:"));
+      const taskPath = command.match(/'@([^']+\.md)'/)![1];
+      assert.equal(readFileSync(taskPath, "utf8"), taskDelivery === "direct"
+        ? `ROLE\n\n${data.task}` : `ROLE\n\nMODE\n\n${data.task}\n\nSUMMARY`);
+      assert.equal(command.includes(data.task), false, "both prompt shapes use a controlled artifact");
     }));
   }
 

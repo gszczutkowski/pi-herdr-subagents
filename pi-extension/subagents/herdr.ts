@@ -1,7 +1,8 @@
 import { execFile, execSync, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import { getEnvironmentConfig } from "./config.ts";
-import { findHcExecutable, HcClient } from "./hc.ts";
+import { findExecutableAsync, findHcExecutable, findHcExecutableAsync, HcClient } from "./hc.ts";
+import { TERMINAL_QUERY_TIMEOUT_MS, withTerminalQuery } from "./terminal-queries.ts";
 
 let hcClient: HcClient | undefined;
 
@@ -19,6 +20,32 @@ function hc(): HcClient {
   return hcClient;
 }
 
+let pendingHcClient: Promise<HcClient> | undefined;
+
+async function hcAsync(): Promise<HcClient> {
+  if (hcClient) return hcClient;
+  if (!pendingHcClient) {
+    pendingHcClient = (async () => {
+      const executable = await findHcExecutableAsync();
+      if (!executable) throw new Error("herdr-core CLI (hc) is not available");
+      return hcClient ??= new HcClient(executable);
+    })();
+  }
+  try { return await pendingHcClient; }
+  finally { pendingHcClient = undefined; }
+}
+
+/** Resolve transport only; the actual query supplies fresh liveness evidence. */
+async function asyncQueryClient(): Promise<HcClient | undefined> {
+  if (process.env.HC_TERMINAL_ID && process.env.HC_TERMINAL_SOCKET) return hcAsync();
+  if (process.env.HERDR_ENV === "1") return undefined;
+  if (!getEnvironmentConfig().allowOutsideHerdr) throw new Error("herdr is not available outside its environment");
+  if (!commandAvailability.has("herdr")) {
+    commandAvailability.set("herdr", Boolean(await findExecutableAsync("herdr")));
+  }
+  return commandAvailability.get("herdr") ? undefined : hcAsync();
+}
+
 const execFileAsync = promisify(execFile);
 
 const commandAvailability = new Map<string, boolean>();
@@ -31,11 +58,11 @@ function hasCommand(command: string): boolean {
   let available = false;
   if (process.platform === "win32") {
     try {
-      execFileSync("where.exe", [command], { stdio: "ignore" });
+      execFileSync("where.exe", [command], { stdio: "ignore", timeout: TERMINAL_QUERY_TIMEOUT_MS, windowsHide: true });
       available = true;
     } catch {
       try {
-        execSync(`command -v ${command}`, { stdio: "ignore" });
+        execSync(`command -v ${command}`, { stdio: "ignore", timeout: TERMINAL_QUERY_TIMEOUT_MS, windowsHide: true });
         available = true;
       } catch {
         available = false;
@@ -43,7 +70,7 @@ function hasCommand(command: string): boolean {
     }
   } else {
     try {
-      execSync(`command -v ${command}`, { stdio: "ignore" });
+      execSync(`command -v ${command}`, { stdio: "ignore", timeout: TERMINAL_QUERY_TIMEOUT_MS, windowsHide: true });
       available = true;
     } catch {
       available = false;
@@ -99,11 +126,17 @@ function extractHerdrRootPaneId(output: string, context: string): string {
 }
 
 function herdrExec(args: string[]): string {
-  return execFileSync("herdr", args, { encoding: "utf8" });
+  // A timeout bounds the legacy synchronous adapter, not dispatch certainty.
+  // Propagate the original failure: pane run may already have reached herdr.
+  return execFileSync("herdr", args, {
+    encoding: "utf8", timeout: TERMINAL_QUERY_TIMEOUT_MS, killSignal: "SIGKILL", windowsHide: true,
+  });
 }
 
 async function herdrExecAsync(args: string[]): Promise<string> {
-  const { stdout } = await execFileAsync("herdr", args, { encoding: "utf8" });
+  const { stdout } = await withTerminalQuery(() => execFileAsync("herdr", args, {
+    encoding: "utf8", timeout: TERMINAL_QUERY_TIMEOUT_MS, windowsHide: true,
+  }));
   return stdout;
 }
 
@@ -235,7 +268,8 @@ export function readHerdrScreen(surface: string, lines = 50): string {
 }
 
 export async function readHerdrScreenAsync(surface: string, lines = 50): Promise<string> {
-  if (usesHcBackend()) return hc().readAsync(surface, lines);
+  const client = await asyncQueryClient();
+  if (client) return client.readAsync(surface, lines);
   return herdrExecAsync(["pane", "read", surface, "--source", "visible", "--lines", String(lines)]);
 }
 
@@ -298,8 +332,9 @@ function parsePaneGetError(error: any): PaneInspectionResult {
  * - unavailable: server command failed; caller should keep polling
  */
 export async function inspectHerdrPane(surface: string): Promise<PaneInspectionResult> {
-  if (usesHcBackend()) return hc().inspect(surface);
   try {
+    const client = await asyncQueryClient();
+    if (client) return await client.inspect(surface);
     return parsePaneGetOutput(await herdrExecAsync(["pane", "get", surface]), surface);
   } catch (error: any) {
     return parsePaneGetError(error);
