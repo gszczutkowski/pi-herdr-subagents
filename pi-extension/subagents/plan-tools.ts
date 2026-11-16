@@ -3,7 +3,8 @@ import { Type, type Static, type TProperties } from "@sinclair/typebox";
 import { Value } from "@sinclair/typebox/value";
 import * as store from "./plan-store.ts";
 import { PlanPersistence } from "./plan-persistence.ts";
-import { registerPlanContext } from "./plan-context.ts";
+import { PLAN_CONTEXT_TYPE, planContext, registerPlanContext } from "./plan-context.ts";
+import { contextReceipt, publicationState } from "./context-publication.ts";
 import { registerPlanView } from "./plan-view-registration.ts";
 
 const text = () => Type.String({ minLength: 1, maxLength: 8192 });
@@ -55,14 +56,32 @@ function apply(plan: store.PlanSnapshot, context: store.CommandContext, command:
   }
 }
 
-function response(details: unknown) {
+function response(details: Record<string, unknown>, current?: string) {
   const json = JSON.stringify(details, null, 2);
   const output = truncateHead(json, { maxBytes: 40000, maxLines: 2000 });
-  return { content: [{ type: "text" as const, text: output.content + (output.truncated ? "\n[Truncated; use plan_read with taskId for details]" : "") }], details };
+  const content = [{ type: "text" as const, text: output.content + (output.truncated ? "\n[Truncated; use plan_read with taskId for details]" : "") }];
+  return { content, details: { ...details,
+    ...contextReceipt(content, current && !output.truncated ? [publicationState(PLAN_CONTEXT_TYPE, current)] : []) } };
 }
 
-/** One persistence boundary for tools, request-time context and the native plan view. */
-export function registerPlanTools(pi: ExtensionAPI): PlanPersistence {
+/** Compact mutation content; the full legacy details shape remains available to UI consumers. */
+export function planMutationReceipt(snapshot: store.PlanSnapshot, previous?: store.PlanSnapshot) {
+  const tasks = snapshot.tasks.filter(task => JSON.stringify(task) !== JSON.stringify(previous?.tasks.find(old => old.taskId === task.taskId)));
+  return { planId: snapshot.planId, revision: snapshot.revision, authority: snapshot.authority,
+    tasks: tasks.map(task => {
+      const old = previous?.tasks.find(item => item.taskId === task.taskId);
+      return { taskId: task.taskId, status: task.status,
+        criterionIds: task.criteria.filter(item => !old?.criteria.some(prior => prior.criterionId === item.criterionId)).map(item => item.criterionId),
+        artifactIds: task.artifacts.filter(item => !old?.artifacts.some(prior => prior.artifactId === item.artifactId)).map(item => item.artifactId),
+        attemptIds: task.attempts.filter(item => !old?.attempts.some(prior => prior.attemptId === item.attemptId)).map(item => item.attemptId),
+        evidenceIds: task.evidence.filter(item => !old?.evidence.some(prior => prior.evidenceId === item.evidenceId)).map(item => item.evidenceId),
+      };
+    }),
+  };
+}
+
+/** One persistence boundary for tools, native publications and the plan view. */
+export function registerPlanTools(pi: ExtensionAPI, options: { publish?: boolean } = {}): PlanPersistence {
   const persistence = new PlanPersistence((type, data) => pi.appendEntry(type, data), Boolean(process.env.PI_SUBAGENT_ID || process.env.PI_SUBAGENT_SESSION));
   const refresh = registerPlanView(pi, persistence);
   const restore = (_event: unknown, ctx: ExtensionContext) => { persistence.restore(ctx.sessionManager); refresh(ctx); };
@@ -77,7 +96,7 @@ export function registerPlanTools(pi: ExtensionAPI): PlanPersistence {
         const view = params.reconcile ? persistence.reconcile(ctx.sessionManager) : persistence.read(ctx.sessionManager);
         const plan = view.snapshot;
         if (params.taskId && !plan?.tasks.some(task => task.taskId === params.taskId)) throw new Error("Unknown task");
-        return response({ ...view, snapshot: plan ? { ...plan, tasks: params.taskId ? plan.tasks.filter(task => task.taskId === params.taskId) : plan.tasks.map(task => ({ taskId: task.taskId, title: task.title, status: task.status, statusReason: task.statusReason })) } : undefined });
+        return response({ ...view, snapshot: plan ? { ...plan, tasks: params.taskId ? plan.tasks.filter(task => task.taskId === params.taskId) : plan.tasks.map(task => ({ taskId: task.taskId, title: task.title, status: task.status, statusReason: task.statusReason })) } : undefined }, params.taskId ? undefined : planContext(view));
       } finally { refresh(ctx); }
     },
   });
@@ -90,13 +109,19 @@ export function registerPlanTools(pi: ExtensionAPI): PlanPersistence {
         signal?.throwIfAborted();
         if (!Value.Check(PlanUpdateParams, params)) throw new Error("Invalid bounded plan command");
         const c = params.command;
+        const previousView = persistence.read(ctx.sessionManager);
+        const previous = previousView.snapshot;
         const snapshot = c.action === "create" ? persistence.create(ctx.sessionManager, params.expectedRevision, c.title) :
           c.action === "detach" ? persistence.detach(ctx.sessionManager, c.planId, params.expectedRevision, c.reason) :
           persistence.mutate(ctx.sessionManager, c.planId, params.expectedRevision, (plan, context) => apply(plan, context, c), c.action === "result" ? c.origin : undefined);
-        return response({ planId: snapshot.planId, revision: snapshot.revision, authority: snapshot.authority, tasks: snapshot.tasks });
+        const content = [{ type: "text" as const, text: JSON.stringify(planMutationReceipt(snapshot, previous)) }];
+        const current = planContext(persistence.read(ctx.sessionManager));
+        return { content, details: { planId: snapshot.planId, revision: snapshot.revision, authority: snapshot.authority, tasks: snapshot.tasks,
+          ...contextReceipt(content, current ? [{ ...publicationState(PLAN_CONTEXT_TYPE, current),
+            ...(previous ? { previousIdentity: publicationState(PLAN_CONTEXT_TYPE, planContext(previousView)!).identity } : {}) }] : [], params) } };
       } finally { refresh(ctx); }
     },
   });
-  registerPlanContext(pi, persistence);
+  if (options.publish !== false) registerPlanContext(pi, persistence);
   return persistence;
 }

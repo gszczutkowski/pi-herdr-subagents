@@ -167,6 +167,8 @@ test("registered resume tool rejects unsafe sessions and behavior overrides befo
   const api = new Proxy({}, { get: (_target, key) => key === "registerTool"
     ? (tool: any) => tools.set(tool.name, tool) : () => {} });
   const previousDeny = process.env.PI_DENY_TOOLS;
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = dir;
   delete process.env.PI_DENY_TOOLS;
   try { subagentsExtension(api as ExtensionAPI); } finally {
     if (previousDeny !== undefined) process.env.PI_DENY_TOOLS = previousDeny;
@@ -180,11 +182,15 @@ test("registered resume tool rejects unsafe sessions and behavior overrides befo
     writeFileSync(launchProfilePath(sessionPath), JSON.stringify({ version: 1, harness: "claude" }));
     await assert.rejects(execute("call", { sessionPath }, undefined, undefined, ctx), /native resume/);
     fixture((_fixtureDir, context) => {
-      const profile = { ...resolveLaunchProfile(context, "pi", "read"), sessionFile: canonicalSessionPath(sessionPath) };
+      const profile = { ...resolveLaunchProfile(context, "pi", "read"), sessionFile: canonicalSessionPath(sessionPath), agentDir: dir };
       writeFileSync(launchProfilePath(sessionPath), JSON.stringify(profile));
     });
     await assert.rejects(execute("call", { sessionPath, autoExit: true }, undefined, undefined, ctx), /preserve the saved autoExit/);
-  } finally { rmSync(dir, { recursive: true, force: true }); }
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // Exercise the generated shell command against a real child process, without a provider or terminal dependency.

@@ -9,6 +9,8 @@ import type {
 } from "../types.ts";
 import type { ResolvedRuntimePlan, ThinkingLevel } from "../../runtime-routing.ts";
 import { extractPaneSummary } from "../pane-summary.ts";
+import { resolveRoleInstructions } from "../../role-instructions.ts";
+import { shellComment } from "../../shell.ts";
 
 const CLAUDE_SESSIONS_DIR = join(
   process.env.HOME ?? "/tmp",
@@ -79,7 +81,7 @@ export class ClaudeHarnessDriver implements HarnessDriver {
       cmdParts.push("--model", shellQuote(effectiveModel));
     }
 
-    const sp = params.systemPrompt ?? agentDefs?.body;
+    const sp = context.identity ?? resolveRoleInstructions(agentDefs?.body, params.systemPrompt);
     if (sp) {
       cmdParts.push("--append-system-prompt", shellQuote(sp));
     }
@@ -99,10 +101,10 @@ export class ClaudeHarnessDriver implements HarnessDriver {
       sentinelFile,
       cli: "claude",
       launchScriptPreamble: [
-        `# Claude Code subagent launch script for ${params.name}`,
-        `# Generated: ${new Date().toISOString()}`,
-        `# Surface: ${surface}`,
-      ],
+        `Claude Code subagent launch script for ${params.name}`,
+        `Generated: ${new Date().toISOString()}`,
+        `Surface: ${surface}`,
+      ].map(shellComment),
     };
   }
 

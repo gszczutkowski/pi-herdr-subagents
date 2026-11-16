@@ -20,6 +20,15 @@ let onRun: (surface: string, command: string) => void = () => {};
 const escapes: string[] = [];
 const childShutdowns: Array<() => void> = [];
 const originalWrite = fs.writeFileSync;
+const originalRead = fs.readFileSync;
+let readFailureFile: string | undefined;
+let readFailureCode = "EACCES";
+mock.method(fs, "readFileSync", (path: any, ...args: any[]) => {
+  if (readFailureFile && String(path).replaceAll("\\", "/").toLowerCase() === readFailureFile.replaceAll("\\", "/").toLowerCase()) {
+    throw Object.assign(new Error(readFailureCode), { code: readFailureCode });
+  }
+  return (originalRead as any)(path, ...args);
+});
 mock.method(fs, "writeFileSync", (path: any, ...args: any[]) => {
   if (prepareFails && String(path).endsWith(".sh")) throw new Error("preparation failed");
   return (originalWrite as any)(path, ...args);
@@ -50,6 +59,7 @@ const { persistLaunchProfile, resolveLaunchProfile } = await import("../pi-exten
 const { runCompletionFile } = await import("../pi-extension/subagents/run-artifacts.ts");
 const { runInPane, runScriptInPane } = await import("../pi-extension/subagents/terminal.ts");
 const { CONTINUE_COMMAND, continuationCommand, registerLiveContinuation } = await import("../pi-extension/subagents/live-continuation.ts");
+const { registerInterruptControl } = await import("../pi-extension/subagents/interrupt-control.ts");
 const keys = ["HERDR_ENV", "HERDR_WORKSPACE_ID", "HC_TERMINAL_ID", "HC_TERMINAL_SOCKET", "PI_SUBAGENT_SHELL_READY_DELAY_MS", "PI_DENY_TOOLS", "PI_SUBAGENT_LAYOUT"];
 const saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
 process.env.HERDR_ENV = "1";
@@ -69,6 +79,8 @@ async function fixture(run: (f: any) => Promise<void>) {
   const dir = fs.mkdtempSync(join(tmpdir(), "ownership-execute-"));
   const agentDir = join(dir, ".pi", "agent");
   fs.mkdirSync(agentDir, { recursive: true });
+  const oldAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir; // Explicit, isolated user configuration for this fixture.
   const session = canonicalSessionPath(join(dir, "child.jsonl"));
   fs.writeFileSync(session, '{"type":"session","version":3,"id":"child","cwd":"test"}\n');
   const context: any = {
@@ -81,33 +93,39 @@ async function fixture(run: (f: any) => Promise<void>) {
   const handoffs: any[] = [];
   let failNotifications = false;
   const tools = new Map<string, any>();
+  const commands = new Map<string, any>();
+  const branch: any[] = [];
   const handlers = new Map<string, any>();
   const api: any = new Proxy({}, { get: (_target, key) => key === "registerTool" ? (tool: any) => tools.set(tool.name, tool)
     : key === "on" ? (event: string, handler: any) => handlers.set(event, handler)
+    : key === "registerCommand" ? (name: string, command: any) => commands.set(name, command)
     : key === "getAllTools" ? () => []
+    : key === "appendEntry" ? (customType: string, data: any) => branch.push({ id: "fixture-custody", type: "custom", customType, data })
     : key === "sendMessage" ? (message: any) => { if (failNotifications) throw new Error("offline"); handoffs.push(message); }
     : key === "getThinkingLevel" ? () => "off" : () => {} });
   extension(api);
   const ctx = {
-    hasUI: false, scopedModels: [], cwd: dir, model: { provider: "test", id: "model" },
+    hasUI: false, scopedModels: [], cwd: dir, isProjectTrusted: () => true, model: { provider: "test", id: "model" },
     modelRegistry: { find: () => ({ provider: "test", id: "model", reasoning: true }), getAvailable: () => [{ provider: "test", id: "model" }], hasConfiguredAuth: () => true },
     sessionManager: { getSessionFile: () => session, getSessionDir: () => dir, getSessionId: () => "parent" },
   };
   const resume = (params = {}) => tools.get("subagent_resume").execute("call", { sessionPath: session, ...params }, undefined, undefined, ctx);
   const interrupt = (id: string) => tools.get("subagent_interrupt").execute("interrupt", { id }, undefined, undefined, ctx);
-  try { await run({ dir, session, ctx, tools, resume, interrupt, handoffs,
+  try { await run({ dir, session, ctx, branch, tools, commands, resume, interrupt, handoffs,
     start: () => handlers.get("session_start")({ reason: "reload" }, ctx),
     shutdown: () => handlers.get("session_shutdown")({ reason: "reload" }, ctx),
     reload: () => { extension(api); handlers.get("session_start")({ reason: "reload" }, ctx); },
     failNotifications: (value: boolean) => { failNotifications = value; } }); } finally {
     for (const stop of childShutdowns.splice(0)) stop();
     prepareFails = false;
+    readFailureFile = undefined;
     powershellResponder = undefined;
     sendFails = false;
     onRun = () => {};
     inspect = async () => JSON.stringify({ error: { code: "pane_not_found" } });
     handlers.get("session_shutdown")({ reason: "exit" }, ctx);
     for (const [path, owner] of sessionOwners) if (!existingOwners.has(path)) releaseSession(path, owner.runId);
+    if (oldAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = oldAgentDir;
     fs.rmSync(dir, { recursive: true, force: true });
   }
 }
@@ -184,6 +202,97 @@ test(`registered close ${scenario} preserves phase-specific ownership fences (Wi
   assert.deepEqual((await tools.get("subagent_close").execute("again", { id: child.id }, undefined, undefined, ctx)).details, result.details);
 }));
 }
+
+for (const code of ["ENOSPC", "EACCES", "EIO"]) {
+  test(`active completion ${code} pauses without closing or losing the child; explicit retry delivers once`, async () => fixture(async ({ resume, commands, ctx, branch, start, session, handoffs }: any) => {
+    ctx.sessionManager.getHeader = () => ({ id: "child" });
+    ctx.sessionManager.getBranch = () => branch;
+    await start();
+    const started = await resume();
+    const child = __test__.runningSubagents.get(started.details.id)!;
+    const events = `${runCompletionFile(session, child.id)}.events`;
+    fs.mkdirSync(events, { recursive: true });
+    const file = join(events, "io.json");
+    fs.writeFileSync(file, JSON.stringify({ type: "done", runId: child.id, eventId: "io", summary: "Recovered result", keepOpen: true }));
+    readFailureFile = file; readFailureCode = code;
+    const before = closed.filter(pane => pane === child.surface).length;
+    await until(() => !!child.observationError);
+    assert.ok(__test__.runningSubagents.has(child.id));
+    assert.equal(closed.filter(pane => pane === child.surface).length, before);
+    assert.equal(handoffs.length, 0, "a read error is not a completion");
+    readFailureFile = undefined;
+    await commands.get("subagents-reconcile").handler("", ctx);
+    await until(() => handoffs.length === 1);
+    assert.equal(handoffs[0].details.response, "Recovered result");
+    assert.equal(child.observationError, undefined);
+    assert.equal(closed.filter(pane => pane === child.surface).length, before);
+  }));
+}
+
+test("registered discovery/dispatch honors exact project grants and host denial", async () => fixture(async ({ tools, ctx, dir }: any) => {
+  const base = process.env.PI_CODING_AGENT_DIR!;
+  const source = join(dir, ".pi", "agents");
+  fs.mkdirSync(source, { recursive: true });
+  fs.mkdirSync(join(base, "agents"), { recursive: true });
+  fs.writeFileSync(join(source, "role.md"), "---\nname: trust-role\nauto-exit: true\n---\nPROJECT ROLE");
+  fs.writeFileSync(join(base, "agents", "role.md"), "---\nname: trust-role\nauto-exit: true\n---\nGLOBAL ROLE");
+  const list = () => tools.get("subagents_list").execute("list", {}, undefined, undefined, ctx);
+  assert.equal((await list()).details.agents.find((agent: any) => agent.name === "trust-role").source, "global");
+  fs.writeFileSync(join(base, "subagent-trust.json"), JSON.stringify({ projectAgentDirectories: [source] }));
+  assert.equal((await list()).details.agents.find((agent: any) => agent.name === "trust-role").source, "project");
+  ctx.isProjectTrusted = () => false;
+  assert.equal((await list()).details.agents.find((agent: any) => agent.name === "trust-role").source, "global");
+  const started = await tools.get("subagent").execute("launch", { name: "Trust", task: "test", agent: "trust-role" }, undefined, undefined, ctx);
+  const profile = (await import("../pi-extension/subagents/launch-profile.ts")).readPiLaunchProfile(started.details.sessionFile);
+  assert.equal(profile.identity, "GLOBAL ROLE", "denied project cannot override even a same-name user definition");
+}));
+
+test("dispatch revalidates project source after asynchronous preparation", async () => fixture(async ({ tools, ctx, dir }: any) => {
+  const base = process.env.PI_CODING_AGENT_DIR!;
+  const source = join(dir, ".pi", "agents"), file = join(source, "role.md");
+  fs.mkdirSync(source, { recursive: true });
+  fs.writeFileSync(file, "---\nname: changing-role\n---\nORIGINAL");
+  fs.writeFileSync(join(base, "subagent-trust.json"), JSON.stringify({ projectAgentDirectories: [source] }));
+  process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "25";
+  const before = sent.length;
+  try {
+    const launching = tools.get("subagent").execute("launch", { name: "Change", task: "test", agent: "changing-role" }, undefined, undefined, ctx);
+    fs.writeFileSync(file, "---\nname: changing-role\n---\nREPLACEMENT");
+    await assert.rejects(launching, /definition.*changed/);
+    assert.equal(sent.length, before);
+  } finally { process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0"; }
+}));
+
+test("closed resume rejects revoked local agentDir authorization before dispatch", async () => fixture(async ({ resume, dir }: any) => {
+  const old = process.env.PI_CODING_AGENT_DIR;
+  const base = join(dir, "another-user-profile"); fs.mkdirSync(base);
+  process.env.PI_CODING_AGENT_DIR = base;
+  const before = sent.length;
+  try {
+    await assert.rejects(resume(), /not explicitly authorized/);
+    assert.equal(sent.length, before);
+  } finally { process.env.PI_CODING_AGENT_DIR = old; }
+}));
+
+test("already aborted spawn/resume never prepare or dispatch", async () => fixture(async ({ tools, ctx, session }: any) => {
+  const signal = AbortSignal.abort();
+  const before = sent.length;
+  await assert.rejects(tools.get("subagent").execute("abort", { name: "Abort", task: "never run" }, signal, undefined, ctx), /abort/i);
+  await assert.rejects(tools.get("subagent_resume").execute("abort", { sessionPath: session }, signal, undefined, ctx), /abort/i);
+  assert.equal(sent.length, before);
+}));
+
+test("abort during shell preparation cancels delay and never dispatches", async () => fixture(async ({ tools, ctx }: any) => {
+  const controller = new AbortController();
+  const before = sent.length;
+  process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "60000";
+  try {
+    const launch = tools.get("subagent").execute("abort", { name: "Abort", task: "never run" }, controller.signal, undefined, ctx);
+    controller.abort();
+    await assert.rejects(launch, /abort/i);
+    assert.equal(sent.length, before);
+  } finally { process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0"; }
+}));
 
 test("close is parent-owned, honors lifecycle denial and is not a child completion allowlist tool", async () => fixture(async ({ tools, ctx, session, resume }: any) => {
   const close = tools.get("subagent_close");
@@ -280,36 +389,51 @@ test("registered audit is read only and accepts a path or an owned selector", as
 test("registered interrupt/resume preserves the live run and watcher; concurrent continuation has one winner", async () => fixture(async ({ session, resume, interrupt }: any) => {
   const started = await resume();
   const child = __test__.runningSubagents.get(started.details.id)!;
+  // Guarded interrupt now yields to the real watcher. This synthetic terminal
+  // exists throughout setup; the fixture's default missing-pane response would
+  // otherwise retire its custody under load before the control test begins.
+  inspect = async (pane) => JSON.stringify({ result: { pane: { pane_id: pane, agent_status: "active" } } });
   const owner = sessionOwners.get(session)!;
   const abort = child.abortController;
   const activityFile = child.activityFile;
   const launchScript = child.launchScriptFile;
   const surfacesBefore = serial;
   const sendsBefore = sent.length;
+  const escapesBefore = escapes.length;
   const events = new Map<string, Function>();
+  const on = (event: string, handler: Function) => {
+    const previous = events.get(event);
+    events.set(event, (...args: any[]) => { previous?.(...args); handler(...args); });
+  };
   const commands = new Map<string, any>();
   const messages: any[] = [];
+  const identity = { schema: 1, runId: child.id, sessionFile: session, headerId: "child", nonce: "test", process: { pid: process.pid, birth: "test" } };
+  fs.writeFileSync(`${runCompletionFile(session, child.id)}.identity.json`, JSON.stringify(identity));
   const env = { PI_SUBAGENT_ID: child.id, PI_SUBAGENT_SESSION: session, PI_SUBAGENT_ACTIVITY_FILE: activityFile };
   const previous = Object.fromEntries(Object.keys(env).map((key) => [key, process.env[key]]));
   Object.assign(process.env, env);
   try {
-    registerLiveContinuation({ on: (event: string, handler: Function) => events.set(event, handler),
+    registerLiveContinuation({ on,
       registerCommand: (name: string, command: any) => commands.set(name, command),
       sendUserMessage: (...args: any[]) => messages.push(args) } as any);
+    registerInterruptControl({ on } as any, () => ({ kind: "present", identity: identity.process }));
   } finally {
     for (const [key, value] of Object.entries(previous)) {
       if (value === undefined) delete process.env[key]; else process.env[key] = value;
     }
   }
-  const childCtx = { isIdle: () => true, hasPendingMessages: () => false,
-    sessionManager: { getSessionFile: () => session } };
+  let childIdle = false, turnAborts = 0;
+  const childCtx = { isIdle: () => childIdle, hasPendingMessages: () => false, abort: () => { turnAborts++; },
+    sessionManager: { getSessionFile: () => session, getHeader: () => ({ id: "child" }) } };
   events.get("session_start")!({}, childCtx);
+  events.get("before_agent_start")!({}, childCtx);
   childShutdowns.push(() => events.get("session_shutdown")!({}, childCtx));
   fs.writeFileSync(activityFile, JSON.stringify({ version: 1, runningChildId: child.id,
     createdAt: Date.now(), updatedAt: Date.now(), sequence: 1, latestEvent: "agent_start",
     phase: "active", activeScope: "agent", agentActive: true, turnActive: true, providerActive: false, toolActive: false }));
   assert.equal((await interrupt(child.id)).details.status, "interrupt_requested");
-  assert.equal(escapes.at(-1), child.surface);
+  assert.equal(turnAborts, 1);
+  assert.equal(escapes.length, escapesBefore, "guarded interrupt never sends terminal keys");
   assert.equal(child.lifecycle.process.kind, "running");
   assert.equal(child.lifecycle.turn.kind, "interrupted");
   assert.equal(abort.signal.aborted, false);
@@ -318,9 +442,16 @@ test("registered interrupt/resume preserves the live run and watcher; concurrent
   inspect = async (pane) => JSON.stringify({ result: { pane: { pane_id: pane, agent_status: "idle" } } });
   const message = "  /subagent_done\n!echo unsafe\n@private.txt\n/skill:secret\n${shell}; ' \"\n\r\n ";
   await assert.rejects(resume({ message }), /not confirmed settled/);
-  assert.equal(messages.length, 0, "Escape alone is not child settlement evidence");
+  assert.equal(messages.length, 0, "acknowledgement alone is not child settlement evidence");
   assert.equal(sent.length, sendsBefore);
+  childIdle = true;
   events.get("agent_settled")!({ aborted: true }, childCtx);
+  for (const message of [undefined, "", " \n\t"]) {
+    await assert.rejects(resume({ message }), /nonempty message/);
+    assert.equal(fs.readdirSync(`${activityFile}.continuation`).some(name => name.endsWith(".request.json")), false);
+    assert.equal(messages.length, 0, "raw empty messages without a contract do not start a turn");
+    assert.equal(serial, surfacesBefore);
+  }
   let release!: () => void;
   const gate = new Promise<void>((resolve) => { release = resolve; });
   let inspectionHeld = false;

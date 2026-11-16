@@ -6,8 +6,8 @@ import {
   createAssistantMessageEventStream,
   getCurrentSystemPrompt,
   getCurrentTools,
-  Type,
 } from "@earendil-works/pi-ai";
+import { Type } from "@sinclair/typebox";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import {
   type AgentSession,

@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { bashPath, findBashExecutable } from "./hc.ts";
 import { dirname, join } from "node:path";
+import { shellComment } from "./shell.ts";
 import {
   closeHerdrSurface,
   createHerdrSurface,
@@ -129,7 +130,9 @@ export function runScriptInPane(
     const tools = process.platform === "win32" && existsSync(gitTools) ? gitTools : dirname(bash);
     scriptLines.push(`export PATH=${shellQuote(bashPath(tools))}:${shellQuote(bashPath(process.env.PATH ?? ""))}:"$PATH"`);
   }
-  if (options?.scriptPreamble) scriptLines.push(options.scriptPreamble.trimEnd());
+  // Treat preambles from built-in and third-party drivers alike as metadata.
+  // Executable setup belongs in command, not in interpolated comments.
+  if (options?.scriptPreamble) scriptLines.push(shellComment(options.scriptPreamble.trimEnd()));
   scriptLines.push(command);
   writeFileSync(scriptPath, `${scriptLines.join("\n")}\n`, { mode: 0o755 });
 

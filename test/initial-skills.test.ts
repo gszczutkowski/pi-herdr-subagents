@@ -1,23 +1,67 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { buildPiPromptArgs } from "../pi-extension/subagents/harness/drivers/pi.ts";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { registerInitialSkills, INITIAL_SKILLS_ENV } from "../pi-extension/subagents/initial-skills.ts";
+import { PiHarnessDriver } from "../pi-extension/subagents/harness/drivers/pi.ts";
+import type { SubagentLaunchContext } from "../pi-extension/subagents/harness/types.ts";
 import { withChildSession } from "./child-session.ts";
 const cliRoot = new URL("./cli/", import.meta.resolve("@earendil-works/pi-coding-agent"));
 const { processFileArguments } = await import(new URL("file-processor.js", cliRoot).href);
 const { buildInitialMessage } = await import(new URL("initial-message.js", cliRoot).href);
 const { parseArgs } = await import(new URL("args.js", cliRoot).href);
 
+for (const fault of ["EACCES", "EIO", "malformed-header"]) {
+  test(`startup session validation ${fault} blocks input without consuming required skills; explicit retry recovers`, () => {
+    const dir = mkdtempSync(join(tmpdir(), "skill-validation-"));
+    const file = join(dir, "session.jsonl"), skill = join(dir, "SKILL.md");
+    const keys = ["PI_SUBAGENT_SESSION", INITIAL_SKILLS_ENV];
+    const prior = keys.map(key => process.env[key]);
+    process.env.PI_SUBAGENT_SESSION = file; process.env[INITIAL_SKILLS_ENV] = "required";
+    writeFileSync(file, fault === "malformed-header" ? "{" : '{"type":"session","id":"skills","version":3}\n');
+    writeFileSync(skill, "REQUIRED_INSTRUCTIONS");
+    let failing = true, commands = 0, input: any;
+    const errors: string[] = [];
+    const ctx: any = { sessionManager: { getSessionFile: () => {
+      if (failing && fault !== "malformed-header") throw Object.assign(new Error(fault), { code: fault });
+      return file;
+    }, getHeader: () => ({ id: "skills" }) }, shutdown: () => assert.fail("validation failure cannot close the child") };
+    try {
+      registerInitialSkills({ on: (_name: string, fn: any) => { input = fn; }, getCommands: () => {
+        commands++; return [{ source: "skill", name: "skill:required", sourceInfo: { path: skill } }];
+      } } as any, error => errors.push(error));
+      assert.deepEqual(input({ text: "TASK" }, ctx), { action: "handled" });
+      assert.equal(commands, 0, "unvalidated input cannot bypass required instructions");
+      assert.equal(errors.length, 1);
+      failing = false; writeFileSync(file, '{"type":"session","id":"skills","version":3}\n');
+      const retried = input({ text: "TASK" }, ctx);
+      assert.equal(retried.action, "transform");
+      assert.match(retried.text, /REQUIRED_INSTRUCTIONS[\s\S]*TASK/);
+    } finally {
+      keys.forEach((key, i) => { if (prior[i] === undefined) delete process.env[key]; else process.env[key] = prior[i]; });
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
 for (const taskDelivery of ["direct", "artifact"] as const) {
   test(`${taskDelivery}: first model request has complete task and two required skills before auto-exit`, async () => {
     await withChildSession({ skills: "first, second, first" }, async ({ session, dir, requests, shutdowns }) => {
       const task = "ACTUAL_TASK with spaces and Unicode 日本語";
-      const path = join(dir, "task with spaces.md");
-      writeFileSync(path, task);
-      const args = buildPiPromptArgs({ effectiveSkills: "first,second", taskDelivery,
-        taskArg: taskDelivery === "artifact" ? `@${path}` : task });
-      const parsed = parseArgs(args);
+      const context: SubagentLaunchContext = {
+        params: { id: "skills-run", name: "Skills worker", task, skills: "first,second" },
+        runtimePlan: { provider: "child-test", modelId: "model", model: "child-test/model", thinking: "off", modelSource: "request", thinkingSource: "request" },
+        parentThinking: "off", surface: "mock-pane", artifactDir: dir, sessionDir: dir,
+        subagentSessionFile: join(dir, "skills.jsonl"), effectiveCwd: dir, localAgentDir: dir,
+        effectiveAutoExit: true, effectiveInteractive: false,
+        inheritsConversationContext: taskDelivery === "direct", taskDelivery, subagentsDir: dir,
+        shellQuote: (value) => `'${value.replaceAll("'", "'\\''")}'`,
+      };
+      const { command } = new PiHarnessDriver().buildCommand(context);
+      const path = /'@([^']+)'/.exec(command)?.[1];
+      assert.ok(path, "both delivery modes use one controlled artifact");
+      const parsed = parseArgs([`@${path}`]);
       const files = await processFileArguments(parsed.fileArgs);
       const initial = buildInitialMessage({ parsed, fileText: files.text, fileImages: files.images });
       assert.deepEqual(parsed.messages, [], "no deferred CLI turns");

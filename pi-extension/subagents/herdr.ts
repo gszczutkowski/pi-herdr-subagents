@@ -58,11 +58,11 @@ function hasCommand(command: string): boolean {
   let available = false;
   if (process.platform === "win32") {
     try {
-      execFileSync("where.exe", [command], { stdio: "ignore" });
+      execFileSync("where.exe", [command], { stdio: "ignore", timeout: TERMINAL_QUERY_TIMEOUT_MS, windowsHide: true });
       available = true;
     } catch {
       try {
-        execSync(`command -v ${command}`, { stdio: "ignore" });
+        execSync(`command -v ${command}`, { stdio: "ignore", timeout: TERMINAL_QUERY_TIMEOUT_MS, windowsHide: true });
         available = true;
       } catch {
         available = false;
@@ -70,7 +70,7 @@ function hasCommand(command: string): boolean {
     }
   } else {
     try {
-      execSync(`command -v ${command}`, { stdio: "ignore" });
+      execSync(`command -v ${command}`, { stdio: "ignore", timeout: TERMINAL_QUERY_TIMEOUT_MS, windowsHide: true });
       available = true;
     } catch {
       available = false;
@@ -126,7 +126,11 @@ function extractHerdrRootPaneId(output: string, context: string): string {
 }
 
 function herdrExec(args: string[]): string {
-  return execFileSync("herdr", args, { encoding: "utf8" });
+  // A timeout bounds the legacy synchronous adapter, not dispatch certainty.
+  // Propagate the original failure: pane run may already have reached herdr.
+  return execFileSync("herdr", args, {
+    encoding: "utf8", timeout: TERMINAL_QUERY_TIMEOUT_MS, killSignal: "SIGKILL", windowsHide: true,
+  });
 }
 
 async function herdrExecAsync(args: string[]): Promise<string> {

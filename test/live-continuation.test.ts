@@ -1,9 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { spawnSync } from "node:child_process";
+import { pathToFileURL } from "node:url";
 import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { CONTINUE_COMMAND, continuationCommand, continuationDir, continueLiveChild, registerLiveContinuation } from "../pi-extension/subagents/live-continuation.ts";
 import { canonicalSessionPath, type SessionOwner } from "../pi-extension/subagents/ownership.ts";
 import { createLifecycle, markInterruptRequested, markProcessRunning } from "../pi-extension/subagents/lifecycle.ts";
@@ -54,6 +56,37 @@ function fixture() {
     } };
 }
 
+test("native watcher callbacks contain ENOSPC/EACCES/EIO even when diagnostics also fail; claimed dispatch never replays", () => {
+  const url = pathToFileURL(resolve("pi-extension/subagents/live-continuation.ts")).href;
+  for (const code of ["ENOSPC", "EACCES", "EIO"]) {
+    const result = spawnSync(process.execPath, ["--input-type=module", "-e", `
+      import fs from 'node:fs';import {syncBuiltinESMExports} from 'node:module';
+      import assert from 'node:assert/strict';import {tmpdir} from 'node:os';import {join} from 'node:path';import {randomUUID} from 'node:crypto';
+      const dir=fs.mkdtempSync(join(tmpdir(),'continuation-io-')),session=join(dir,'child.jsonl'),activity=join(dir,'activity');
+      fs.writeFileSync(session,'');Object.assign(process.env,{PI_SUBAGENT_ID:'run',PI_SUBAGENT_SESSION:session,PI_SUBAGENT_ACTIVITY_FILE:activity});
+      let notify,watchError,closed=0,unref=0,fail=false,sends=0;
+      const write=fs.writeFileSync;fs.writeFileSync=(...args)=>{if(fail)throw Object.assign(Error('${code}'),{code:'${code}'});return write(...args);};
+      fs.watch=(_dir,fn)=>{notify=fn;return {close(){closed++},unref(){unref++},on(_event,fn){watchError=fn}}};syncBuiltinESMExports();
+      const {registerLiveContinuation,CONTINUE_COMMAND,continuationDir}=await import(${JSON.stringify(url)});
+      const hooks=new Map(),commands=new Map(),notices=[];
+      const ctx={hasUI:true,ui:{notify:m=>notices.push(m)},isIdle:()=>true,hasPendingMessages:()=>false,sessionManager:{getSessionFile:()=>session}};
+      registerLiveContinuation({on:(n,f)=>hooks.set(n,f),registerCommand:(n,c)=>commands.set(n,c),sendUserMessage:()=>{sends++;fail=true;throw Error('ambiguous dispatch')}});
+      try {
+        hooks.get('session_start')({},ctx);hooks.get('agent_settled')({aborted:true},ctx);
+        const state=JSON.parse(fs.readFileSync(join(continuationDir(activity),'state.json'),'utf8')),requestId=randomUUID();
+        const name=requestId+'.request.json';write(join(continuationDir(activity),name),JSON.stringify({runId:'run',sessionFile:state.sessionFile,requestId,idleToken:state.idleToken,message:'literal'}));
+        assert.doesNotThrow(()=>notify('rename',name));assert.equal(sends,1);assert.ok(closed);
+        assert.ok(notices.some(m=>/paused|uncertain/i.test(m)),'I/O failure must remain visible when disk diagnostics fail');
+        fail=false;hooks.get('session_start')({},ctx);hooks.get('agent_settled')({aborted:true},ctx);
+        commands.get(CONTINUE_COMMAND).handler(requestId,ctx);assert.equal(sends,1,'claim survives storage recovery and reload');
+        fail=true;assert.doesNotThrow(()=>watchError(Object.assign(Error('${code}'),{code:'${code}'})));
+        assert.ok(unref,'watcher must not keep an SDK host alive');
+      } finally {fail=false;hooks.get('session_shutdown')({},ctx);fs.rmSync(dir,{recursive:true,force:true});}
+    `], { encoding: "utf8", timeout: 15000 });
+    assert.equal(result.status, 0, `${code}: ${result.stderr}`);
+  }
+});
+
 test("interrupted settled child receives exact hostile text via API, reusing all live resources", async () => {
   const f = fixture();
   try {
@@ -92,6 +125,57 @@ test("HC done requires a fresh child settled token, never coarse done alone", as
   } finally { f.cleanup(); }
 });
 
+test("manual Escape reconciles a waiting parent without inventing a completed result", async () => {
+  const f = fixture();
+  try {
+    f.child.lifecycle = { ...f.child.lifecycle, turn: { kind: "waiting", startedAt: 4 } };
+    f.settle(false);
+    await assert.rejects(continueLiveChild(f.owner, f.child, { message: "x" }, f.transport), /not confirmed an interrupted/);
+    f.settle(true);
+    assert.equal((await continueLiveChild(f.owner, f.child, { message: "manual escape follow-up" }, f.transport)).status, "accepted");
+    assert.equal(f.sent.length, 1);
+    f.events.get("agent_start")!({}, f.ctx);
+    await assert.rejects(continueLiveChild(f.owner, f.child, { message: "stale" }, f.transport), /not confirmed settled/);
+    assert.equal(f.sent.length, 1);
+  } finally { f.cleanup(); }
+});
+
+test("only a fresh interrupted-idle capability can override a stale active parent label", async () => {
+  const f = fixture();
+  try {
+    f.child.lifecycle = { ...f.child.lifecycle, turn: { kind: "active", source: "activity", startedAt: 4 } };
+    await assert.rejects(continueLiveChild(f.owner, f.child, { message: "busy must not dispatch" }, f.transport), /not confirmed settled/);
+    f.settle(false);
+    await assert.rejects(continueLiveChild(f.owner, f.child, { message: "ordinary idle cannot override active" }, f.transport), /active parent/);
+    assert.equal(f.sent.length, 0);
+    f.settle(true);
+    const result = await continueLiveChild(f.owner, f.child, { message: "confirmed interrupted follow-up" }, f.transport);
+    assert.equal(result.status, "accepted");
+    assert.equal(f.sent.length, 1);
+    assert.deepEqual(f.sent[0], ["confirmed interrupted follow-up", { expandPromptTemplates: false }]);
+    f.events.get("before_agent_start")!({}, f.ctx);
+    await assert.rejects(continueLiveChild(f.owner, f.child, { message: "expired must not dispatch" }, f.transport), /not confirmed settled/);
+    assert.equal(f.sent.length, 1);
+  } finally { f.cleanup(); }
+});
+
+test("foreign, malformed and busy child state cannot authorize continuation", async () => {
+  const f = fixture();
+  try {
+    f.settle();
+    const dir = continuationDir(f.activityFile);
+    const path = join(dir, "state.json");
+    const state = JSON.parse(readFileSync(path, "utf8"));
+    for (const patch of [{ runId: randomUUID() }, { sessionFile: "foreign" }, { state: "busy" }, { idleToken: "stale" }]) {
+      writeFileSync(path, JSON.stringify({ ...state, ...patch }));
+      await assert.rejects(continueLiveChild(f.owner, f.child, { message: "must not dispatch" }, f.transport), /not confirmed settled/);
+      assert.equal(f.owner.continuationRequestId, undefined);
+      assert.equal(readdirSync(dir).some(name => name.endsWith(".request.json")), false);
+    }
+    assert.equal(f.sent.length, 0);
+  } finally { f.cleanup(); }
+});
+
 test("reservation happens before asynchronous inspection; concurrent resumes cannot duplicate", async () => {
   const f = fixture();
   try {
@@ -109,16 +193,16 @@ test("reservation happens before asynchronous inspection; concurrent resumes can
   } finally { f.cleanup(); }
 });
 
-test("starting, active, finalizing, unknown and non-Pi owners reject without transport", async () => {
+test("starting, active without aborted proof, finalizing, unknown and non-Pi owners reject without dispatch", async () => {
   const f = fixture();
   try {
-    f.settle();
+    f.settle(false); // Ordinary idle is deliberately insufficient to override active.
     const original = f.child.lifecycle;
     for (const processKind of ["starting", "finalizing", "completed", "failed"]) {
       f.child.lifecycle = { ...original, process: { ...original.process, kind: processKind } as any };
       await assert.rejects(continueLiveChild(f.owner, f.child, { message: "x" }, f.transport), /not a tracked interrupted/);
     }
-    for (const kind of ["active", "starting", "unknown", "waiting"]) {
+    for (const kind of ["active", "starting", "unknown"]) {
       f.child.lifecycle = { ...original, turn: { kind } as any };
       await assert.rejects(continueLiveChild(f.owner, f.child, { message: "x" }, f.transport));
     }
@@ -129,7 +213,7 @@ test("starting, active, finalizing, unknown and non-Pi owners reject without tra
   } finally { f.cleanup(); }
 });
 
-test("requires exact nonempty message and immutable name; idle evidence must be child settled-aborted", async () => {
+test("requires exact nonempty message and immutable name; Escape to idle uses existing child settlement",  async () => {
   const f = fixture();
   try {
     for (const message of [undefined, "", " \n\t"]) {
@@ -141,12 +225,13 @@ test("requires exact nonempty message and immutable name; idle evidence must be 
       await assert.rejects(continueLiveChild(f.owner, f.child, { message: "x" }, f.transport), /not confirmed settled/);
     }
     f.settle(false);
-    await assert.rejects(continueLiveChild(f.owner, f.child, { message: "x" }, f.transport));
+    assert.equal((await continueLiveChild(f.owner, f.child, { message: "x" }, f.transport)).status, "accepted",
+      "Escape to an already idle child does not require a new aborted settlement");
     f.settle();
     f.idle(false);
     await assert.rejects(continueLiveChild(f.owner, f.child, { message: "x" }, f.transport), /Child rejected/);
     assert.equal(f.owner.continuationRequestId, undefined);
-    assert.equal(f.sent.length, 0);
+    assert.equal(f.sent.length, 1);
   } finally { f.cleanup(); }
 });
 

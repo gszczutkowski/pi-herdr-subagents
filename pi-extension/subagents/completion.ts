@@ -1,4 +1,6 @@
-import { existsSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, rmSync, statSync, type BigIntStats } from "node:fs";
+import { createHash } from "node:crypto";
+import type { EventMembership } from "./runtime-store.ts";
 import { normalizeStructuredResult, type StructuredResult } from "./contracts.ts";
 import { runCompletionFile } from "./run-artifacts.ts";
 
@@ -32,7 +34,8 @@ export interface CompletionOptions {
   runId?: string;
   sentinelFile?: string;
   /** Durable watchers retain immutable evidence and skip committed outbox IDs. */
-  retainedEventIds?: () => readonly string[];
+  retainedEventIds?: () => RetainedEventCursor;
+  retainedEventIndex?: RetainedCompletionIndex;
   onTick?: (elapsedSeconds: number) => void;
 }
 
@@ -65,6 +68,8 @@ export function interpretExitSidecar(data: unknown): CompletionResult {
         : "Subagent exited with stopReason=error (no errorMessage in sidecar).";
     return {
       reason: "error", exitCode: 1, errorMessage,
+      ...normalizeStructuredResult(payload.structuredResult),
+      ...(typeof payload.resultDiagnostic === "string" ? { resultDiagnostic: payload.resultDiagnostic.slice(0, 8192) } : {}),
       ...(typeof payload.keepOpen === "boolean" ? { keepOpen: payload.keepOpen } : {}),
     };
   }
@@ -86,40 +91,98 @@ export function interpretExitSidecar(data: unknown): CompletionResult {
   };
 }
 
-function consumeExitSidecar(sessionFile: string | undefined, runId?: string, retainedEventIds?: () => readonly string[]): CompletionResult | null {
-  if (!sessionFile) return null;
+export type RetainedEventCursor = readonly string[] | EventMembership;
+const eventKey = (runId: string, eventId?: string) => `subagent:${runId}:completion${eventId ? `:${eventId}` : ""}`;
 
+/** Cache only validated identities/fingerprints, never discard immutable files.
+ * Every poll still checks ctime/mtime/size/inode: directory mtime alone misses
+ * in-place corruption, including a same-size edit with restored mtime. */
+export class RetainedCompletionIndex {
+  private readonly files = new Map<string, { stamp: string; hash: string; eventKey?: string }>();
+
+  read(file: string, runId: string, committed: EventMembership): any | undefined {
+    let stat: BigIntStats;
+    try { stat = statSync(file, { bigint: true }); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
+    const stamp = `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+    const previous = this.files.get(file);
+    if (previous?.stamp === stamp && (!previous.eventKey || committed.has(previous.eventKey))) return;
+    const text = readFileSync(file, "utf8");
+    const hash = createHash("sha256").update(text).digest("hex");
+    if (previous && previous.hash !== hash) throw new Error(`Immutable completion changed/corrupt: ${file}`);
+    const payload = JSON.parse(text);
+    if (typeof payload?.runId === "string" && payload.runId !== runId) {
+      // Foreign evidence is retained but cannot cross run custody. Remember its
+      // fingerprint so an empty poll neither rereads it nor hides later edits.
+      this.files.set(file, { stamp, hash });
+      return;
+    }
+    if (payload?.runId !== runId || (payload.eventId !== undefined && (typeof payload.eventId !== "string" || !payload.eventId))) {
+      throw new Error(`Invalid run-bound retained completion: ${file}`);
+    }
+    const key = eventKey(runId, payload.eventId);
+    this.files.set(file, { stamp, hash, eventKey: key });
+    return committed.has(key) ? undefined : payload;
+  }
+}
+
+// Compatibility callers need no new lifecycle API. Explicitly scoped indexes
+// are preferred for watchers/recovery; bound the fallback's session retention.
+const retainedIndexes = new Map<string, RetainedCompletionIndex>();
+function retainedIndex(base: string): RetainedCompletionIndex {
+  let index = retainedIndexes.get(base);
+  if (!index) {
+    index = new RetainedCompletionIndex();
+    if (retainedIndexes.size >= 64) retainedIndexes.delete(retainedIndexes.keys().next().value!);
+    retainedIndexes.set(base, index);
+  }
+  return index;
+}
+function completionPayload(payload: any): CompletionResult {
+  return { ...interpretExitSidecar(payload), ...(typeof payload.eventId === "string" ? { eventId: payload.eventId } : {}),
+    ...(typeof payload.summary === "string" ? { summary: payload.summary } : {}) };
+}
+function consumeExitSidecar(sessionFile: string | undefined, runId?: string,
+  retainedEventIds?: () => RetainedEventCursor, index?: RetainedCompletionIndex,
+): CompletionResult | null {
+  if (!sessionFile) return null;
   const base = runId ? runCompletionFile(sessionFile, runId) : `${sessionFile}.exit`;
   const events = `${base}.events`;
-  const committed = retainedEventIds?.();
-  const next = runId && existsSync(events) ? readdirSync(events).filter((name) => {
-    if (!name.endsWith(".json")) return false;
-    if (!committed) return true;
-    try {
-      const payload = JSON.parse(readFileSync(`${events}/${name}`, "utf8"));
-      return !committed.includes(`subagent:${runId}:completion:${payload.eventId}`);
-    } catch { return true; }
-  }).sort()[0] : undefined;
+  if (runId && retainedEventIds) {
+    const cursor = retainedEventIds();
+    const committed: EventMembership = Array.isArray(cursor) ? new Set(cursor) : cursor as EventMembership;
+    index ??= retainedIndex(base);
+    let names: string[];
+    try { names = readdirSync(events); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; names = []; }
+    for (const name of names.filter(name => name.endsWith(".json")).sort()) {
+      const payload = index.read(`${events}/${name}`, runId, committed);
+      if (payload) return completionPayload(payload);
+    }
+    const payload = index.read(base, runId, committed);
+    return payload ? completionPayload(payload) : null;
+  }
+  const next = runId && existsSync(events) ? readdirSync(events).filter(name => name.endsWith(".json")).sort()[0] : undefined;
   const exitFile = next ? `${events}/${next}` : base;
   if (!existsSync(exitFile)) return null;
-
   try {
     const payload = JSON.parse(readFileSync(exitFile, "utf8"));
     if (runId && payload.runId !== runId) return null;
-    if (committed?.includes(`subagent:${runId}:completion${payload.eventId ? `:${payload.eventId}` : ""}`)) return null;
-    const result = interpretExitSidecar(payload);
+    const result = completionPayload(payload);
     if (!retainedEventIds) rmSync(exitFile, { force: true });
-    return { ...result, ...(typeof payload.eventId === "string" ? { eventId: payload.eventId } : {}),
-      ...(typeof payload.summary === "string" ? { summary: payload.summary } : {}) };
+    return result;
   } catch {
-    // The child may still be writing the file. Retry on the next polling cycle.
+    // Legacy mutable sidecars may still be in flight. Retained immutable
+    // evidence instead reports corruption/I/O to its supervisor above.
     return null;
   }
 }
 
 /** Artifact-only recovery must never inspect or control a stale terminal. */
-export function readRetainedCompletion(sessionFile: string, runId: string, cursor: readonly string[]): CompletionResult | null {
-  return consumeExitSidecar(sessionFile, runId, () => cursor);
+export function readRetainedCompletion(sessionFile: string, runId: string, cursor: RetainedEventCursor,
+  index?: RetainedCompletionIndex,
+): CompletionResult | null {
+  return consumeExitSidecar(sessionFile, runId, () => cursor, index);
 }
 
 function terminalExitCode(screen: string, runId?: string): number | null {
@@ -138,7 +201,7 @@ function terminalExitCode(screen: string, runId?: string): number | null {
 }
 
 function completionArtifact(options: CompletionOptions): CompletionResult | null {
-  const sidecar = consumeExitSidecar(options.sessionFile, options.runId, options.retainedEventIds);
+  const sidecar = consumeExitSidecar(options.sessionFile, options.runId, options.retainedEventIds, options.retainedEventIndex);
   if (sidecar) return sidecar;
   if (options.sentinelFile && existsSync(options.sentinelFile)) {
     return { reason: "sentinel", exitCode: 0 };
@@ -189,7 +252,7 @@ export async function waitForCompletion(
   for (;;) {
     if (signal.aborted) throw new Error(ABORT_MESSAGE);
 
-    const sidecarResult = consumeExitSidecar(options.sessionFile, options.runId, options.retainedEventIds);
+    const sidecarResult = consumeExitSidecar(options.sessionFile, options.runId, options.retainedEventIds, options.retainedEventIndex);
     if (sidecarResult) return sidecarResult;
 
     if (options.sentinelFile && existsSync(options.sentinelFile)) {
@@ -202,7 +265,7 @@ export async function waitForCompletion(
         // The terminal read is asynchronous. The child may publish its final
         // result (or provider failure/ping) while that read is in flight. Prefer
         // that richer evidence before falling back to the shell's exit code.
-        const racedCompletion = consumeExitSidecar(options.sessionFile, options.runId, options.retainedEventIds);
+        const racedCompletion = consumeExitSidecar(options.sessionFile, options.runId, options.retainedEventIds, options.retainedEventIndex);
         if (racedCompletion) return racedCompletion;
         return { reason: "sentinel", exitCode };
       }

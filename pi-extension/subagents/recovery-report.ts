@@ -1,6 +1,7 @@
-import type { ContextEvent, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import type { RuntimeManifest } from "./runtime-store.ts";
+import { registerContextPublication } from "./context-publication.ts";
 
 export interface RecoveryView { manifest?: RuntimeManifest; error?: string; paused?: string; diagnostics?: string[] }
 export const RECOVERY_CONTEXT_TYPE = "pi-subagents-recovery-context/v1";
@@ -9,7 +10,13 @@ const guidance = "Saved reconciliation is NOT current liveness. Delivery pending
 function clip(value: string, bytes: number): string {
   const buffer = Buffer.from(value);
   if (buffer.length <= bytes) return value;
-  return buffer.subarray(0, bytes - 16).toString("utf8") + "… [truncated]";
+  let output = "", used = 0;
+  for (const char of value.toWellFormed()) {
+    const size = Buffer.byteLength(char);
+    if (used + size > bytes - 16) break;
+    output += char; used += size;
+  }
+  return output + "… [truncated]";
 }
 
 /** Pure bounded projection of existing evidence. No probing, delivery or store mutation. */
@@ -57,12 +64,9 @@ export function recoveryReport(view: RecoveryView, options: { runId?: string; of
   return clip(lines.join("\n"), options.compact ? 4096 : 24000);
 }
 
-export function projectRecoveryContext(messages: ContextEvent["messages"], view: RecoveryView): ContextEvent["messages"] {
-  const retained = messages.filter(message => !(message.role === "custom" && message.customType === RECOVERY_CONTEXT_TYPE &&
-    (message.details as { projection?: string } | undefined)?.projection === RECOVERY_CONTEXT_TYPE));
-  if (!view.error && !view.paused && !Object.keys(view.manifest?.runs ?? {}).length) return retained;
-  return [...retained, { role: "custom", customType: RECOVERY_CONTEXT_TYPE, content: recoveryReport(view, { limit: 3, compact: true }),
-    display: false, details: { projection: RECOVERY_CONTEXT_TYPE }, timestamp: 0 }];
+export function recoveryContext(view: RecoveryView): string | undefined {
+  if (!view.error && !view.paused && !view.diagnostics?.length && !Object.keys(view.manifest?.runs ?? {}).length) return;
+  return recoveryReport(view, { limit: 3, compact: true });
 }
 
 export function registerRecoveryReport(pi: ExtensionAPI, read: (ctx: ExtensionContext) => RecoveryView): void {
@@ -78,5 +82,7 @@ export function registerRecoveryReport(pi: ExtensionAPI, read: (ctx: ExtensionCo
     description: "Read-only saved assignments; optional runId for detail (no terminal control)",
     handler: async (args, ctx) => { ctx.ui.notify(recoveryReport(read(ctx), { runId: args.trim() || undefined }), "info"); },
   });
-  pi.on("context", (event, ctx) => ({ messages: projectRecoveryContext(event.messages, read(ctx)) }));
+  registerContextPublication(pi, { customType: RECOVERY_CONTEXT_TYPE, read: ctx => recoveryContext(read(ctx)),
+    absent: "No saved assignment recovery state is currently available on this branch; previous recovery context no longer applies. This does not establish current liveness or acceptance.",
+  });
 }

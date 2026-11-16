@@ -1,9 +1,9 @@
-import type { ExtensionAPI, ContextEvent } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { PlanPersistence, PlanView } from "./plan-persistence.ts";
+import { registerContextPublication } from "./context-publication.ts";
 
 export const PLAN_CONTEXT_TYPE = "pi-subagents-plan-context/v1";
 export const PLAN_CONTEXT_BYTES = 8192;
-const marker = "pi-subagents-plan-projection/v1";
 
 /** UTF-8 bounded single-line text, without splitting Unicode surrogate pairs. */
 function clip(value: string, bytes: number): string {
@@ -17,7 +17,7 @@ function clip(value: string, bytes: number): string {
 
 export function summarizePlan(view: PlanView): string {
   const plan = view.snapshot;
-  const pointer = 'Details omitted: scope, criteria, attempts, results, evidence, decisions and artifacts. Read plan_read({}); plan_read({taskId:"<taskId>"}) for full task details. Read latest revision before plan_update. Child results require parent verification; process exit is not acceptance.';
+  const pointer = 'Details omitted: scope, criteria, attempts, results, evidence, decisions and artifacts. Use plan_read({taskId:"<taskId>"}) when details are needed, and verify current revision/authority before plan_update or after a conflict. Child results require parent verification; process exit is not acceptance.';
   const lines = ["Current durable plan (active branch only; not runtime liveness):"];
   if (!plan) {
     lines.push("No readable active plan.");
@@ -44,14 +44,17 @@ export function summarizePlan(view: PlanView): string {
   return lines.join("\n");
 }
 
-/** Pure projection: replace only our own previous projection; preserve everything else. */
-export function projectPlanContext(messages: ContextEvent["messages"], view: PlanView): ContextEvent["messages"] {
-  const retained = messages.filter(message => !(message.role === "custom" && message.customType === PLAN_CONTEXT_TYPE &&
-    (message.details as { projection?: string } | undefined)?.projection === marker));
-  return [...retained, { role: "custom", customType: PLAN_CONTEXT_TYPE, content: summarizePlan(view), display: false, details: { projection: marker }, timestamp: 0 }];
+/** No empty-plan notices during ordinary conversation or setup/child sessions. */
+export function planContext(view: PlanView): string | undefined {
+  if (!view.snapshot && (!view.error || /Child sessions cannot|A durable session/.test(view.error))) return;
+  // A failed native append may have advanced memory only. Never publish that
+  // snapshot as confirmed state; the existing storage latch requires reconcile.
+  return summarizePlan(view.error?.startsWith("Plan append failed") ? { ...view, snapshot: undefined } : view);
 }
 
-/** No append/send/turn hooks: re-read the real store for every provider context. */
 export function registerPlanContext(pi: ExtensionAPI, persistence: PlanPersistence): void {
-  pi.on("context", (event, ctx) => ({ messages: projectPlanContext(event.messages, persistence.read(ctx.sessionManager)) }));
+  registerContextPublication(pi, { customType: PLAN_CONTEXT_TYPE,
+    read: ctx => planContext(persistence.read(ctx.sessionManager)),
+    absent: "No readable active plan on this branch; previous plan context no longer applies.",
+  });
 }

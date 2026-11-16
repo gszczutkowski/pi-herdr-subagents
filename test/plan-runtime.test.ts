@@ -118,6 +118,14 @@ test("registered task-bound spawn, live/closed resume, failure isolation and res
     continuationEvents.get("agent_settled")!({ aborted: true }, continuationCtx);
     const liveSnapshot = structuredClone(read());
     const liveDispatches = dispatches;
+    const requestFiles = () => fs.readdirSync(`${child.activityFile}.continuation`).filter(name => name.endsWith(".request.json"));
+    for (const message of [undefined, "", " \n\t"]) {
+      await assert.rejects(execute("subagent_resume", { sessionPath: child.sessionFile, message }), /nonempty message/);
+      assert.deepEqual(requestFiles(), [], "raw empty message never publishes a contract-only request");
+      assert.equal(liveSends, 0);
+      assert.equal(dispatches, liveDispatches);
+      assert.deepEqual(read(), liveSnapshot);
+    }
     await assert.rejects(execute("subagent_resume", { sessionPath: child.sessionFile, message: "stale", planTask: { ...selection(), expectedRevision: 0 } }), /Revision conflict/);
     assert.deepEqual(read(), liveSnapshot);
     assert.equal(dispatches, liveDispatches);
@@ -170,7 +178,7 @@ test("registered task-bound spawn, live/closed resume, failure isolation and res
     assert.equal(readRuntimeManifest(manifestDir)!.outbox[sent[1].details.eventId].status, "handedOff");
     assert.equal(read().tasks[0].attempts[0].results.length, 1);
     p.reconcile(sm);
-    await emit("context", { messages: [] });
+    await emit("before_agent_start", { systemPromptOptions: { toolGuidelines: {} } } as any);
     assert.equal(read().tasks[0].attempts[0].results.length, 2, "handed-off outbox retries task import");
     // Closed resume canonical aliases add a run, not a task/attempt.
     child.lifecycle.delivery = "suppressed";
@@ -202,7 +210,10 @@ test("registered task-bound spawn, live/closed resume, failure isolation and res
     // Execute the real child tool, then let the original parent watcher consume
     // its run-bound artifact. No direct task mutation stands in for caller_ping.
     const childTools = new Map<string, any>();
-    const childApi: any = new Proxy({}, { get: (_, key) => key === "registerTool" ? (t: any) => childTools.set(t.name, t) : () => {} });
+    const childEvents = new Map<string, Function[]>();
+    const childApi: any = new Proxy({}, { get: (_, key) => key === "registerTool" ? (t: any) => childTools.set(t.name, t)
+      : key === "on" ? (name: string, fn: Function) => childEvents.set(name, [...(childEvents.get(name) ?? []), fn])
+      : key === "getAllTools" ? () => [] : () => {} });
     const { default: childExtension } = await import("../pi-extension/subagents/subagent-done.ts");
     const reason = "Choose schema A or B; migration approval needed.";
     let shutdown = false;
@@ -213,7 +224,13 @@ test("registered task-bound spawn, live/closed resume, failure isolation and res
       process.env.PI_SUBAGENT_NAME = resumedChild.name;
       process.env.PI_SUBAGENT_ACTIVITY_FILE = resumedChild.activityFile;
       childExtension(childApi);
-      await childTools.get("caller_ping").execute("ping", { message: reason }, undefined, undefined, { shutdown: () => { shutdown = true; } });
+      const childCtx: any = { shutdown: () => { shutdown = true; }, sessionManager: SessionManager.open(resumedChild.sessionFile),
+        isIdle: () => true, hasPendingMessages: () => false, hasUI: false, ui: {} };
+      for (const handler of childEvents.get("before_agent_start") ?? []) await handler({}, childCtx);
+      await childTools.get("caller_ping").execute("ping", { message: reason }, undefined, undefined, childCtx);
+      assert.equal(shutdown, false, "a staged ping cannot close before settlement");
+      for (const handler of childEvents.get("agent_settled") ?? []) await handler({ type: "agent_settled", aborted: false }, childCtx);
+      for (const handler of childEvents.get("session_shutdown") ?? []) await handler({ reason: "quit" }, childCtx);
     } finally {
       for (const key of Object.keys(process.env)) if (!(key in childEnv)) delete process.env[key];
       Object.assign(process.env, childEnv);
@@ -260,7 +277,7 @@ test("registered task-bound spawn, live/closed resume, failure isolation and res
     const deferredEvent = sent.at(-1).details.eventId;
     assert.ok(readRuntimeManifest(manifestDir)!.outbox[deferredEvent]);
     sm.branch(originalLeaf);
-    await emit("context", { messages: [] });
+    await emit("before_agent_start", { systemPromptOptions: { toolGuidelines: {} } } as any);
     assert.ok(read().tasks[0].attempts[0].results.some(r => r.eventId === deferredEvent));
     // Fresh persistence plus a reopened manifest retains original authority, no launch.
     const snapshot = readRuntimeManifest(manifestDir)!;
@@ -283,18 +300,18 @@ test("registered task-bound spawn, live/closed resume, failure isolation and res
     assert.equal(read().tasks[0].status, "in_progress", "failed append leaves task import pending");
     assert.equal(dispatches, 2);
     p.reconcile(sm);
-    await emit("context", { messages: [] });
+    await emit("before_agent_start", { systemPromptOptions: { toolGuidelines: {} } } as any);
     assert.equal(read().tasks[0].status, "failed");
     assert.match(read().tasks[0].statusReason, /before send/);
     const failureRevision = read().revision;
-    await emit("context", { messages: [] });
+    await emit("before_agent_start", { systemPromptOptions: { toolGuidelines: {} } } as any);
     assert.equal(read().revision, failureRevision);
     mutate((p: any, c: any) => store.retry(p, c, p.tasks[0].taskId));
     failSend = true;
     await assert.rejects(execute("subagent", { name: "Send fails", task: "five", cwd: dir, planTask: selection() }), /ambiguous transport/);
     assert.equal(read().tasks[0].status, "in_progress");
     p.reconcile(sm);
-    await emit("context", { messages: [] });
+    await emit("before_agent_start", { systemPromptOptions: { toolGuidelines: {} } } as any);
     assert.equal(read().tasks[0].status, "blocked", "ambiguous send cannot certify process failure");
     assert.match(read().tasks[0].statusReason, /Dispatch uncertain/);
   } finally {

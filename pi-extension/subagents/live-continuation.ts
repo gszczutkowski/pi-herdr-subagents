@@ -38,8 +38,22 @@ export function registerLiveContinuation(pi: ExtensionAPI): void {
     mkdirSync(dir, { recursive: true });
     publish(join(dir, "state.json"), { runId, sessionFile, transport: watcher ? CONTINUATION_TRANSPORT : undefined, state: "busy" });
   };
+  const stopWatcher = () => {
+    const previous = watcher;
+    watcher = undefined;
+    idleToken = undefined;
+    try { previous?.close(); } catch { /* Cleanup must not depend on storage or diagnostics. */ }
+  };
+  const pause = (error: unknown, ctx: ExtensionContext) => {
+    stopWatcher();
+    const diagnostic = `Continuation paused/uncertain: ${String(error)}. Reload to restore transport; claimed requests must not be replayed.`;
+    // Native fs callbacks are outside Pi's protected event dispatcher. Even the
+    // diagnostic may hit the same failed disk (or a disposed UI).
+    try { mkdirSync(dir, { recursive: true }); publish(join(dir, "state.json"), { runId, sessionFile, state: "paused", error: diagnostic }); } catch { /* Best effort only. */ }
+    try { if (ctx.hasUI) ctx.ui.notify(diagnostic, "warning"); } catch { /* A failed observer cannot escape a native callback. */ }
+  };
   pi.on("session_start", (_event, ctx) => {
-    watcher?.close();
+    stopWatcher();
     mkdirSync(dir, { recursive: true });
     // Only atomic request renames are dispatchable, never partial temporary files.
     watcher = watch(dir, (_event, filename) => {
@@ -48,19 +62,18 @@ export function registerLiveContinuation(pi: ExtensionAPI): void {
         for (const name of names) {
           if (name.endsWith(".request.json")) receive(name.slice(0, -".request.json".length), ctx);
         }
-      } catch {
+      } catch (error) {
         // An I/O or API failure is ambiguous after claiming. Never replay it.
-        watcher?.close();
-        watcher = undefined;
-        busy();
+        pause(error, ctx);
       }
     });
-    watcher.on("error", () => { watcher?.close(); watcher = undefined; busy(); });
+    watcher.unref();
+    watcher.on("error", (error) => pause(error, ctx));
     busy(); // Startup/reload invalidates every previous settled token.
   });
   pi.on("before_agent_start", busy);
   pi.on("agent_start", busy);
-  pi.on("session_shutdown", () => { watcher?.close(); watcher = undefined; busy(); });
+  pi.on("session_shutdown", () => { stopWatcher(); busy(); });
   pi.on("agent_settled", (event, ctx) => {
     if (!ctx.isIdle() || ctx.hasPendingMessages()) { busy(); return; }
     idleToken = randomUUID();
@@ -146,7 +159,7 @@ export async function continueLiveChild(owner: SessionOwner, child: LiveChild | 
     return previous; // A recheck never dispatches the newly supplied message.
   }
   if (!child || child.id !== owner.runId || child.cli !== "pi" || !child.activityFile ||
-      child.lifecycle.process.kind !== "running" || !(child.lifecycle.turn.kind === "interrupted" || (child.hasTurnResult && child.lifecycle.turn.kind === "waiting"))) {
+      child.lifecycle.process.kind !== "running" || !["interrupted", "waiting", "active"].includes(child.lifecycle.turn.kind)) {
     throw new Error("Owned session is not a tracked interrupted or settled idle live Pi child; close its process before closed-session resume.");
   }
   if (typeof params.message !== "string" || !params.message.trim()) throw new Error("Live continuation requires a nonempty message.");
@@ -159,14 +172,27 @@ export async function continueLiveChild(owner: SessionOwner, child: LiveChild | 
     // HC reports a completed turn as done even while the Pi process remains open.
     // Neither coarse status authorizes dispatch without the child-issued idle token below.
     if (pane.kind !== "present" || !["idle", "done"].includes(pane.agentStatus ?? "")) throw new Error("Live child pane is not confirmed idle.");
-    if (child.lifecycle.process.kind !== "running" || !(child.lifecycle.turn.kind === "interrupted" || (child.hasTurnResult && child.lifecycle.turn.kind === "waiting"))) {
+    if (child.lifecycle.process.kind !== "running" || !["interrupted", "waiting", "active"].includes(child.lifecycle.turn.kind)) {
       throw new Error("Live child changed state during continuation inspection.");
     }
     const dir = continuationDir(child.activityFile);
     const state = read(join(dir, "state.json"));
     if (state?.runId !== child.id || state?.sessionFile !== canonicalSessionPath(child.sessionFile) ||
-        state?.state !== (child.lifecycle.turn.kind === "interrupted" ? "interrupted-idle" : "settled-idle") || !uuid.test(state?.idleToken)) {
+        !["interrupted-idle", "settled-idle"].includes(state?.state) || !uuid.test(state?.idleToken)) {
       throw new Error("Child has not confirmed settled interrupted idle.");
+    }
+    // Native cancellation can emit a final turn_start after the parent's local
+    // interrupt marker. That stale active label cannot outrank the child's fresh
+    // interrupted-idle token. Ordinary settled-idle does NOT get this exception.
+    if (child.lifecycle.turn.kind === "active" && state.state !== "interrupted-idle") {
+      throw new Error("Child has not confirmed interrupted idle over an active parent observation.");
+    }
+    // Parent turn labels are observations, not an acknowledgement of Escape.
+    // A manually aborted child can be `waiting` without any result; conversely
+    // Escape sent to an already settled child need not generate another event.
+    // Only a run/session-bound child token qualifies either case for dispatch.
+    if (state.state === "settled-idle" && child.lifecycle.turn.kind !== "interrupted" && !child.hasTurnResult) {
+      throw new Error("Child has not confirmed an interrupted turn or a supervised keepOpen result.");
     }
     if (state.transport !== CONTINUATION_TRANSPORT) {
       throw new Error("Child lacks artifact continuation support. Update/reload the child and complete a turn before continuing; no terminal fallback was attempted.");

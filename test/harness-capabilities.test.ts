@@ -48,7 +48,8 @@ async function withLaunchFixture(run: (fixture: {
     const ctx = {
       cwd: root, model,
       modelRegistry: { find: () => model, getAvailable: () => [model], getAll: () => [model], hasConfiguredAuth: () => true },
-      sessionManager: { getSessionFile: () => parentFile, getSessionId: () => "parent", getSessionDir: () => join(root, "parent-sessions") },
+      sessionManager: { getSessionFile: () => parentFile, getSessionId: () => "parent", getSessionDir: () => join(root, "parent-sessions"),
+        getBranch: () => SessionManager.open(parentFile).getBranch() },
     };
     await run({ root, calls, launch: async (cli, mode, extra = {}) => {
       const name = `test-${cli}-${mode}`;
@@ -96,7 +97,7 @@ describe("harness launch capability contract", () => {
       for (const mode of ["standalone", "lineage-only", "fork"]) {
         const running = await launch("pi", mode);
         const script = readFileSync(running.launchScriptFile, "utf8");
-        assert.ok(script.includes(`pi --session '${running.sessionFile}'`));
+        assert.ok(script.includes(`pi --no-approve --session '${running.sessionFile}'`), "missing host trust must preserve project-resource denial");
         if (mode === "standalone") {
           assert.equal(existsSync(running.sessionFile), false, "fresh Pi session is created by the child");
         } else {
@@ -108,7 +109,7 @@ describe("harness launch capability contract", () => {
           assert.equal(JSON.stringify(messages).includes("INHERITED_HISTORY"), mode === "fork");
           assert.equal(JSON.stringify(messages).includes("CURRENT_KICKOFF"), false);
         }
-        assert.equal(script.includes("'@"), mode !== "fork", "blank contexts use artifact-backed task delivery");
+        assert.equal(script.includes("'@"), true, "every prompt shape uses one literal artifact transport");
         assert.ok(script.includes("CHILD_TASK") || script.includes("'@"));
       }
       assert.equal(calls.filter((call) => call[0] === "herdr" && call[1] === "tab" && call[2] === "create").length, 3);

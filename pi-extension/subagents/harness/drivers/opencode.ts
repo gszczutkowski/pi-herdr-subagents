@@ -7,6 +7,8 @@ import type {
 } from "../types.ts";
 import type { ResolvedRuntimePlan } from "../../runtime-routing.ts";
 import { extractPaneSummary } from "../pane-summary.ts";
+import { resolveRoleInstructions } from "../../role-instructions.ts";
+import { shellComment } from "../../shell.ts";
 
 export class OpenCodeHarnessDriver implements HarnessDriver {
   readonly id = "opencode";
@@ -29,14 +31,13 @@ export class OpenCodeHarnessDriver implements HarnessDriver {
       surface,
       shellQuote,
       inheritsConversationContext,
-      roleBlock,
       modeHint,
       summaryInstruction,
     } = context;
 
     const fullTask = inheritsConversationContext
       ? params.task
-      : `${roleBlock ?? ""}\n\n${modeHint ?? ""}\n\n${params.task}\n\n${summaryInstruction ?? ""}`;
+      : `${modeHint ?? ""}\n\n${params.task}\n\n${summaryInstruction ?? ""}`;
 
     const cmdParts: string[] = ["opencode", "run"];
 
@@ -44,7 +45,7 @@ export class OpenCodeHarnessDriver implements HarnessDriver {
       cmdParts.push("--model", shellQuote(effectiveModel));
     }
 
-    const sp = params.systemPrompt ?? agentDefs?.body;
+    const sp = context.identity ?? resolveRoleInstructions(agentDefs?.body, params.systemPrompt);
     if (sp) {
       cmdParts.push("--system-prompt", shellQuote(sp));
     }
@@ -62,10 +63,10 @@ export class OpenCodeHarnessDriver implements HarnessDriver {
       command,
       cli: "opencode",
       launchScriptPreamble: [
-        `# OpenCode subagent launch script for ${params.name}`,
-        `# Generated: ${new Date().toISOString()}`,
-        `# Surface: ${surface}`,
-      ],
+        `OpenCode subagent launch script for ${params.name}`,
+        `Generated: ${new Date().toISOString()}`,
+        `Surface: ${surface}`,
+      ].map(shellComment),
     };
   }
 

@@ -86,10 +86,17 @@ test("real native disk append failure latches writes across reload until reopene
     const file = sm.getSessionFile()!;
     const backup = `${file}.backup`;
     renameSync(file, backup);
-    mkdirSync(file); // appendFileSync fails on a directory, after advancing Pi's memory.
+    mkdirSync(file); // appendFileSync fails on a directory.
+    const durableLeaf = sm.getLeafId();
     assert.throws(() => add(p, sm, plan), /append failed/);
+    assert.equal(sm.getLeafId(), durableLeaf, "patched Pi rolls back a failed native append");
     rmSync(file, { recursive: true });
     renameSync(backup, file);
+    // Independently exercise the legacy/misbehaving-host ahead-of-disk guard:
+    // native rollback no longer creates this condition as an incidental side effect.
+    const persist = (sm as any)._persist;
+    try { (sm as any)._persist = () => {}; sm.appendCustomEntry("synthetic-memory-only", {}); }
+    finally { (sm as any)._persist = persist; }
     const reload = new PlanPersistence((type, data) => { sm.appendCustomEntry(type, data); }, false);
     assert.throws(() => add(reload, sm, plan), /writes disabled/);
     assert.throws(() => reload.reconcile(sm), /ahead of disk/);
@@ -160,8 +167,8 @@ test("actual Pi lifecycle bindings and model-issued plan tools persist through a
       extensionFactories: [registerPlanTools, pi => {
         pi.on("context_with_system", event => {
           const summary = event.messages.filter(message => message.role === "custom" && message.customType === "pi-subagents-plan-context/v1");
-          assert.equal(summary.length, 1);
-          projected.push(String((summary[0] as any).content));
+          assert.equal(summary.length, 0, "no empty-plan injection or duplicate of a model-issued receipt");
+          projected.push(JSON.stringify(event.messages.filter(message => message.role === "toolResult" && message.toolName === "plan_update")));
         });
         pi.registerProvider("plan-test", {
           baseUrl: "https://example.invalid", apiKey: "test", api: "plan-test-api",
@@ -190,9 +197,9 @@ test("actual Pi lifecycle bindings and model-issued plan tools persist through a
     await session.bindExtensions({ onError: error => errors.push(error) });
     await session.prompt("Create a durable plan");
     assert.equal(requests, 2);
-    assert.match(projected[0], /No readable active plan/);
-    assert.match(projected[1], /Runtime plan/);
-    assert.match(projected[1], /revision=0/);
+    assert.equal(projected[0], "[]");
+    assert.match(projected[1], /planId/);
+    assert.match(projected[1], /\\"revision\\":0/);
     assert.equal(sm.getEntries().filter(entry => entry.type === "custom_message" && entry.customType === "pi-subagents-plan-context/v1").length, 0);
     assert.deepEqual(errors, []);
     const reopened = SessionManager.open(sm.getSessionFile()!);

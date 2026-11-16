@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import {
   createSubagentActivityRecorder,
   readSubagentActivityFile,
@@ -203,7 +204,7 @@ for (const completion of ["close:false", "natural"] as const) {
       shutdown: () => { shutdowns++; },
       isIdle: () => true,
       hasPendingMessages: () => false,
-      sessionManager: { getSessionFile: () => env.PI_SUBAGENT_SESSION },
+      sessionManager: SessionManager.open(env.PI_SUBAGENT_SESSION),
     };
     const emit = async (name: string, event = {}) => {
       for (const handler of handlers.get(name) ?? []) await handler(event, ctx);
@@ -228,7 +229,7 @@ for (const completion of ["close:false", "natural"] as const) {
       await emit("agent_start");
       if (completion === "close:false") {
         await tools.get("subagent_done").execute("done", { close: false }, undefined, undefined, ctx);
-        assert.equal(read().phase, "done");
+        assert.notEqual(read().phase, "done", "tool intent must not mark activity done before settlement");
       }
       await emit("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] });
       await emit("agent_settled", { aborted: false });
@@ -253,7 +254,14 @@ for (const completion of ["close:false", "natural"] as const) {
       let lifecycle = observeActivity(createLifecycle(1_000), { ok: true, activity: active }, Date.now());
       lifecycle = markInterruptRequested(lifecycle, Date.now());
       await emit("agent_end", { messages: [{ role: "assistant", stopReason: "aborted" }] });
+      // Pi can drain a trailing turn_start after cancellation's agent_end.
+      // The final settled boundary must overwrite that stale active snapshot.
+      await emit("turn_start", { turnIndex: 2 });
+      assert.equal(read().phase, "active");
       await emit("agent_settled", { aborted: true });
+      assert.equal(read().phase, "waiting");
+      assert.equal(read().agentActive, false);
+      assert.equal(read().turnActive, false);
       lifecycle = observeActivity(lifecycle, { ok: true, activity: read() }, Date.now());
       assert.equal(lifecycle.turn.kind, "interrupted");
       await emit("input");

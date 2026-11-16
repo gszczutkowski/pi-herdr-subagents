@@ -1,5 +1,5 @@
 import { canonicalSessionPath, releaseSession, reserveSession, sessionOwners } from "./ownership.ts";
-import { readRetainedCompletion, type CompletionResult } from "./completion.ts";
+import { readRetainedCompletion, RetainedCompletionIndex, type CompletionResult } from "./completion.ts";
 import { readChildIdentity, verifyRecoveryChild } from "./recovery-identity.ts";
 import { probeProcess, sameProcess } from "./process-identity.ts";
 import { assertSessionWriters, auditSession } from "./session-audit.ts";
@@ -14,7 +14,7 @@ export function releaseRecoveredSession(store: RuntimeStore, sessionFile: string
   const path = canonicalSessionPath(sessionFile);
   const owner = sessionOwners.get(path);
   if (!owner || owner.surface) return;
-  const run = store.snapshot().runs[owner.runId];
+  const run = store.getRun(owner.runId);
   if (!run || run.cli !== "pi" || canonicalSessionPath(run.sessionFile) !== path) return;
   const identity = readChildIdentity(path, run.id);
   if (!identity) return;
@@ -29,74 +29,131 @@ export function releaseRecoveredSession(store: RuntimeStore, sessionFile: string
   releaseSession(path, run.id);
 }
 
+export interface RecoveryFailure { runId?: string; error: string }
+export interface RecoveryStatus { state: "active" | "paused" | "stopped"; errors: readonly RecoveryFailure[] }
+export interface RecoverySupervisor {
+  (): void;
+  /** One bounded artifact-only pass. No dispatch, launch, or custody acquisition. */
+  reconcile(): RecoveryStatus;
+  status(): RecoveryStatus;
+}
+
 /** Restart policy B. No launch builders, terminal APIs or task scripts here.
  * Reservations are synchronous, before the first identity probe/await. */
 export async function reconcileRuntime(
   store: RuntimeStore,
   onEvidence: (run: DurableRun, completion: CompletionResult) => void,
   isCurrent: () => boolean,
-): Promise<() => void> {
-  const runs = Object.values(store.snapshot().runs).sort((a, b) => b.startTime - a.startTime);
+  options: { onError?: (failure: RecoveryFailure) => void; maxEventsPerPass?: number } = {},
+): Promise<RecoverySupervisor> {
+  const limit = options.maxEventsPerPass ?? 100;
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) throw new Error("Recovery pass limit must be 1..1000 events");
+  store.assertCustody();
+  const runs = store.listRuns().sort((a, b) => b.startTime - a.startTime);
   const reserved = new Set<string>();
+  const baseline = new Map<string, string>();
   for (const run of runs) {
     const path = canonicalSessionPath(run.sessionFile);
     const previous = sessionOwners.get(path);
     if (previous) {
-      // Re-establish artifact-only supervision after a temporary suspension.
-      // The same run keeps its reservation, but must pass a fresh identity probe.
+      // Same-run reservations must still pass a fresh identity probe. A different
+      // run can contribute immutable evidence, never inherit writer controls.
       if (previous.runId === run.id) { reserved.add(run.id); continue; }
-      // Another run in this manifest cannot inherit a writer reservation.
-      store.reconcileRun(run.id, `decision: session reserved by ${previous.runId}`);
+      const decision = `decision: session reserved by ${previous.runId}`;
+      store.reconcileRun(run.id, decision); baseline.set(run.id, decision);
       continue;
     }
     const owner = reserveSession(path, run.id);
     owner.dispatched = true;
     owner.continuationRequestId = run.continuationRequestId;
-    // No recovered surface: presence cannot prove pane -> process binding.
     reserved.add(run.id);
   }
   let stopped = false;
+  let timer: ReturnType<typeof setInterval> | undefined;
+  let globalFailure: RecoveryFailure | undefined;
+  let nextRun = 0;
   const current = () => !stopped && isCurrent();
   const verified = new Set<string>();
-  const harvest = (run: DurableRun) => {
-    if (!current()) return;
+  const backlog = new Set(runs.map(run => run.id));
+  const paused = new Map<string, RecoveryFailure>();
+  const indexes = new Map(runs.map(run => [run.id, new RetainedCompletionIndex()]));
+  const status = (): RecoveryStatus => ({ state: stopped ? "stopped" : globalFailure || paused.size ? "paused" : "active",
+    errors: structuredClone([...(globalFailure ? [globalFailure] : []), ...paused.values()]) });
+  const report = (failure: RecoveryFailure) => {
+    try { options.onError?.(failure); } catch { /* Native timer diagnostics must not escape. */ }
+  };
+  const pauseRun = (run: DurableRun, error: unknown) => {
+    const failure = { runId: run.id, error: `Recovered supervision paused: ${String(error)}; explicit reconciliation required` };
+    paused.set(run.id, failure);
+    try { store.reconcileRun(run.id, `paused: ${failure.error}`); } catch { /* The callback/status still reports failure if this disk is unavailable. */ }
+    report(failure);
+  };
+  const checkCustody = () => {
+    if (!current()) throw new Error("Parent runtime lost custody/current branch");
     store.assertCustody();
+  };
+  const harvest = (run: DurableRun, budget: { remaining: number }): void => {
+    checkCustody();
     const owner = sessionOwners.get(canonicalSessionPath(run.sessionFile));
     if (owner?.runId === run.id) reconcileContinuation(owner, run, (requestId) => store.settleContinuation(run.id, requestId));
-    // Drain only immutable run-bound evidence, never terminal output or transcript
-    // tails from another invocation. The outbox transaction advances the cursor.
-    for (;;) {
-      if (!current()) return;
-      store.assertCustody();
-      const before = store.snapshot().runs[run.id].eventCursor;
-      const event = readRetainedCompletion(run.sessionFile, run.id, before);
-      if (!event) return;
+    while (budget.remaining > 0) {
+      checkCustody();
+      const cursor = store.committedEventIds(run.id);
+      const before = cursor.size;
+      const event = readRetainedCompletion(run.sessionFile, run.id, cursor, indexes.get(run.id));
+      if (!event) { backlog.delete(run.id); return; }
+      budget.remaining--; // Failed attempts count too; a partial failure cannot exceed the pass bound.
       onEvidence(run, event);
-      const after = store.snapshot().runs[run.id].eventCursor;
-      if (after.length <= before.length) throw new Error("Recovery failed to commit evidence cursor");
+      if (store.committedEventIds(run.id).size <= before) throw new Error("Recovery failed to commit evidence cursor");
     }
+    backlog.add(run.id); // A later bounded pass must check whether more remain.
+  };
+  const pass = (explicit = false): RecoveryStatus => {
+    if (stopped || (globalFailure && !explicit)) return status();
+    try { checkCustody(); globalFailure = undefined; }
+    catch (error) {
+      globalFailure = { error: `Recovered supervision paused: ${String(error)}; explicit reconciliation required` };
+      report(globalFailure); return status();
+    }
+    if (explicit) nextRun = 0;
+    const budget = { remaining: limit };
+    const start = nextRun;
+    for (let n = 0; n < runs.length && budget.remaining > 0; n++) {
+      const index = (start + n) % runs.length;
+      const run = runs[index];
+      if (!explicit && (paused.has(run.id) || (!verified.has(run.id) && !backlog.has(run.id)))) continue;
+      nextRun = (index + 1) % runs.length;
+      try {
+        harvest(run, budget);
+        if (paused.has(run.id)) {
+          store.reconcileRun(run.id, baseline.get(run.id) ?? "unverified: artifact reconciliation resumed; no terminal controls or automatic launch");
+          paused.delete(run.id);
+        }
+      } catch (error) { pauseRun(run, error); }
+    }
+    return status();
   };
   for (const run of runs) {
     if (!current()) break;
-    if (!reserved.has(run.id)) { harvest(run); continue; }
+    if (!reserved.has(run.id)) continue;
     const outcome = run.cli === "pi"
       ? await verifyRecoveryChild(run.sessionFile, run.id, store.generation, current) : "unverified";
-    // Fence every asynchronous probe before touching state or installing a timer.
     if (!current()) break;
     store.assertCustody();
-    store.reconcileRun(run.id, outcome === "verified-live"
+    const decision = outcome === "verified-live"
       ? "verified-live: artifact-only supervision; terminal controls disabled"
       : outcome === "exited" ? "exited: decision required before another writer"
-        : "unverified: decision required; no terminal controls or automatic launch");
+        : "unverified: decision required; no terminal controls or automatic launch";
+    store.reconcileRun(run.id, decision); baseline.set(run.id, decision);
     if (outcome === "verified-live") verified.add(run.id);
-    // Durable events can be reconciled even when the child is dead/unverified.
-    harvest(run);
   }
-  const timer = verified.size ? setInterval(() => {
-    if (!current()) { clearInterval(timer); return; }
-    try { for (const run of runs) if (verified.has(run.id)) harvest(run); }
-    catch { stopped = true; clearInterval(timer); }
-  }, 250) : undefined;
-  timer?.unref?.();
-  return () => { stopped = true; if (timer) clearInterval(timer); };
+  pass();
+  if (verified.size || backlog.size) {
+    timer = setInterval(() => { pass(); }, 250);
+    timer.unref?.();
+  }
+  const stop = (() => { stopped = true; if (timer) clearInterval(timer); }) as RecoverySupervisor;
+  stop.status = status;
+  stop.reconcile = () => pass(true);
+  return stop;
 }

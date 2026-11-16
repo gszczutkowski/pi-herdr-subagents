@@ -25,17 +25,18 @@ test("discovery helper preserves CRLF parsing and catalog/lookup precedence at c
     assert.equal(getAgentConfigDir(), global);
     assert.equal(parseAgentDefinition(globalContent, "fallback")?.sessionMode, "lineage-only");
     assert.equal(parseAgentDefinition("invalid", "fallback"), null);
-    const found = discoverAgentDefinitions().filter((agent) => agent.name === "boundary-alias");
+    const options = { cwd: project, projectAgents: true };
+    const found = discoverAgentDefinitions(options).filter((agent) => agent.name === "boundary-alias");
     assert.equal(found.length, 1);
     assert.equal(found[0].source, "project");
     assert.equal(found[0].body, "Local body");
     assert.equal(found[0].commandTemplate, "run --flag");
     assert.equal(found[0].cwd, "relative-role", "discovery does not reinterpret launch paths");
-    assert.deepEqual(loadAgentDefaults("boundary-alias"), found[0]);
-    assert.equal(loadAgentDefaults("different-filename"), null);
+    assert.deepEqual(loadAgentDefaults("boundary-alias", options), found[0]);
+    assert.equal(loadAgentDefaults("different-filename", options), null);
     assert.match(buildAvailableAgentCatalog(found, 24, { agents: {} }), /test\/local/);
     process.chdir(root);
-    assert.equal(loadAgentDefaults("boundary-alias")?.model, "test/global", "cwd resolved at call time");
+    assert.equal(loadAgentDefaults("boundary-alias", { cwd: root, projectAgents: true })?.model, "test/global", "authorized cwd is explicit, never inferred from process.cwd");
   } finally {
     process.chdir(cwd);
     if (oldDir === undefined) delete process.env.PI_CODING_AGENT_DIR;

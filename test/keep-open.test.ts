@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtempSync, writeFileSync, rmSync, readdirSync } from "node:fs";
+import { mkdtempSync, rmSync, readdirSync } from "node:fs";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import childExtension from "../pi-extension/subagents/subagent-done.ts";
@@ -25,13 +26,13 @@ for (const autoExit of [true, false]) {
     const handlers = new Map<string, Function[]>();
     const tools = new Map<string, any>();
     let shutdowns = 0;
+    const manager = SessionManager.open(session);
     const ctx = { isIdle: () => true, hasPendingMessages: () => false,
-      shutdown: () => { shutdowns++; }, sessionManager: { getSessionFile: () => session } };
+      shutdown: () => { shutdowns++; }, sessionManager: manager };
     const emit = async (event: string, data = {}) => {
       for (const handler of handlers.get(event) ?? []) await handler(data, ctx);
     };
-    const snapshot = (text: string) => writeFileSync(session, JSON.stringify({ type: "message", id: text,
-      message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text }] } }) + "\n");
+    const snapshot = (text: string) => manager.appendMessage({ role: "assistant", stopReason: "stop", content: [{ type: "text", text }] } as any);
     try {
       childExtension({ on: (name: string, handler: Function) => {
         const list = handlers.get(name) ?? []; list.push(handler); handlers.set(name, list);
@@ -68,6 +69,9 @@ for (const autoExit of [true, false]) {
       await emit("before_agent_start");
       snapshot("closing");
       await tools.get("subagent_done").execute("close", { close: true }, undefined, undefined, ctx);
+      assert.equal(shutdowns, 0, "tool only stages closure");
+      await emit("agent_end", { messages: [{ role: "assistant", stopReason: "toolUse" }] });
+      await emit("agent_settled", { aborted: false });
       assert.equal(shutdowns, 1);
       const closed = await waitForCompletion(new AbortController().signal, {
         intervalMs: 1, sessionFile: session, runId, readTerminalTail: async () => "",

@@ -4,7 +4,7 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 interface Role { name: string; disableModelInvocation?: boolean; body?: string; skills?: string }
 interface Dependencies {
   skillPath: string;
-  discoverRoles: () => Role[];
+  discoverRoles: (ctx: ExtensionCommandContext) => Role[];
   terminalAvailable: () => boolean;
   terminalHint: () => string;
 }
@@ -14,7 +14,7 @@ export function planningPreflight(pi: ExtensionAPI, ctx: ExtensionCommandContext
   const active = new Set(pi.getActiveTools());
   const missing = ["plan_read", "plan_update", "subagent", "read", "bash", "write", "edit"].filter(name => !active.has(name));
   if (missing.length) throw new Error(`Missing active tools: ${missing.join(", ")}. Enable them in Pi's tool selection and reload the subagents package if plan tools are absent.`);
-  const roles = deps.discoverRoles();
+  const roles = deps.discoverRoles(ctx);
   const required = ["scout", "planner", "worker", "reviewer"].map(name => {
     const role = roles.find(role => role.name === name && !role.disableModelInvocation && role.body?.trim());
     if (!role) throw new Error(`Required role '${name}' is unavailable or disabled. Restore its agent definition or remove the disabling override, then retry /plan.`);

@@ -32,11 +32,17 @@ export interface AgentDefinition {
   commandTemplate?: string;
   body?: string;
   disableModelInvocation?: boolean;
+  source?: "package" | "global" | "project";
+  sourcePath?: string;
+  sourceHash?: string;
+  sourceCwd?: string;
 }
 
 export interface SubagentLaunchContext {
   /** Closed-session reopen: deliver only the new message, never the original task/skills. */
   resume?: boolean;
+  /** Current parent's denial, applied without rewriting a saved profile. */
+  denyProjectConfig?: boolean;
   launchProfile?: import("../launch-profile.ts").LaunchProfile;
   lineage?: import("../lineage.ts").Lineage;
   params: SubagentLaunchParams;

@@ -5,8 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { PlanPersistence } from "../pi-extension/subagents/plan-persistence.ts";
-import { registerPlanTools } from "../pi-extension/subagents/plan-tools.ts";
-import { PLAN_CONTEXT_BYTES, PLAN_CONTEXT_TYPE, projectPlanContext, summarizePlan } from "../pi-extension/subagents/plan-context.ts";
+import { registerPlanTools, planMutationReceipt } from "../pi-extension/subagents/plan-tools.ts";
+import { PLAN_CONTEXT_BYTES, PLAN_CONTEXT_TYPE, planContext, registerPlanContext, summarizePlan } from "../pi-extension/subagents/plan-context.ts";
 import * as store from "../pi-extension/subagents/plan-store.ts";
 
 function fixture() {
@@ -14,98 +14,144 @@ function fixture() {
   const sm = SessionManager.create(dir, dir);
   sm.appendMessage({ role: "user", content: "Plan work", timestamp: 1 });
   const p = new PlanPersistence((type, data) => { sm.appendCustomEntry(type, data); }, false);
-  return { sm, p, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+  const events = new Map<string, Function>();
+  registerPlanContext({ on: (name, handler) => events.set(name, handler) } as any, p);
+  const ctx = { sessionManager: sm };
+  const publication = () => events.get("before_agent_start")!({}, ctx)?.message;
+  const persist = (message: any) => sm.appendCustomMessageEntry(message.customType, message.content, message.display, message.details);
+  return { sm, p, ctx, events, publication, persist, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
 }
 
-test("native retain-none compaction, subsequent mutation and branch selection project current state without writes", () => {
-  const { sm, p, cleanup } = fixture();
+test("native compaction/reload/branch restore current state once without ordinary request-time tails", () => {
+  const f = fixture(); const { sm, p } = f;
   try {
+    assert.equal(f.publication(), undefined, "no routine empty-plan messages");
     let plan = p.create(sm, 0, "Current 日本語 🚀");
     plan = p.mutate(sm, plan.planId, plan.revision, (s, c) => store.addTask(s, c, "Implementation"));
     const oldLeaf = sm.getLeafId()!;
-    const previous = projectPlanContext(sm.buildSessionContext().messages, p.read(sm));
-    const compactId = sm.appendCompaction("No retained plan details", null, 10000);
-    const compact = sm.getEntry(compactId);
-    assert.equal(compact?.type, "compaction");
-    assert.equal((compact as any).firstKeptEntryId, compactId);
-    const native = sm.buildSessionContext().messages;
-    assert.ok(native.some(message => message.role === "compactionSummary"));
-    assert.ok(!JSON.stringify(native).includes(plan.planId));
+    const initial = f.publication(); f.persist(initial);
+    assert.equal(f.publication(), undefined);
+    assert.equal(f.events.get("context")!({ messages: sm.buildSessionContext().messages }, f.ctx), undefined);
+    sm.appendCompaction("No retained plan details", null, 10000);
     plan = p.mutate(sm, plan.planId, plan.revision, (s, c) => store.block(s, c, s.tasks[0].taskId, "Need approval 日本語 🚀"));
     const bytes = readFileSync(sm.getSessionFile()!, "utf8");
-    const projected = projectPlanContext(native, p.read(sm));
-    const text = String((projected.at(-1) as any).content);
-    assert.match(text, new RegExp(`planId=${plan.planId} revision=2`));
-    assert.match(text, /blocked.*Need approval 日本語 🚀/);
-    assert.match(text, /plan_read/);
-    assert.equal(readFileSync(sm.getSessionFile()!, "utf8"), bytes);
-    assert.deepEqual(projectPlanContext(projected, p.read(sm)), projected);
+    const native = sm.buildSessionContext().messages;
+    const fallback = f.events.get("context")!({ messages: native }, f.ctx).messages;
+    assert.match(fallback.at(-1).content, /revision=2/);
+    assert.match(fallback.at(-1).content, /blocked.*Need approval 日本語 🚀/);
+    assert.equal(readFileSync(sm.getSessionFile()!, "utf8"), bytes, "compaction fallback is read-only");
+    assert.deepEqual(f.events.get("context")!({ messages: fallback }, f.ctx).messages, fallback);
+    f.persist(f.publication());
+    assert.equal(f.publication(), undefined);
+    const reopened = SessionManager.open(sm.getSessionFile()!);
+    assert.equal(f.events.get("before_agent_start")!({}, { sessionManager: reopened }), undefined, "visible persisted state deduplicates after restart");
     sm.branch(oldLeaf);
-    const historical = String((projectPlanContext(previous, p.read(sm)).at(-1) as any).content);
-    assert.match(historical, /revision=1/); assert.match(historical, /read-only/); assert.doesNotMatch(historical, /Need approval/);
+    const historical = f.publication();
+    assert.match(historical.content, /revision=1/); assert.match(historical.content, /read-only/); assert.doesNotMatch(historical.content, /Need approval/);
     sm.resetLeaf();
-    const none = projectPlanContext(previous, p.read(sm));
-    assert.match(String((none.at(-1) as any).content), /No readable active plan/);
-    assert.doesNotMatch(String((none.at(-1) as any).content), new RegExp(plan.planId));
-  } finally { cleanup(); }
+    assert.equal(f.publication(), undefined, "an empty sibling does not inherit prior publication state");
+  } finally { f.cleanup(); }
 });
 
-test("projection preserves unrelated messages, bounds Unicode and exposes counts and omitted details", () => {
-  const { sm, p, cleanup } = fixture();
+test("bounded Unicode summary preserves access, task counts, blockers and conditional detail guidance", () => {
+  const f = fixture(); const { sm, p } = f;
   try {
     let plan = p.create(sm, 0, "Unicode 🚀 日本語 ".repeat(250));
     for (let i = 0; i < 40; i++) plan = p.mutate(sm, plan.planId, plan.revision, (s, c) => store.addTask(s, c, `Task ${i} 🚀 日本語 `.repeat(200)));
     plan = p.mutate(sm, plan.planId, plan.revision, (s, c) => store.block(s, c, s.tasks[39].taskId, "Approval 🚀 日本語 ".repeat(300)));
-    const user: any = { role: "user", content: PLAN_CONTEXT_TYPE, timestamp: 2 };
-    const unrelated: any = { role: "custom", customType: "other-extension", content: "Keep 🚀", display: false, timestamp: 3 };
-    const sameType: any = { ...unrelated, customType: PLAN_CONTEXT_TYPE };
-    const input = [user, unrelated, sameType];
-    const copy = structuredClone(input);
-    const output = projectPlanContext(input, p.read(sm));
-    assert.deepEqual(input, copy); assert.deepEqual(output.slice(0, 3), input);
-    assert.equal(output[0], user); assert.equal(output[1], unrelated);
-    const text = String((output.at(-1) as any).content);
+    const text = summarizePlan(p.read(sm));
     assert.ok(Buffer.byteLength(text, "utf8") <= PLAN_CONTEXT_BYTES);
-    assert.equal(Buffer.from(text, "utf8").toString("utf8"), text);
-    assert.doesNotMatch(text, /\uFFFD|[\uD800-\uDBFF](?![\uDC00-\uDFFF])/u);
-    assert.match(text, /accepted=0\/40/); assert.match(text, /blocked=1/); assert.match(text, /tasks omitted/); assert.match(text, /Details omitted/);
+    assert.equal(text.isWellFormed(), true);
+    assert.match(text, /accepted=0\/40/); assert.match(text, /blocked=1/); assert.match(text, /tasks omitted/);
+    assert.match(text, /when details are needed/); assert.doesNotMatch(text, /Read plan_read\(\{\}\)/);
     assert.match(text, new RegExp(plan.tasks[39].taskId));
-    assert.equal(projectPlanContext(output, p.read(sm)).length, 4);
-    const child = new PlanPersistence(() => { throw new Error("No writes"); }, true);
+    const child = new PlanPersistence(() => assert.fail("No writes"), true);
     assert.match(summarizePlan(child.read(sm)), /read-only/);
-    assert.doesNotMatch(summarizePlan(child.read(sm)), /parent-writable/);
-    const foreign = { ...p.read(sm), writable: false, detachRequired: "foreign" as const, error: "Foreign inherited plan" };
-    assert.match(summarizePlan(foreign), /read-only; foreign copy requires explicit detach/);
-  } finally { cleanup(); }
+    assert.match(summarizePlan({ ...p.read(sm), writable: false, detachRequired: "foreign", error: "Foreign inherited plan" }), /read-only; foreign copy requires explicit detach/);
+    assert.equal(planContext({ writable: false, recoveryUncertain: [], error: "Child sessions cannot write parent plans" }), undefined);
+    assert.doesNotMatch(planContext({ ...p.read(sm), error: "Plan append failed; durability uncertain" })!, new RegExp(plan.planId));
+  } finally { f.cleanup(); }
 });
 
-test("registered tools and every context call share the actual persistence, with no send/append projection", async () => {
-  const { sm, cleanup } = fixture();
+test("50-task single-change receipt is at least 70% smaller and retains full UI details", async () => {
+  const f = fixture(); const prior = [process.env.PI_SUBAGENT_ID, process.env.PI_SUBAGENT_SESSION];
+  delete process.env.PI_SUBAGENT_ID; delete process.env.PI_SUBAGENT_SESSION;
+  try {
+    const tools = new Map<string, any>();
+    const persistence = registerPlanTools({ on() {}, registerTool: tool => tools.set(tool.name, tool), registerCommand() {},
+      appendEntry: (type, data) => f.sm.appendCustomEntry(type, data) } as any);
+    let plan = persistence.create(f.sm, 0, "Benchmark");
+    for (let i = 0; i < 50; i++) plan = persistence.mutate(f.sm, plan.planId, plan.revision, (s, c) => store.addTask(s, c, `Task ${i}`));
+    const result = await tools.get("plan_update").execute("id", { expectedRevision: plan.revision,
+      command: { action: "status", planId: plan.planId, taskId: plan.tasks[0].taskId, transition: "block", reason: "Need review" } }, undefined, undefined, f.ctx);
+    const receipt = JSON.parse(result.content[0].text);
+    assert.equal(receipt.revision, 51); assert.equal(receipt.tasks.length, 1);
+    assert.equal(receipt.tasks[0].taskId, plan.tasks[0].taskId); assert.equal(receipt.tasks[0].status, "blocked");
+    assert.equal(result.details.tasks.length, 50); assert.equal(result.details.tasks[0].statusReason, "Need review");
+    const oldBytes = Buffer.byteLength(JSON.stringify({ planId: result.details.planId, revision: result.details.revision, authority: result.details.authority, tasks: result.details.tasks }, null, 2));
+    const newBytes = Buffer.byteLength(result.content[0].text);
+    assert.ok(newBytes <= oldBytes * 0.3, `${newBytes}/${oldBytes} bytes`);
+    console.log(`50-task receipt: ${oldBytes} -> ${newBytes} bytes (${(100 * (1 - newBytes / oldBytes)).toFixed(1)}% smaller)`);
+    assert.equal(PLAN_CONTEXT_TYPE, "pi-subagents-plan-context/v1");
+  } finally {
+    for (const [i, name] of ["PI_SUBAGENT_ID", "PI_SUBAGENT_SESSION"].entries()) { if (prior[i] === undefined) delete process.env[name]; else process.env[name] = prior[i]; }
+    f.cleanup();
+  }
+});
+
+test("mutation receipts expose every generated task, attempt, criterion/artifact and evidence ID", () => {
+  const authority = { sessionId: "s", branchInstanceId: "b" };
+  let plan = store.createPlan("IDs", authority);
+  const ctx = () => ({ ...authority, expectedRevision: plan.revision });
+  const criterion = store.createCriterion("Verified"), artifact = store.createArtifact("test/report.md");
+  let previous = plan;
+  plan = store.addTask(plan, ctx(), "Task", { criteria: [criterion], artifacts: [artifact] });
+  let receipt = planMutationReceipt(plan, previous);
+  assert.equal(receipt.tasks[0].taskId, plan.tasks[0].taskId);
+  assert.deepEqual(receipt.tasks[0].criterionIds, [criterion.criterionId]);
+  assert.deepEqual(receipt.tasks[0].artifactIds, [artifact.artifactId]);
+  previous = plan; plan = store.startAttempt(plan, ctx(), plan.tasks[0].taskId);
+  receipt = planMutationReceipt(plan, previous);
+  assert.deepEqual(receipt.tasks[0].attemptIds, [plan.tasks[0].attempts[0].attemptId]);
+  previous = plan; plan = store.addEvidence(plan, ctx(), plan.tasks[0].taskId, { criterionId: criterion.criterionId, ref: "test/report.md", artifactId: artifact.artifactId });
+  receipt = planMutationReceipt(plan, previous);
+  assert.deepEqual(receipt.tasks[0].evidenceIds, [plan.tasks[0].evidence[0].evidenceId]);
+  assert.deepEqual(receipt.tasks[0].attemptIds, []);
+  assert.deepEqual(planMutationReceipt(plan, plan).tasks, []);
+});
+
+test("a complete review/evidence/acceptance command sequence uses receipt IDs, with unchanged CAS/authority errors", async () => {
+  const f = fixture();
   const prior = [process.env.PI_SUBAGENT_ID, process.env.PI_SUBAGENT_SESSION];
   delete process.env.PI_SUBAGENT_ID; delete process.env.PI_SUBAGENT_SESSION;
   try {
-    const events = new Map<string, Function>(); const tools = new Map<string, any>();
-    let appends = 0;
-    registerPlanTools({
-      on: (name, handler) => events.set(name, handler),
-      registerTool: tool => tools.set(tool.name, tool), registerCommand() {},
-      sendMessage() { assert.fail("Plan projection must not wake the model"); },
-      sendUserMessage() { assert.fail("Plan projection must not start a turn"); },
-      appendEntry: (type, data) => { appends++; sm.appendCustomEntry(type, data); },
-    } as any);
-    const ctx = { sessionManager: sm };
-    const call = (command: any, expectedRevision: number) => tools.get("plan_update").execute("id", { command, expectedRevision }, undefined, undefined, ctx);
-    const first = await call({ action: "create", title: "First" }, 0);
-    const before = events.get("context")!({ messages: [] }, ctx);
-    assert.match(before.messages.at(-1).content, /revision=0/);
-    await call({ action: "add", planId: first.details.planId, title: "Latest" }, 0);
-    const after = events.get("context")!({ messages: before.messages }, ctx);
-    assert.match(after.messages.at(-1).content, /revision=1/); assert.match(after.messages.at(-1).content, /Latest/);
-    assert.equal(after.messages.length, 1); assert.equal(appends, 2);
-    assert.equal(events.has("before_agent_start"), false);
-    assert.equal(sm.getEntries().filter(entry => entry.type === "custom_message").length, 0);
+    const tools = new Map<string, any>();
+    registerPlanTools({ on() {}, registerTool: tool => tools.set(tool.name, tool), registerCommand() {},
+      appendEntry: (type, data) => f.sm.appendCustomEntry(type, data) } as any);
+    const invoke = async (command: any, expectedRevision: number) => JSON.parse((await tools.get("plan_update").execute("id", { command, expectedRevision }, undefined, undefined, f.ctx)).content[0].text);
+    await tools.get("plan_read").execute("read", {}, undefined, undefined, f.ctx); // read-first contract
+    let receipt = await invoke({ action: "create", title: "Receipt workflow" }, 0);
+    const planId = receipt.planId, authority = receipt.authority;
+    const criterion = store.createCriterion("Parent verifies a passing check");
+    receipt = await invoke({ action: "add", planId, title: "Implementation", details: { criteria: [criterion] } }, receipt.revision);
+    const taskId = receipt.tasks[0].taskId;
+    receipt = await invoke({ action: "attempt", planId, taskId, mode: "start" }, receipt.revision);
+    const attemptId = receipt.tasks[0].attemptIds[0];
+    receipt = await invoke({ action: "run", planId, taskId, attemptId, runId: "synthetic-run" }, receipt.revision);
+    const result = { eventId: "synthetic-event", runId: "synthetic-run", ref: "test/synthetic.md" };
+    await assert.rejects(invoke({ action: "result", planId, taskId, attemptId, origin: { ...authority, sessionId: "foreign" }, result }, receipt.revision), /authority mismatch/);
+    receipt = await invoke({ action: "result", planId, taskId, attemptId, origin: authority, result }, receipt.revision);
+    assert.equal(receipt.tasks[0].status, "in_review");
+    await assert.rejects(invoke({ action: "accept", planId, taskId, criteria: {}, reason: "No evidence yet" }, receipt.revision), /Map ALL criteria/);
+    receipt = await invoke({ action: "evidence", planId, taskId, evidence: { criterionId: criterion.criterionId, ref: "test/synthetic.md#passed", resultEventId: result.eventId } }, receipt.revision);
+    const evidenceId = receipt.tasks[0].evidenceIds[0];
+    receipt = await invoke({ action: "accept", planId, taskId, criteria: { [criterion.criterionId]: [evidenceId] }, reason: "Parent verified the evidence" }, receipt.revision);
+    assert.equal(receipt.tasks[0].status, "accepted");
+    await assert.rejects(invoke({ action: "edit", planId, taskId, patch: { title: "Stale edit" } }, 0), /Revision conflict/);
+    receipt = await invoke({ action: "edit", planId, taskId, patch: { title: "Revised definition" } }, receipt.revision);
+    assert.equal(receipt.tasks[0].status, "in_review", "definition edits still invalidate acceptance");
   } finally {
     for (const [i, name] of ["PI_SUBAGENT_ID", "PI_SUBAGENT_SESSION"].entries()) { if (prior[i] === undefined) delete process.env[name]; else process.env[name] = prior[i]; }
-    cleanup();
+    f.cleanup();
   }
 });

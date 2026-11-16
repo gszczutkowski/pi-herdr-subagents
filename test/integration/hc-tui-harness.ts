@@ -3,10 +3,11 @@ import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, watch, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
+import { getAgentConfigDir } from "../../pi-extension/subagents/discovery.ts";
 import { HcClient, bashPath, findHcExecutable } from "../../pi-extension/subagents/hc.ts";
 import { runScriptInPane, shellQuote } from "../../pi-extension/subagents/terminal.ts";
-import { probeProcess } from "../../pi-extension/subagents/process-identity.ts";
+import { isProtectedProcess, probeProcess, sameProcess } from "../../pi-extension/subagents/process-identity.ts";
 import { canonicalSessionPath } from "../../pi-extension/subagents/ownership.ts";
 
 export function jsonLines(path: string): any[] {
@@ -32,6 +33,14 @@ export function until<T>(directory: string, check: () => T | undefined, label: s
   });
 }
 
+/** Metadata may be commented by both the driver and terminal writer. Never
+ * accept an executable line or multiple ambiguous terminal declarations. */
+export function childSurface(script: string): string {
+  const matches = [...script.matchAll(/^#(?:[ \t]*#)*[ \t]*Surface: (t[a-z0-9]+)\r?$/gm)];
+  assert.equal(matches.length, 1, "Exactly one commented child Surface required");
+  return matches[0][1];
+}
+
 export class HcTuiRun {
   readonly root = resolve(import.meta.dirname, "../..");
   readonly id = randomUUID();
@@ -39,6 +48,7 @@ export class HcTuiRun {
   readonly evidence: string;
   readonly parentSession: string;
   readonly events: string;
+  readonly profile: string;
   readonly hc: HcClient;
   readonly owned = new Set<string>();
   parent = "";
@@ -53,23 +63,34 @@ export class HcTuiRun {
     mkdirSync(this.evidence, { recursive: true });
     this.parentSession = join(this.evidence, "parent.jsonl");
     this.events = join(this.evidence, "events.jsonl");
+    this.profile = join(this.scratch, "profile");
+    mkdirSync(this.profile);
+    writeFileSync(join(this.profile, "subagent-trust.json"), JSON.stringify({
+      projectAgentDirectories: [join(this.scratch, ".pi", "agents")], agentDirectories: [],
+    }));
     writeFileSync(this.events, "");
     const executable = findHcExecutable();
     if (!executable) throw new Error("HC executable unavailable");
     this.hc = new HcClient(executable);
     const entry = join(this.root, "pi-extension/subagents/index.ts");
+    const cli = join(this.root, "node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js");
+    const cliVersion = execFileSync(process.execPath, [cli, "--version"], { encoding: "utf8" }).trim();
+    const sourceFiles = (directory: string): string[] => readdirSync(directory, { withFileTypes: true }).flatMap(item =>
+      item.isDirectory() ? sourceFiles(join(directory, item.name)) : [join(directory, item.name)]);
     this.save("environment.json", {
       journey, id: this.id, scratch: this.scratch, node: process.version, argv: process.argv, execArgv: process.execArgv,
-      pi: execFileSync("bash", ["-lc", "pi --version"], { encoding: "utf8" }).trim(),
+      pi: cliVersion, cli, nodeExecutable: process.execPath,
       hc: execFileSync(executable, ["server", "status"], { encoding: "utf8" }).trim(),
       branch: execFileSync("git", ["branch", "--show-current"], { encoding: "utf8" }).trim(),
       commit: execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
       entry, sha256: createHash("sha256").update(readFileSync(entry)).digest("hex"),
-      sourceHashes: Object.fromEntries(["index.ts", "subagent-done.ts", "live-continuation.ts", "close-control.ts", "session-audit.ts", "process-identity.ts"].map(name =>
-        [name, createHash("sha256").update(readFileSync(join(this.root, "pi-extension/subagents", name))).digest("hex")])),
+      sourceHashes: Object.fromEntries([...sourceFiles(join(this.root, "pi-extension/subagents")),
+        ...sourceFiles(join(this.root, "test/integration")), join(this.root, "package.json"), join(this.root, "package-lock.json")]
+        .map(path => [path.slice(this.root.length + 1).replaceAll("\\", "/"), createHash("sha256").update(readFileSync(path)).digest("hex")])),
+      workingTree: execFileSync("git", ["status", "--porcelain=v1"], { encoding: "utf8" }),
       sourceRoot: this.root,
       model: process.env.PI_TEST_MODEL || "openai-codex/gpt-6.1-sol",
-      isolation: "Scratch PATH wrapper: -ne plus explicit observer; parent explicit worktree index, child explicit production done extension. Original agent directory and credentials unchanged.",
+      isolation: "Pinned local CLI; isolated scratch profile with exact project-role approval. Native test auth bridge resolves the original credential store without copying credentials or changing global settings. Observer never fabricates results.",
     });
     mkdirSync(join(this.scratch, ".pi", "agents"), { recursive: true });
     writeFileSync(join(this.scratch, ".pi", "agents", "verify-worker.md"), `---\nname: verify-worker\ndescription: Disposable live verification worker\nmodel: ${process.env.PI_TEST_MODEL || "openai-codex/gpt-6.1-sol"}\nthinking: minimal\ntools: read,bash,write\nauto-exit: true\n---\nExecute the exact assigned verification task. Never delegate. Use bash for marker side effects. Call subagent_done as requested. Do not commit or edit source.\n`);
@@ -77,8 +98,8 @@ export class HcTuiRun {
     // Gate work is intentionally event-driven and runs inside the child's actual bash tool.
     writeFileSync(join(this.scratch, "gate.mjs"), `import fs from 'node:fs';\nconst n=process.argv[2];fs.writeFileSync(n+'.started','STARTED');\nawait new Promise((resolve,reject)=>{let w;const t=setTimeout(()=>{w?.close();reject(Error('gate timeout'))},240000);const check=()=>{if(fs.existsSync(n+'.release')){clearTimeout(t);w?.close();resolve()}};w=fs.watch('.',check);check()});\nfs.writeFileSync(n+'.txt',n);\n`);
     const bin = join(this.scratch, "bin"); mkdirSync(bin);
-    const realPi = execFileSync("bash", ["-lc", "command -v pi"], { encoding: "utf8" }).trim();
-    writeFileSync(join(bin, "pi"), `#!/bin/bash\nexport PI_TEST_HC_EVENTS=${shellQuote(this.events)} PI_TEST_HC_SCRATCH=${shellQuote(this.scratch)}\nexec ${shellQuote(realPi)} -ne -e ${shellQuote(join(this.root, "test/integration/hc-observer.ts"))} "$@"\n`, { mode: 0o755 });
+    const originalProfile = getAgentConfigDir();
+    writeFileSync(join(bin, "pi"), `#!/bin/bash\nexport PI_TEST_HC_TUI=1 PI_TEST_MODEL=${shellQuote(process.env.PI_TEST_MODEL || "openai-codex/gpt-6.1-sol")} PI_TEST_HC_AUTH_DIR=${shellQuote(originalProfile)} PI_CODING_AGENT_DIR=${shellQuote(this.profile)} PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 PI_TEST_HC_EVENTS=${shellQuote(this.events)} PI_TEST_HC_SCRATCH=${shellQuote(this.scratch)}\nexec ${shellQuote(bashPath(process.execPath))} ${shellQuote(bashPath(cli))} -ne -e ${shellQuote(join(this.root, "test/integration/hc-auth.ts"))} -e ${shellQuote(join(this.root, "test/integration/hc-observer.ts"))} "$@"\n`, { mode: 0o755 });
     this.save("state.json", { scratch: this.scratch, evidence: this.evidence, owned: [] });
   }
   save(name: string, data: unknown) { writeFileSync(join(this.evidence, name), JSON.stringify(data, null, 2)); }
@@ -135,8 +156,7 @@ export class HcTuiRun {
   registerChild(details: any) {
     assert.ok(details.id && details.sessionFile && details.launchScriptFile);
     const script = readFileSync(details.launchScriptFile, "utf8");
-    const surface = script.match(/^# Surface: (t[a-z0-9]+)\r?$/m)?.[1];
-    assert.ok(surface, "Child surface must come from production launch artifact");
+    const surface = childSurface(script);
     assert.notEqual(surface, process.env.HC_TERMINAL_ID);
     this.owned.add(surface);
     this.save("state.json", { scratch: this.scratch, evidence: this.evidence, owned: [...this.owned] });
@@ -207,34 +227,62 @@ export class HcTuiRun {
   async finish(error?: unknown) {
     this.save("assertions.json", { journey: this.journey, passed: !error, assertions: this.assertions, error: error ? String(error) : undefined, at: Date.now(), parentToolOutcomes: this.observed().filter(e => e.session === this.parentSession && e.kind === "tool_end") });
     const cleanup: any[] = [];
+    const unresolved: any[] = [];
     try { await this.capture("final"); } catch (error) { cleanup.push({ captureError: String(error) }); }
     // Recover child ownership even when an assertion failed immediately after launch.
     for (const event of this.results()) {
       try { if (event.data.result.details?.launchScriptFile) this.registerChild(event.data.result.details); } catch { /* Keep cleanup going. */ }
     }
+    // Recover only surfaces recorded in this exact parent's prepared durable
+    // runs, even if dispatch failed before a tool acknowledgement/start event.
+    try {
+      for (const run of Object.values(this.manifest().runs) as any[]) {
+        if (!run.surface || this.owned.has(run.surface)) continue;
+        try {
+          assert.match(run.surface, /^t[a-z0-9]+$/);
+          assert.notEqual(run.surface, process.env.HC_TERMINAL_ID);
+          assert.ok(typeof run.launchScriptFile === "string" &&
+            resolve(run.launchScriptFile).startsWith(resolve(this.artifactDirectory()) + sep), "Launch artifact outside this parent's custody");
+          assert.equal(childSurface(readFileSync(run.launchScriptFile, "utf8")), run.surface);
+          this.owned.add(run.surface);
+        } catch (ownershipError) {
+          // One damaged artifact must neither adopt an unverified surface nor
+          // prevent later verifiable children from being cleaned up.
+          unresolved.push({ runId: run.id, surface: run.surface, error: String(ownershipError) });
+        }
+      }
+    } catch (ownershipError) { unresolved.push({ error: String(ownershipError) }); }
     for (const event of this.observed()) {
-      if (event.terminal && event.terminal !== process.env.HC_TERMINAL_ID) this.owned.add(event.terminal);
-      if (event.session && event.session !== this.parentSession && existsSync(event.session)) {
-        copyFileSync(event.session, join(this.evidence, `session-${event.terminal}.jsonl`));
+      // Observations are evidence, not permission to adopt an arbitrary terminal.
+      if (event.session && event.session !== this.parentSession && this.owned.has(event.terminal) && existsSync(event.session)) {
+        try {
+          const identity = createHash("sha256").update(canonicalSessionPath(event.session)).digest("hex").slice(0, 16);
+          copyFileSync(event.session, join(this.evidence, `session-${event.terminal}-${identity}.jsonl`));
+        } catch (copyError) { cleanup.push({ sessionCopyError: String(copyError) }); }
       }
     }
     for (const terminal of [...this.owned].reverse()) {
       try { this.hc.close(terminal); cleanup.push({ terminal, inspection: await this.hc.inspect(terminal) }); }
       catch (error) { cleanup.push({ terminal, error: String(error) }); }
     }
-    const allMissing = cleanup.filter(x => x.terminal).every(x => x.inspection?.kind === "missing");
-    this.save("cleanup.json", { at: Date.now(), allMissing, terminals: cleanup });
+    const allMissing = unresolved.length === 0 && cleanup.filter(x => x.terminal).every(x => x.inspection?.kind === "missing");
+    this.save("cleanup.json", { at: Date.now(), allMissing, unresolved, terminals: cleanup });
     // Retain scratch on failure: gate files and launch inputs are diagnostic evidence.
     // Windows may retain directory handles briefly after HC reports terminal removal.
     if (!error && allMissing) rmSync(this.scratch, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
-    assert.ok(allMissing, "All owned HC terminals must be removed");
+    assert.ok(allMissing, "All owned HC terminals must be removed, with no unresolved ownership");
   }
   parentPid() {
     return this.observed().findLast(e => e.kind === "session_start" && e.terminal === this.parent)?.pid as number;
   }
   async killParent() {
     const pid = this.parentPid(); assert.ok(pid);
+    assert.ok(this.owned.has(this.parent)); assert.notEqual(this.parent, process.env.HC_TERMINAL_ID);
+    const start = this.observed().findLast(e => e.kind === "session_start" && e.terminal === this.parent);
     const before = probeProcess(pid); assert.equal(before.kind, "present");
+    assert.equal(start?.data.process?.kind, "present", "Saved startup PID/birth evidence required");
+    assert.ok(before.kind === "present" && sameProcess(before.identity, start.data.process.identity), "Never signal a reused PID");
+    assert.equal(isProtectedProcess(pid), false, "Never signal self, ancestor, or uncertain ancestry");
     process.kill(pid, "SIGKILL");
     // OS probe is bounded and does not ask a model to poll. Windows process exit can lag termination.
     const deadline = Date.now() + 10_000;

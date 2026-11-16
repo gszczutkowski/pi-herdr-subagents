@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { canonicalSessionPath } from "../pi-extension/subagents/ownership.ts";
-import { projectRecoveryContext, recoveryReport, registerRecoveryReport, RECOVERY_CONTEXT_TYPE } from "../pi-extension/subagents/recovery-report.ts";
+import { recoveryContext, recoveryReport, registerRecoveryReport } from "../pi-extension/subagents/recovery-report.ts";
 import type { RuntimeManifest } from "../pi-extension/subagents/runtime-store.ts";
 
 function manifest(): RuntimeManifest {
@@ -26,7 +26,7 @@ test("unbound assignments expose saved evidence and distinct delivery states wit
   assert.deepEqual(saved, before, "report is read-only");
 });
 
-test("bounded list/detail and replaceable context preserve unrelated messages", () => {
+test("bounded list/detail and meaningful context preserve Unicode and omit empty recovery", () => {
   const saved = manifest();
   for (let i = 0; i < 50; i++) saved.runs[`run${i}`] = { ...saved.runs.run, id: `run${i}`, task: '"\n😀'.repeat(20000), sessionFile: "x".repeat(10000) };
   const report = recoveryReport({ manifest: saved }, { limit: 20 });
@@ -34,14 +34,11 @@ test("bounded list/detail and replaceable context preserve unrelated messages", 
   assert.match(report, /More assignments/);
   assert.ok(Buffer.byteLength(recoveryReport({ manifest: saved }, { runId: "run1" })) <= 24000);
   for (const options of [{ limit: 21 }, { limit: 0 }, { offset: -1 }, { offset: NaN }]) assert.throws(() => recoveryReport({ manifest: saved }, options), /bounds/);
-  const original: any[] = [{ role: "user", content: "keep", timestamp: 1 }];
-  let messages = projectRecoveryContext(original, { manifest: saved });
-  messages = projectRecoveryContext(messages, { manifest: saved });
-  assert.equal(messages.length, 2);
-  assert.deepEqual(messages[0], original[0]);
-  assert.ok(Buffer.byteLength(String((messages[1] as any).content)) <= 4096);
-  assert.equal((messages[1] as any).customType, RECOVERY_CONTEXT_TYPE);
-  assert.deepEqual(projectRecoveryContext(messages, {}), original);
+  const context = recoveryContext({ manifest: saved })!;
+  assert.ok(Buffer.byteLength(context) <= 4096);
+  assert.equal(context.isWellFormed(), true);
+  assert.equal(recoveryContext({}), undefined);
+  assert.match(recoveryContext({ diagnostics: ["Task import pending: revision conflict"] })!, /Task import pending/);
 });
 
 test("blocked and paused diagnostics grant no control; missing legacy manifests are explicit", async () => {
@@ -55,8 +52,8 @@ test("blocked and paused diagnostics grant no control; missing legacy manifests 
   assert.equal(result.isError, true);
   assert.match(result.content[0].text, /Host unavailable/);
   assert.equal(commands[0][0], "subagents-recovery");
-  assert.equal(hooks.size, 1);
-  assert.ok(hooks.has("context"));
+  assert.equal(hooks.size, 3);
+  assert.ok(hooks.has("context")); assert.ok(hooks.has("before_agent_start")); assert.ok(hooks.has("turn_end"));
 });
 
 test("real Pi RPC startup discovers unbound work and serves recovery command without a model turn", { timeout: 60000 }, async () => {

@@ -5,19 +5,23 @@ import { Box, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { ACTIVE_ACCENT, OPEN_ACCENT, borderLine, borderTop, borderBottom, framedMessage } from "./frame.ts";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
 import { resolveSubagentCwd } from "./paths.ts";
+import { resolveRoleInstructions } from "./role-instructions.ts";
+import { shellComment } from "./shell.ts";
 import { persistLaunchProfile, persistProfileBinding, readPiLaunchProfile, resolveLaunchProfile, resumeLaunchContext } from "./launch-profile.ts";
 import { continueLiveChild } from "./live-continuation.ts";
 import { auditSession, assertSessionWriters } from "./session-audit.ts";
 import { readChildIdentity } from "./recovery-identity.ts";
 import { closeOwnedChild, type CloseResult } from "./close-control.ts";
+import { interruptOwnedChild, type InterruptResult } from "./interrupt-control.ts";
 import { probeProcess, sameProcess, type ProcessIdentity } from "./process-identity.ts";
 import { prepareLaunchRun, registerLaunchedRun } from "./launch-registration.ts";
 import { createLineage, type Lineage } from "./lineage.ts";
 import { recordHistory, registerPlanHistory } from "./history.ts";
 import { registerHistoryView } from "./history-view.ts";
 import { RuntimeStore, readRuntimeManifest, type RuntimeParent } from "./runtime-store.ts";
-import { reconcileRuntime, releaseRecoveredSession } from "./runtime-recovery.ts";
+import { reconcileRuntime, releaseRecoveredSession, type RecoverySupervisor } from "./runtime-recovery.ts";
 import { registerRecoveryReport, type RecoveryView } from "./recovery-report.ts";
 import type { SubagentLaunchContext } from "./harness/types.ts";
 import { fileURLToPath } from "node:url";
@@ -32,14 +36,13 @@ import {
   resolveSubagentLayout,
   runScriptInPane,
   closePane,
-  interruptPane,
   shellQuote,
   readPane,
   readPaneAsync,
   inspectPane,
   setPaneTask,
 } from "./terminal.ts";
-import { waitForCompletion } from "./completion.ts";
+import { waitForCompletion, RetainedCompletionIndex } from "./completion.ts";
 import { canonicalSessionPath, reserveSession, releaseSession, sessionOwners } from "./ownership.ts";
 import {
   buildAuthenticatedModelCatalog,
@@ -59,8 +62,11 @@ import { resolveModelDefault } from "./model-config.ts";
 import { getSubagentConfig } from "./config.ts";
 import { boundSubagentMessage } from "./result-budget.ts";
 import { registerContextGuard } from "./context-guard.ts";
-import { registerContextCheckpoint } from "./context-checkpoint.ts";
+import { registerPayloadDiagnostics } from "./payload-diagnostics.ts";
+import { registerCheckpointContext, registerContextCheckpoint } from "./context-checkpoint.ts";
+import { registerPlanContext } from "./plan-context.ts";
 import { getAgentConfigDir, loadAgentDefaults, discoverAgentDefinitions, buildAvailableAgentCatalog, type AgentDefaults, type SubagentSessionMode } from "./discovery.ts";
+import { authorizedDiscovery, sourceAuthorized, assertAgentDirectoryAuthorized, assertDefinitionAuthorized, type TrustContext } from "./project-trust.ts";
 
 import {
   findLastAssistantMessage,
@@ -155,7 +161,7 @@ const SubagentParams = Type.Object({
     }),
   ),
   systemPrompt: Type.Optional(
-    Type.String({ description: "Appended to system prompt (role instructions)" }),
+    Type.String({ description: "Additional role instructions, appended after the named agent's body (never replaces it). Pi uses the agent's system-prompt append/replace mode; without that mode, delivered with the task in every session mode." }),
   ),
   model: Type.Optional(
     Type.String({
@@ -235,14 +241,16 @@ function resolveDenyTools(agentDefs: AgentDefaults | null): Set<string> {
 function resolveSubagentPaths(
   params: Static<typeof SubagentParams>,
   agentDefs: AgentDefaults | null,
+  ctx: TrustContext,
 ): { effectiveCwd: string | null; localAgentDir: string | null; effectiveAgentDir: string } {
   const rawCwd = params.cwd ?? agentDefs?.cwd ?? null;
   const cwdIsFromAgent = !params.cwd && agentDefs?.cwd != null;
-  const cwdBase = cwdIsFromAgent ? getAgentConfigDir() : process.cwd();
+  const cwdBase = cwdIsFromAgent ? getAgentConfigDir() : ctx.cwd;
   const effectiveCwd = resolveSubagentCwd(rawCwd, cwdBase);
-  const localAgentDir = effectiveCwd ? join(effectiveCwd, ".pi", "agent") : null;
-  const effectiveAgentDir =
-    localAgentDir && existsSync(localAgentDir) ? localAgentDir : getAgentConfigDir();
+  const localAgentDir = join(effectiveCwd ?? ctx.cwd, ".pi", "agent");
+  const effectiveAgentDir = localAgentDir && existsSync(localAgentDir) &&
+    sourceAuthorized(ctx, getAgentConfigDir(), localAgentDir, "agentDirectories", effectiveCwd ?? ctx.cwd)
+    ? localAgentDir : getAgentConfigDir();
   return { effectiveCwd, localAgentDir, effectiveAgentDir };
 }
 
@@ -443,6 +451,9 @@ interface RunningSubagent {
   sentinelFile?: string;
   completionRunId?: string;
   hasTurnResult?: boolean;
+  completionIndex?: RetainedCompletionIndex;
+  observationError?: string;
+  retryObservation?: () => void;
   /**
    * Optional legacy status snapshot retained only for hydrating pre-lifecycle
    * runtime entries after /reload. Live observation uses `lifecycle` only.
@@ -465,7 +476,7 @@ interface SubagentRuntime {
   plans?: PlanPersistence;
   planImportErrors?: Map<string, string>;
   store?: RuntimeStore;
-  stopRecovery?: () => void;
+  stopRecovery?: RecoverySupervisor;
   recoveryError?: string;
   /** Settlements observed while no session-bound context is available. */
   suspendedCompletions?: Map<string, { running: RunningSubagent; result: SubagentResult }>;
@@ -513,7 +524,8 @@ function durableStoreFor(ctx: ExtensionContext): RuntimeStore | undefined {
     sessionFile: canonicalSessionPath(sessionFile), headerId: header.id,
     branchToken: (checkpoint.data as any).branchToken, checkpoint: checkpoint.id,
   });
-  store.isCurrent = () => ownsActiveBranch(runtime.latestCtx, store.snapshot().parent);
+  const storeParent = store.snapshot().parent;
+  store.isCurrent = () => ownsActiveBranch(runtime.latestCtx, storeParent);
   runtime.store = store;
   delivery.store = store;
   return store;
@@ -541,7 +553,9 @@ function readRecoveryView(ctx: ExtensionContext): RecoveryView {
     if (runtime.recoveryError) return { error: runtime.recoveryError };
     runtime.store?.assertCustody();
     return { manifest, paused: manifest?.custodyPaused,
-      diagnostics: [...(runtime.planImportErrors?.values() ?? []), ...(delivery.persistenceError ? [delivery.persistenceError] : [])] };
+      diagnostics: [...(runtime.planImportErrors?.values() ?? []), ...(delivery.persistenceError ? [delivery.persistenceError] : []),
+        ...(runtime.stopRecovery?.status?.().errors.map(failure => `Supervision paused${failure.runId ? ` (${failure.runId})` : ""}: ${failure.error}`) ?? []),
+        ...[...runningSubagents.values()].flatMap(child => child.observationError ? [`${child.name}: ${child.observationError}`] : [])] };
   } catch (error) { return { error: String(error) }; }
 }
 
@@ -587,10 +601,17 @@ async function recoverParentRuntime(ctx: ExtensionContext): Promise<void> {
       enqueueSubagentCompletion(running, { ...evidence, name: run.name, task: run.task,
         summary: evidence.summary ?? evidence.errorMessage ?? "Recovered run-bound completion (no immutable summary)",
         sessionFile: run.sessionFile, elapsed: Math.floor((Date.now() - run.startTime) / 1000) });
-    }, () => runtime.store === store && ownsActiveBranch(runtime.latestCtx, manifest.parent));
+    }, () => runtime.store === store && ownsActiveBranch(runtime.latestCtx, manifest.parent), {
+      maxEventsPerPass: 100,
+      onError: failure => {
+        const current = runtime.latestCtx;
+        if (current?.hasUI) current.ui.notify(`Subagent supervision paused${failure.runId ? ` (${failure.runId})` : ""}: ${failure.error}. Use /subagents-reconcile after fixing storage.`, "warning");
+      },
+    });
     if (runtime.store !== store || !ownsActiveBranch(runtime.latestCtx, manifest.parent)) { stopRecovery(); return; }
     runtime.stopRecovery = stopRecovery;
     store.assertCustody();
+    runtime.recoveryError = undefined;
   } catch (error) {
     if (runtime.latestCtx !== ctx) return;
     runtime.recoveryError = `Subagent recovery paused: ${String(error)}`;
@@ -987,27 +1008,67 @@ function resolveInterruptTarget(params: { id?: string; name?: string }):
   return { error: `Ambiguous subagent name "${requestedName}". Matches: ${candidates}` };
 }
 
-function requestSubagentInterrupt(
+function interruptCustodyGuard(running: RunningSubagent, ctx: ExtensionContext | undefined, signal?: AbortSignal): () => void {
+  const path = canonicalSessionPath(running.sessionFile);
+  const owner = sessionOwners.get(path);
+  if (!owner || owner.runId !== running.id) throw new Error("Interrupt requires a currently owned tracked Pi child");
+  const runId = running.id, cli = running.cli;
+  const store = running.durableStore, parentStore = runtime.store;
+  const binding = JSON.stringify(running.planTask);
+  const parentSession = ctx?.sessionManager.getSessionFile();
+  const parentHeader = ctx?.sessionManager.getHeader?.()?.id;
+  const parentCtx = runtime.latestCtx;
+  const surface = running.surface, activityFile = running.activityFile;
+  return () => {
+    signal?.throwIfAborted();
+    if (runtime.recoveryError) throw new Error(runtime.recoveryError);
+    if (runtime.treeSuspension || running.terminalActionsAllowed === false ||
+        running.id !== runId || running.cli !== cli || runningSubagents.get(runId) !== running ||
+        sessionOwners.get(path) !== owner || owner.runId !== runId || !owner.dispatched ||
+        running.durableStore !== store || runtime.store !== parentStore || JSON.stringify(running.planTask) !== binding ||
+        running.surface !== surface || running.activityFile !== activityFile || canonicalSessionPath(running.sessionFile) !== path ||
+        runtime.latestCtx !== parentCtx || ctx?.sessionManager.getSessionFile() !== parentSession ||
+        ctx?.sessionManager.getHeader?.()?.id !== parentHeader) throw new Error("Interrupt custody/binding/branch changed or is detached/unverified");
+    parentStore?.assertCustody();
+    if (store !== parentStore) store?.assertCustody();
+    if (running.planTask) {
+      if (!store || !ctx || !runtime.plans) throw new Error("Task-bound interrupt requires current durable custody");
+      const view = runtime.plans.read(ctx.sessionManager);
+      const plan = view.snapshot;
+      const task = plan?.tasks.find(t => t.taskId === running.planTask!.taskId);
+      if (!view.writable || plan?.planId !== running.planTask.planId ||
+          JSON.stringify(plan.authority) !== JSON.stringify(running.planTask.authority) ||
+          !task?.attempts.some(a => a.attemptId === running.planTask!.attemptId && a.runIds.includes(running.id))) {
+        throw new Error("Interrupt task binding is not on the current parent branch");
+      }
+    }
+  };
+}
+
+async function requestSubagentInterrupt(
   running: RunningSubagent,
-  interruptPaneKey: (surface: string) => void = interruptPane,
-): { ok: true } | { error: string } {
+  request: typeof interruptOwnedChild = interruptOwnedChild,
+  ctx = runtime.latestCtx,
+  signal?: AbortSignal,
+  guard?: () => void,
+): Promise<InterruptResult | { error: string }> {
   try {
-    if (runtime.treeSuspension || running.terminalActionsAllowed === false) throw new Error("Terminal custody is detached/unverified");
-    running.durableStore?.assertCustody();
-    interruptPaneKey(running.surface);
-    return { ok: true };
+    const validate = guard ?? interruptCustodyGuard(running, ctx, signal);
+    validate();
+    const owner = sessionOwners.get(canonicalSessionPath(running.sessionFile))!;
+    const result = await request(owner, running, { validate, signal });
+    validate(); // Never report acknowledgement after losing custody across an await.
+    return result;
   } catch (error: any) {
-    return {
-      error:
-        `Failed to send Escape to subagent "${running.name}" via herdr: ` +
-        `${error?.message ?? String(error)}`,
-    };
+    return { error: `Failed guarded interrupt for subagent "${running.name}": ${error?.message ?? String(error)}` };
   }
 }
 
-function handleSubagentInterrupt(
+async function handleSubagentInterrupt(
   params: { id?: string; name?: string },
-  interruptPaneKey: (surface: string) => void = interruptPane,
+  request: typeof interruptOwnedChild = interruptOwnedChild,
+  ctx = runtime.latestCtx,
+  signal?: AbortSignal,
 ) {
   const resolved = resolveInterruptTarget(params);
   if ("error" in resolved) {
@@ -1024,7 +1085,7 @@ function handleSubagentInterrupt(
       content: [{
         type: "text" as const,
         text:
-          `Turn-only Escape interrupt is currently supported only for Pi-backed subagents. ${driver.name}-backed semantics have not been verified yet.`,
+          `Guarded turn interrupt is currently supported only for Pi-backed subagents. ${driver.name}-backed semantics have not been verified yet.`,
       }],
       details: {
         error: `${running.cli ?? "external"} interrupt unsupported`,
@@ -1037,7 +1098,14 @@ function handleSubagentInterrupt(
   const now = Date.now();
   observeRunningSubagent(running, now);
 
-  const interruption = requestSubagentInterrupt(running, interruptPaneKey);
+  let interruption: Awaited<ReturnType<typeof requestSubagentInterrupt>>;
+  try {
+    const validate = interruptCustodyGuard(running, ctx, signal);
+    interruption = await requestSubagentInterrupt(running, request, ctx, signal, validate);
+    validate(); // The outer await is a separate custody boundary before status mutation/reporting.
+  } catch (error: any) {
+    interruption = { error: `Failed guarded interrupt for subagent "${running.name}": ${error?.message ?? String(error)}` };
+  }
   if ("error" in interruption) {
     return {
       content: [{ type: "text" as const, text: interruption.error }],
@@ -1045,12 +1113,20 @@ function handleSubagentInterrupt(
     };
   }
 
-  running.lifecycle = markInterruptRequested(ensureLifecycle(running), now);
+  if (interruption.status !== "requested") {
+    return {
+      content: [{ type: "text" as const, text: interruption.reason ?? `Interrupt ${interruption.status}; no aborted settlement confirmed.` }],
+      details: { id: running.id, name: running.name, ...interruption },
+    };
+  }
+  // This remains a LOCAL request marker, not evidence of aborted settlement.
+  running.lifecycle = markInterruptRequested(ensureLifecycle(running), Date.now());
   updateWidget();
 
   return {
-    content: [{ type: "text" as const, text: `Interrupt requested for subagent "${running.name}".` }],
-    details: { id: running.id, name: running.name, status: "interrupt_requested" },
+    content: [{ type: "text" as const, text: `Interrupt requested for subagent "${running.name}". ` +
+      (interruption.settlement === "aborted" ? "Child confirmed correlated aborted settlement." : "Aborted settlement is not yet confirmed.") }],
+    details: { id: running.id, name: running.name, ...interruption, status: "interrupt_requested" },
   };
 }
 
@@ -1097,6 +1173,7 @@ export const __test__ = {
   discoverAgentDefinitions,
   buildAvailableAgentCatalog,
   resolveEffectiveSessionMode,
+  resolveSubagentPaths,
   resolveLaunchBehavior,
   resolveEffectiveAutoExit,
   resolveEffectiveInteractive,
@@ -1134,6 +1211,7 @@ async function launchSubagent(
   ctx: {
     sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string };
     cwd: string;
+    isProjectTrusted?: () => boolean;
     model?: { provider: string; id: string };
     modelRegistry: {
       find(provider: string, modelId: string): any;
@@ -1143,12 +1221,22 @@ async function launchSubagent(
     };
   },
   parentThinking: ThinkingLevel,
-  options?: { surface?: string },
+  options?: { surface?: string; signal?: AbortSignal },
 ): Promise<RunningSubagent> {
+  options?.signal?.throwIfAborted();
   const startTime = Date.now();
   const id = randomUUID();
 
-  const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
+  const agentDefs = params.agent ? loadAgentDefaults(params.agent, authorizedDiscovery(ctx, getAgentConfigDir())) : null;
+  if (params.agent && !agentDefs) throw new Error(`Agent '${params.agent}' is unavailable or its project source is not explicitly authorized.`);
+  const validateSources = () => {
+    if (!params.agent) return;
+    const current = loadAgentDefaults(params.agent, authorizedDiscovery(ctx, getAgentConfigDir()));
+    if (!current || current.sourcePath !== agentDefs?.sourcePath || current.sourceHash !== agentDefs?.sourceHash) {
+      throw new Error("Agent definition/source authorization changed during launch; rediscover before retrying.");
+    }
+    assertDefinitionAuthorized(ctx, getAgentConfigDir(), current);
+  };
   if (!ctx.model) throw new Error("Subagent launch requires a resolved parent model");
   const runtimePlan = resolveRuntimePlan(
     { model: params.model, thinking: params.thinking },
@@ -1173,7 +1261,7 @@ async function launchSubagent(
   const sessionId = ctx.sessionManager.getSessionId();
   const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
 
-  const { effectiveCwd, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs);
+  const { effectiveCwd, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs, ctx);
   const targetCwdForSession = effectiveCwd ?? ctx.cwd;
   const sessionDir = getDefaultSessionDirFor(targetCwdForSession, effectiveAgentDir);
 
@@ -1204,8 +1292,9 @@ async function launchSubagent(
     setPaneTask(surface, params.task);
   }
   if (!surfacePreCreated) {
-    await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+    await delay(getShellReadyDelayMs(), undefined, { signal: options?.signal });
   }
+  options?.signal?.throwIfAborted();
 
   if (launchBehavior.seededSessionMode) {
     seedSubagentSessionFile({
@@ -1235,7 +1324,7 @@ async function launchSubagent(
     ? "Your FINAL assistant message should summarize what you accomplished."
     : "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
   const denySet = resolveDenyTools(agentDefs);
-  const identity = agentDefs?.body ?? params.systemPrompt ?? null;
+  const identity = resolveRoleInstructions(agentDefs?.body, params.systemPrompt);
   const systemPromptMode = agentDefs?.systemPromptMode;
   const identityInSystemPrompt = systemPromptMode && identity;
   const roleBlock = identity && !identityInSystemPrompt ? `\n\n${identity}` : "";
@@ -1271,6 +1360,7 @@ async function launchSubagent(
   };
   launchContext.launchProfile = resolveLaunchProfile(launchContext, driver.id,
     buildSubagentToolAllowlist(params.tools ?? agentDefs?.tools));
+  if (ctx.isProjectTrusted?.() !== true) launchContext.launchProfile.projectTrust = false;
   if (planTask) launchContext.launchProfile.planTask = planTask;
   persistLaunchProfile(launchContext.launchProfile);
   const built = driver.buildCommand(launchContext);
@@ -1289,15 +1379,18 @@ async function launchSubagent(
     launchScriptFile, profile: launchContext.launchProfile, lineage });
   runScriptInPane(surface, built.command, {
     onDispatch: () => {
+      options?.signal?.throwIfAborted();
+      validateSources();
+      assertAgentDirectoryAuthorized(ctx, getAgentConfigDir(), effectiveAgentDir, targetCwdForSession);
       if (planTask) bindPlanRun(runtime.plans!, ctx as ExtensionContext, id, undefined, planTask);
       store?.phase(id, "dispatch-intent"); owner.dispatched = true;
     },
     scriptPath: launchScriptFile,
     scriptPreamble: (built.launchScriptPreamble ?? [
-      `# Subagent launch script for ${params.name}`,
-      `# Generated: ${new Date().toISOString()}`,
-      `# Surface: ${surface}`,
-    ]).join("\n"),
+      `Subagent launch script for ${params.name}`,
+      `Generated: ${new Date().toISOString()}`,
+      `Surface: ${surface}`,
+    ].map(shellComment)).join("\n"),
   });
 
   store?.phase(id, "supervised");
@@ -1331,6 +1424,31 @@ async function launchSubagent(
  * the summary from the session file, and cleans up the surface.
  * The outbox removes the registry entry only after synchronous handoff.
  */
+async function waitForObservedCompletion(running: RunningSubagent, signal: AbortSignal,
+  options: Parameters<typeof waitForCompletion>[1]): ReturnType<typeof waitForCompletion> {
+  for (;;) {
+    try {
+      running.observationError = undefined;
+      const result = await waitForCompletion(signal, options);
+      running.observationError = undefined;
+      return result;
+    } catch (error) {
+      if (signal.aborted) throw error;
+      running.observationError = `Completion observation paused/uncertain: ${String(error)}. Use /subagents-reconcile after fixing storage.`;
+      try { if (runtime.latestCtx?.hasUI) runtime.latestCtx.ui.notify(`${running.name}: ${running.observationError}`, "warning"); } catch { /* Diagnostic observers cannot end supervision. */ }
+      // Preserve the child, ownership and exact retained evidence. A failed read
+      // is neither child completion nor permission to close its terminal.
+      await new Promise<void>((resolve, reject) => {
+        const cleanup = () => { signal.removeEventListener("abort", aborted); running.retryObservation = undefined; };
+        const aborted = () => { cleanup(); reject(signal.reason ?? new Error("Supervision aborted")); };
+        running.retryObservation = () => { cleanup(); resolve(); };
+        signal.addEventListener("abort", aborted, { once: true });
+        if (signal.aborted) aborted();
+      });
+    }
+  }
+}
+
 async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
@@ -1343,12 +1461,13 @@ async function watchSubagent(
   };
 
   try {
-    const result = await waitForCompletion(signal, {
+    const result = await waitForObservedCompletion(running, signal, {
       intervalMs: 1000,
       sessionFile,
       runId: running.completionRunId,
       retainedEventIds: running.durableStore
-        ? () => running.durableStore!.snapshot().runs[running.id].eventCursor : undefined,
+        ? () => running.durableStore!.committedEventIds(running.id) : undefined,
+      retainedEventIndex: running.completionIndex ??= new RetainedCompletionIndex(),
       sentinelFile: running.sentinelFile,
       readTerminalTail: () => readPaneAsync(surface, 5),
       inspectPane: async () => inspectPane(surface),
@@ -1509,26 +1628,83 @@ async function watchSubagent(
 
 export default function subagentsExtension(pi: ExtensionAPI) {
   registerSubagentAssignmentRenderer(pi);
-  runtime.plans = registerPlanTools(pi);
-  const checkpoints = registerContextCheckpoint(pi, runtime.plans);
+  runtime.plans = registerPlanTools(pi, { publish: false });
+  const checkpoints = registerContextCheckpoint(pi, runtime.plans, { publish: false });
   registerContextGuard(pi, config.contextProtection, checkpoints.capture);
+  registerPayloadDiagnostics(pi, config.contextProtection);
   const stopPlanHistory = registerPlanHistory(runtime.plans);
   runtime.planImportErrors ??= new Map();
+  const pendingImports = new Map<string, { runId: string; envelope: Parameters<NonNullable<DeliveryState["onEnvelope"]>>[1] }>();
+  const imported = new Set<string>();
+  let importStore: RuntimeStore | undefined;
+  let importOffset = 0;
   delivery.onEnvelope = (runId, envelope) => {
-    const binding = runtime.store?.snapshot().runs[runId]?.planTask ?? runningSubagents.get(runId)?.planTask;
-    if (!binding) return;
     const eventId = String((envelope.message.details as any)?.eventId ?? runId);
+    if (imported.has(eventId)) return;
+    pendingImports.set(eventId, { runId, envelope });
     try {
-      if (!runtime.latestCtx) throw new Error("Parent context unavailable during reload");
-      runtime.store?.assertCustody();
-      importPlanEnvelope(runtime.plans!, runtime.latestCtx, binding, runId, envelope);
+      const binding = runtime.store?.runBinding(runId) ?? runningSubagents.get(runId)?.planTask;
+      if (binding) {
+        if (!runtime.latestCtx) throw new Error("Parent context unavailable during reload");
+        runtime.store?.assertCustody();
+        importPlanEnvelope(runtime.plans!, runtime.latestCtx, binding, runId, envelope);
+      }
+      pendingImports.delete(eventId);
+      imported.add(eventId);
       runtime.planImportErrors!.delete(eventId);
+      if (eventId.includes(":dispatch-failure:")) runtime.planImportErrors!.delete(runId);
     } catch (error) { runtime.planImportErrors!.set(eventId, `Task import pending: ${String(error)}`); }
   };
   const retryPlanImports = () => {
-    for (const event of Object.values(runtime.store?.snapshot().outbox ?? {})) delivery.onEnvelope?.(event.runId, event.envelope);
+    const store = runtime.store;
+    if (store !== importStore) { importStore = store; importOffset = 0; imported.clear(); }
+    if (store) {
+      // Full ID restoration occurs once per store. Later phases request only the
+      // append-only tail, never clone or re-import the historical outbox.
+      const ids = store.outboxIdsSince(importOffset);
+      importOffset += ids.length;
+      for (const id of ids) {
+        if (imported.has(id)) continue;
+        const event = store.getEvent(id);
+        if (event) pendingImports.set(id, { runId: event.runId, envelope: event.envelope });
+      }
+    }
+    for (const { runId, envelope } of pendingImports.values()) delivery.onEnvelope?.(runId, envelope);
   };
-  pi.on("context", () => { retryPlanImports(); });
+  pi.registerCommand("subagents-reconcile", {
+    description: "Explicit bounded retry of paused artifact supervision/imports; never relaunches or replays dispatch",
+    handler: async (_args, ctx) => {
+      if (runtime.store && !ownsActiveBranch(ctx, runtime.store.snapshot().parent)) throw new Error("Reconciliation requires current branch custody");
+      runtime.latestCtx = ctx;
+      runtime.store?.assertCustody();
+      if (runtime.stopRecovery) runtime.stopRecovery.reconcile();
+      else if (runtime.recoveryError || runtime.store?.listRuns().some(run => !runningSubagents.has(run.id))) await recoverParentRuntime(ctx);
+      for (const child of runningSubagents.values()) {
+        if (!child.retryObservation || child.terminalActionsAllowed === false) continue;
+        child.durableStore?.assertCustody();
+        child.retryObservation();
+      }
+      retryPlanImports();
+      if (!runtime.recoveryError) { delivery.api = pi; flushDeliveries(delivery); }
+      if (ctx.hasUI) {
+        const errors = runtime.stopRecovery?.status().errors ?? [];
+        ctx.ui.notify(runtime.recoveryError ?? (errors.length ? `Supervision remains paused for ${errors.length} error(s); see /subagents-recovery.` : "Artifact reconciliation requested; no child was relaunched. Review recovery diagnostics for remaining errors."),
+          runtime.recoveryError || errors.length ? "warning" : "info");
+      }
+    },
+  });
+  // Reconciliation precedes every publication/restoration phase. Importing an
+  // immutable outbox event is idempotent and never re-delivers or wakes a model.
+  pi.on("before_agent_start", () => { retryPlanImports(); });
+  pi.on("turn_end", () => { retryPlanImports(); });
+  pi.on("context", (event) => {
+    // Ordinary requests must remain read-only after their actionable boundary.
+    // Only emergency post-compaction restoration still needs a context-phase
+    // retry, immediately before the read-only fallback is constructed.
+    if (event.messages.some(message => message.role === "compactionSummary")) retryPlanImports();
+  });
+  registerPlanContext(pi, runtime.plans);
+  registerCheckpointContext(pi, checkpoints);
   registerRecoveryReport(pi, readRecoveryView);
   registerHistoryView(pi, ctx => join(getArtifactDir(ctx.sessionManager.getSessionDir(), ctx.sessionManager.getSessionId()), "subagent-history"));
   // A factory API is not bound yet. Never fall back to a captured pre-reload API.
@@ -1557,7 +1733,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       ctx.scopedModels.map(({ model }) => model),
     );
     runtime.agentCatalog = buildAvailableAgentCatalog(
-      discoverAgentDefinitions().filter((agent) => !agent.disableModelInvocation),
+      discoverAgentDefinitions(authorizedDiscovery(ctx, getAgentConfigDir())).filter((agent) => !agent.disableModelInvocation),
     );
     if (runningSubagents.size > 0) {
       startWidgetRefresh();
@@ -1614,7 +1790,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     await finishTreeNavigation(ctx);
   });
 
-  pi.on("before_agent_start", (event) => {
+  pi.on("before_agent_start", (event, ctx) => {
+    runtime.agentCatalog = buildAvailableAgentCatalog(discoverAgentDefinitions(authorizedDiscovery(ctx, getAgentConfigDir()))
+      .filter(agent => !agent.disableModelInvocation));
     const guidelines = event.systemPromptOptions.toolGuidelines.subagent ??= [];
     for (const catalog of [runtime.agentCatalog, runtime.modelCatalog]) {
       if (catalog && !guidelines.includes(catalog)) guidelines.push(catalog);
@@ -1694,6 +1872,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       parameters: SubagentParams,
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+        _signal?.throwIfAborted();
         // Prevent self-spawning (e.g. planner spawning another planner)
         const currentAgent = process.env.PI_SUBAGENT_AGENT;
         if (params.agent && currentAgent && params.agent === currentAgent) {
@@ -1738,7 +1917,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         ) {
           throw new Error(`Unsupported parent thinking level: ${parentThinking}`);
         }
-        const running = await launchSubagent(params, ctx, parentThinking);
+        const running = await launchSubagent(params, ctx, parentThinking, { signal: _signal });
 
         // Create a separate AbortController for the watcher
         // (the tool's signal completes when we return)
@@ -1845,20 +2024,19 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagent_interrupt",
       label: "Interrupt Subagent",
       description:
-        "Send Escape to the active turn of a currently running Pi-backed subagent. " +
-        "The child pane, session, watcher, and running entry remain alive; this returns only a local acknowledgement " +
-        "and does not emit a subagent_result solely because of this request.",
+        "Request a guarded abort of the active turn of an owned Pi-backed subagent via its child-issued capability. " +
+        "The child process, session and watcher remain alive. interrupt_requested acknowledges the child API request, " +
+        "not aborted settlement; settlement reports correlated confirmation separately. No terminal/signal fallback or automatic retry.",
       promptSnippet:
-        "Send Escape to the active turn of a currently running Pi-backed subagent. " +
-        "The child pane, session, watcher, and running entry remain alive; this returns only a local acknowledgement " +
-        "and does not emit a subagent_result solely because of this request.",
+        "Request guarded active-turn cancellation from an owned Pi child; acknowledgement is not aborted settlement. " +
+        "No terminal/signal fallback or automatic retry; process, watcher and ownership are preserved.",
       parameters: Type.Object({
         id: Type.Optional(Type.String({ description: "Exact running subagent id" })),
         name: Type.Optional(Type.String({ description: "Exact running subagent display name" })),
       }),
 
-      async execute(_toolCallId, params) {
-        return handleSubagentInterrupt(params);
+      async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+        return handleSubagentInterrupt(params, interruptOwnedChild, ctx, signal);
       },
 
       renderCall(args, theme) {
@@ -1897,17 +2075,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagents_list",
       label: "List Subagents",
       description:
-        "List all available subagent definitions. " +
-        "Scans project-local .pi/agents/ and global ~/.pi/agent/agents/. " +
-        "Project-local agents override global ones with the same name.",
-      promptSnippet:
-        "List all available subagent definitions. " +
-        "Scans project-local .pi/agents/ and global ~/.pi/agent/agents/. " +
-        "Project-local agents override global ones with the same name.",
+        "List bundled/global agents and explicitly authorized project-local .pi/agents/. " +
+        "Authorized project agents override global ones with the same name.",
+      promptSnippet: "Discover named roles from bundled, global and explicitly authorized project sources (not running-child status).",
       parameters: Type.Object({}),
 
-      async execute() {
-        const list = discoverAgentDefinitions().filter((agent) => !agent.disableModelInvocation);
+      async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+        const list = discoverAgentDefinitions(authorizedDiscovery(ctx, getAgentConfigDir())).filter((agent) => !agent.disableModelInvocation);
 
         if (list.length === 0) {
           return {
@@ -2122,13 +2296,20 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+        _signal?.throwIfAborted();
         params.sessionPath = canonicalSessionPath(params.sessionPath, ctx.cwd);
         const name = params.name ?? "Resume";
         // Fail closed before reading history (in particular foreign harness transcripts).
         const profile = readPiLaunchProfile(params.sessionPath);
+        const validateProfileSources = () => {
+          assertAgentDirectoryAuthorized(ctx, getAgentConfigDir(), profile.agentDir, profile.cwd);
+          if (profile.role && !profile.definitionSource) throw new Error("Legacy named-agent profile lacks source provenance; start a new subagent with explicit restrictions.");
+          assertDefinitionAuthorized(ctx, getAgentConfigDir(), profile.definitionSource ?? {});
+        };
         if (params.autoExit !== undefined && params.autoExit !== profile.autoExit) {
           throw new Error("Resume must preserve the saved autoExit/interactivity profile. Start a new subagent to change it.");
         }
+        validateProfileSources();
         if (runtime.recoveryError) throw new Error(runtime.recoveryError);
         runtime.store?.assertCustody();
         assertResumeWriters(params.sessionPath);
@@ -2145,11 +2326,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         assertResumeWriters(params.sessionPath);
         const liveOwner = sessionOwners.get(params.sessionPath);
         if (liveOwner && runningSubagents.has(liveOwner.runId)) {
+          // Validate caller input before contractTask can turn an empty message
+          // into metadata-only work. Closed-session resume remains optional.
+          if (typeof params.message !== "string" || !params.message.trim()) {
+            throw new Error("Live continuation requires a nonempty message.");
+          }
           const child = runningSubagents.get(liveOwner.runId)!;
           if (runtime.treeSuspension || child.terminalActionsAllowed === false) throw new Error("Live continuation requires verified terminal custody");
           const continuationContract = resolveResumeContract(runtime.plans!, ctx, profile.assignmentContract,
             params.planTask, child.planTask ?? profile.planTask);
-          const continuationParams = { ...params, message: contractTask(params.message ?? "", continuationContract) };
+          const continuationParams = { ...params, message: contractTask(params.message, continuationContract) };
           const result = await continueLiveChild(liveOwner, child, continuationParams, { inspect: inspectPane,
             settled: (requestId) => {
               if (runtime.treeSuspension || child.terminalActionsAllowed === false
@@ -2158,6 +2344,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             }, beforeSend: () => {
             if (runtime.treeSuspension || child.terminalActionsAllowed === false) throw new Error("Terminal custody was detached during continuation");
             child.durableStore?.assertCustody();
+            _signal?.throwIfAborted();
+            validateProfileSources();
             assertResumeWriters(params.sessionPath);
             // Validate after async inspection, immediately before dispatch.
             resolveResumeContract(runtime.plans!, ctx, continuationContract, params.planTask, child.planTask ?? profile.planTask);
@@ -2215,7 +2403,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         if (params.message) {
           setPaneTask(surface, params.message);
         }
-        await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+        await delay(getShellReadyDelayMs(), undefined, { signal: _signal });
+        _signal?.throwIfAborted();
         store?.assertCustody();
         if (sessionOwners.get(params.sessionPath) !== owner) throw new Error("Session ownership changed during launch preparation");
         assertResumeWriters(params.sessionPath);
@@ -2224,10 +2413,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
         const activityFile = getSubagentActivityFile(artifactDir, id);
         mkdirSync(dirname(activityFile), { recursive: true });
-        const built = getHarnessDriver("pi").buildCommand(resumeLaunchContext(resumeProfile, {
+        const resumeContext = resumeLaunchContext(resumeProfile, {
           id, name, message: params.message, surface, artifactDir,
           subagentsDir: SUBAGENTS_DIR, shellQuote,
-        }));
+        });
+        resumeContext.denyProjectConfig = ctx.isProjectTrusted?.() !== true;
+        const built = getHarnessDriver("pi").buildCommand(resumeContext);
         const launchScriptFile = join(
           artifactDir,
           "subagent-scripts",
@@ -2243,6 +2434,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           launchScriptFile, profile: resumeProfile, lineage: resumeProfile.lineage, entryCountBefore });
         runScriptInPane(surface, built.command, {
           onDispatch: () => {
+            _signal?.throwIfAborted();
+            validateProfileSources();
             assertResumeWriters(params.sessionPath);
             resolveResumeContract(runtime.plans!, ctx, assignmentContract, undefined, planTask);
             if (planTask) bindPlanRun(runtime.plans!, ctx, id, undefined, planTask);
@@ -2328,7 +2521,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       const agentName = spaceIdx === -1 ? trimmed : trimmed.slice(0, spaceIdx);
       const task = spaceIdx === -1 ? "" : trimmed.slice(spaceIdx + 1).trim();
 
-      const defs = loadAgentDefaults(agentName);
+      const defs = loadAgentDefaults(agentName, authorizedDiscovery(ctx, getAgentConfigDir()));
       if (!defs) {
         ctx.ui.notify(
           `Agent "${agentName}" not found in ~/.pi/agent/agents/ or .pi/agents/`,
@@ -2495,7 +2688,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
   registerPlanCommand(pi, {
     skillPath: join(SUBAGENTS_DIR, "plan-skill.md"),
-    discoverRoles: discoverAgentDefinitions,
+    discoverRoles: ctx => discoverAgentDefinitions(authorizedDiscovery(ctx, getAgentConfigDir())),
     terminalAvailable: isTerminalAvailable,
     terminalHint: terminalSetupHint,
   });

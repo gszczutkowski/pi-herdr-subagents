@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, rmSync, readdirSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, readdirSync, readFileSync } from "node:fs";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import childExtension from "../pi-extension/subagents/subagent-done.ts";
@@ -16,13 +17,15 @@ test("real child tool publishes immutable structured turns; durable outbox survi
   const dir = mkdtempSync(join(tmpdir(), "structured-result-"));
   const saved = { ...process.env };
   const session = join(dir, "child.jsonl"); const runId = "structured-child";
-  Object.assign(process.env, { PI_SUBAGENT_ID: runId, PI_SUBAGENT_SESSION: session, PI_SUBAGENT_AUTO_EXIT: "1" });
+  Object.assign(process.env, { PI_SUBAGENT_ID: runId, PI_SUBAGENT_SESSION: session, PI_SUBAGENT_AUTO_EXIT: "1",
+    PI_SUBAGENT_ACTIVITY_FILE: join(dir, "activity.json") });
   const handlers = new Map<string, Function[]>(); const tools = new Map<string, any>();
-  const ctx = { isIdle: () => true, hasPendingMessages: () => false, shutdown: () => assert.fail("kept-open child must not shut down") };
+  const manager = SessionManager.open(session);
+  const ctx = { isIdle: () => true, hasPendingMessages: () => false, shutdown: () => assert.fail("kept-open child must not shut down"), sessionManager: manager };
   const emit = async (name: string, event = {}) => { for (const fn of handlers.get(name) ?? []) await fn(event, ctx); };
   let store: RuntimeStore | undefined;
   try {
-    writeFileSync(session, JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "text", text: "plain summary" }] } }) + "\n");
+    manager.appendMessage({ role: "assistant", content: [{ type: "text", text: "plain summary from previous task" }], stopReason: "stop" } as any);
     childExtension({ on: (name: string, fn: Function) => handlers.set(name, [...(handlers.get(name) ?? []), fn]),
       registerTool: (tool: any) => tools.set(tool.name, tool), registerCommand() {}, registerShortcut() {} } as any);
     assert.ok(isStructuredResult(proposal));

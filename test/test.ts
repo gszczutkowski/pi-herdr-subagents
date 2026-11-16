@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
+import { canonicalSessionPath, reserveSession, releaseSession, sessionOwners } from "../pi-extension/subagents/ownership.ts";
 import { captureGuidanceRequests } from "./guidance-session.ts";
 import {
   cleanupSubagentsForShutdown,
@@ -159,16 +160,6 @@ function restoreEnvVar(name: string, value: string | undefined) {
   process.env[name] = value;
 }
 
-function withMockedNow<T>(now: number, fn: () => T): T {
-  const originalNow = Date.now;
-  Date.now = () => now;
-  try {
-    return fn();
-  } finally {
-    Date.now = originalNow;
-  }
-}
-
 function writeAgentFile(
   agentsDir: string,
   name: string,
@@ -199,6 +190,7 @@ async function withIsolatedAgentEnv(
   mkdirSync(globalAgentsDir, { recursive: true });
   process.chdir(projectDir);
   process.env.PI_CODING_AGENT_DIR = globalDir;
+  writeFileSync(join(globalDir, "subagent-trust.json"), JSON.stringify({ projectAgentDirectories: [projectAgentsDir] }));
 
   try {
     await fn({ projectDir, projectAgentsDir, globalDir, globalAgentsDir });
@@ -972,7 +964,13 @@ describe("model configuration", () => {
 });
 
 describe("subagent discovery", () => {
-  const testApi = (subagentsModule as any).__test__;
+  const helpers = (subagentsModule as any).__test__;
+  // Parser/precedence fixtures explicitly authorize their isolated project source.
+  const testApi = { ...helpers,
+    discoverAgentDefinitions: () => helpers.discoverAgentDefinitions({ cwd: process.cwd(), projectAgents: true }),
+    loadAgentDefaults: (name: string) => helpers.loadAgentDefaults(name, { cwd: process.cwd(), projectAgents: true }),
+  };
+  const listContext = () => ({ cwd: process.cwd(), isProjectTrusted: () => true });
 
   for (const lineEnding of ["LF", "CRLF", "mixed"]) {
     it(`discovers and loads agents with ${lineEnding} line endings`, async () => {
@@ -1320,7 +1318,7 @@ describe("subagent discovery", () => {
       const tool = registeredTools.find((tool) => tool.name === "subagents_list");
       assert.ok(tool, "expected subagents_list to be registered");
 
-      const result = await tool.execute();
+      const result = await tool.execute("list", {}, undefined, undefined, listContext());
       const agents = result.details?.agents ?? [];
 
       assert.ok(agents.some((agent: any) => agent.name === "visible-discovery-test-agent"));
@@ -1348,7 +1346,7 @@ describe("subagent discovery", () => {
       const tool = registeredTools.find((tool) => tool.name === "subagents_list");
       assert.ok(tool, "expected subagents_list to be registered");
 
-      const result = await tool.execute();
+      const result = await tool.execute("list", {}, undefined, undefined, listContext());
       const agents = result.details?.agents ?? [];
 
       assert.equal(agents.some((agent: any) => agent.name === "hidden-discovery-test-agent"), false);
@@ -1392,7 +1390,7 @@ describe("subagent discovery", () => {
       const tool = registeredTools.find((tool) => tool.name === "subagents_list");
       assert.ok(tool, "expected subagents_list to be registered");
 
-      const result = await tool.execute();
+      const result = await tool.execute("list", {}, undefined, undefined, listContext());
       const agents = result.details?.agents ?? [];
 
       assert.equal(agents.some((agent: any) => agent.name === "shadowed-discovery-test-agent"), false);
@@ -1423,7 +1421,7 @@ describe("subagent discovery", () => {
       (subagentsModule as any).default(api);
 
       const tool = registeredTools.find((tool) => tool.name === "subagents_list");
-      const result = await tool.execute();
+      const result = await tool.execute("list", {}, undefined, undefined, listContext());
       const agents = result.details?.agents ?? [];
       assert.ok(
         agents.some((agent: any) => agent.name === "aliased-test-agent"),
@@ -1569,7 +1567,10 @@ describe("subagent-done.ts", () => {
           const agentEnd = eventHandlers.get("agent_end")![0];
           const agentSettled = eventHandlers.get("agent_settled")![0];
           let shutdowns = 0;
-          const ctx = { shutdown: () => { shutdowns += 1; } };
+          writeFileSync(sessionFile, JSON.stringify({ type: "session", id: "auto-exit-fixture", version: 3 }) + "\n");
+          const ctx = { shutdown: () => { shutdowns += 1; }, isIdle: () => true, hasPendingMessages: () => false,
+            sessionManager: { getSessionFile: () => sessionFile, getHeader: () => ({ id: "auto-exit-fixture" }), getEntries: () => [], getBranch: () => [] } };
+          eventHandlers.get("before_agent_start")![0]({}, ctx);
 
           agentEnd({ messages: [{ role: "assistant", stopReason: "stop" }] }, ctx);
           assert.equal(shutdowns, 0, "agent_end must not shut down before Pi settles");
@@ -1598,7 +1599,7 @@ describe("subagent-done.ts", () => {
         const { api, eventHandlers } = createMockExtensionApi();
         subagentDoneExtension(api);
         let shutdowns = 0;
-        const ctx = { shutdown: () => { shutdowns += 1; } };
+        const ctx = { shutdown: () => { shutdowns += 1; }, isIdle: () => true, hasPendingMessages: () => false };
         eventHandlers.get("agent_end")![0]({
           messages: [{ role: "assistant", stopReason: "aborted" }],
         }, ctx);
@@ -2476,6 +2477,7 @@ describe("subagent activity snapshots", () => {
 });
 
 describe("subagent interruption", () => {
+  const interruptCtx = { sessionManager: { getSessionFile: () => null } };
   function makeRunning(overrides: Record<string, unknown> = {}) {
     return {
       id: "a1",
@@ -2518,7 +2520,18 @@ describe("subagent interruption", () => {
     }
   });
 
-  it("returns an explicit error when Escape delivery fails", () => {
+  async function withInterruptTarget(run: (running: any, owner: any) => Promise<void>) {
+    const dir = createTestDir();
+    const running = makeRunning({ cli: "pi", sessionFile: canonicalSessionPath(join(dir, "worker.jsonl")) });
+    const owner = reserveSession(running.sessionFile, running.id);
+    owner.dispatched = true;
+    const runningMap = (subagentsModule as any).__test__.runningSubagents as Map<string, any>;
+    runningMap.set(running.id, running);
+    try { await run(running, owner); }
+    finally { runningMap.delete(running.id); releaseSession(running.sessionFile, running.id); rmSync(dir, { recursive: true, force: true }); }
+  }
+
+  it("returns an explicit error when guarded interrupt delivery fails", async () => {
     const testApi = (subagentsModule as any).__test__;
     let aborted = false;
     const running = makeRunning({
@@ -2529,16 +2542,25 @@ describe("subagent interruption", () => {
       },
     });
 
-    const result = testApi.requestSubagentInterrupt(running, () => {
-      throw new Error("mux write failed");
-    });
+    const owner = reserveSession(running.sessionFile, running.id);
+    owner.dispatched = true;
+    testApi.runningSubagents.set(running.id, running);
+    let result: any;
+    try {
+      result = await testApi.requestSubagentInterrupt(running, async () => {
+        throw new Error("control publication failed");
+      }, interruptCtx);
+    } finally {
+      releaseSession(running.sessionFile, owner.runId);
+      testApi.runningSubagents.delete(running.id);
+    }
 
-    assert.match(result.error, /Failed to send Escape/);
+    assert.match(result.error, /Failed guarded interrupt.*control publication failed/);
     assert.equal(aborted, false);
     assert.equal("interruptRequested" in running, false);
   });
 
-  it("leaves status unchanged when Escape delivery fails in the tool path", () => {
+  it("leaves status unchanged when guarded interrupt delivery fails in the tool path", async () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
     runningMap.clear();
@@ -2570,46 +2592,51 @@ describe("subagent interruption", () => {
     try {
       runningMap.set("a1", makeRunning({ lifecycle: activeLifecycle }));
 
-      const result = withMockedNow(20_000, () => testApi.handleSubagentInterrupt({ name: "Worker" }, () => {
-        throw new Error("mux write failed");
-      }));
+      const running = runningMap.get("a1");
+      const owner = reserveSession(running.sessionFile, running.id);
+      owner.dispatched = true;
+      let result: any;
+      try {
+        result = await testApi.handleSubagentInterrupt({ name: "Worker" }, async () => {
+          throw new Error("control publication failed");
+        }, interruptCtx);
+      } finally { releaseSession(running.sessionFile, owner.runId); }
 
-      assert.match(result.content[0].text, /Failed to send Escape/);
+      assert.match(result.content[0].text, /Failed guarded interrupt/);
       assert.equal(projectLifecycle(runningMap.get("a1").lifecycle, 20_000).kind, "active");
     } finally {
       runningMap.clear();
     }
   });
 
-  it("sends Escape without aborting or mutating running state", () => {
+  it("awaits the child acknowledgement without aborting the watcher or mutating running state", async () => {
     const testApi = (subagentsModule as any).__test__;
-    let aborted = false;
-    let sentSurface = "";
-    const running = makeRunning({
-      abortController: {
-        abort() {
-          aborted = true;
-        },
-      },
+    await withInterruptTarget(async (running, owner) => {
+      const abort = new AbortController();
+      running.abortController = abort;
+      const lifecycle = running.lifecycle;
+      const result = await testApi.requestSubagentInterrupt(running, async (selectedOwner: any, child: any, transport: any) => {
+        await Promise.resolve();
+        transport.validate();
+        assert.equal(selectedOwner, owner);
+        assert.equal(child, running);
+        return { status: "requested", requestId: "request", settlement: "unconfirmed" };
+      }, interruptCtx);
+      assert.deepEqual(result, { status: "requested", requestId: "request", settlement: "unconfirmed" });
+      assert.equal(abort.signal.aborted, false);
+      assert.equal(running.lifecycle, lifecycle);
+      assert.equal(sessionOwners.get(running.sessionFile), owner);
     });
-
-    const result = testApi.requestSubagentInterrupt(running, (surface: string) => {
-      sentSurface = surface;
-    });
-
-    assert.deepEqual(result, { ok: true });
-    assert.equal(sentSurface, "pane-1");
-    assert.equal(aborted, false);
-    assert.equal("interruptRequested" in running, false);
   });
 
-  it("refreshes the latest activity snapshot before forcing local interrupt waiting", () => {
+  it("refreshes the latest activity snapshot before marking the local interrupt request", async () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
     let sentSurface = "";
     runningMap.clear();
 
-    withTempDir((dir) => {
+    const dir = createTestDir();
+    try {
       mkdirSync(join(dir, "subagent-activity"), { recursive: true });
       const activityFile = getSubagentActivityFile(dir, "a1");
       const activity = {
@@ -2633,9 +2660,15 @@ describe("subagent interruption", () => {
       try {
         runningMap.set("a1", makeRunning({ activityFile }));
 
-        withMockedNow(20_000, () => testApi.handleSubagentInterrupt({ name: "Worker" }, (surface: string) => {
-          sentSurface = surface;
-        }));
+        const running = runningMap.get("a1");
+        const owner = reserveSession(running.sessionFile, running.id);
+        owner.dispatched = true;
+        try {
+          await testApi.handleSubagentInterrupt({ name: "Worker" }, async (_owner: any, child: any) => {
+            sentSurface = child.surface;
+            return { status: "requested", requestId: "request", settlement: "unconfirmed" };
+          }, interruptCtx);
+        } finally { releaseSession(running.sessionFile, owner.runId); }
 
         assert.equal(sentSurface, "pane-1");
         const lifecycle = runningMap.get("a1").lifecycle;
@@ -2647,10 +2680,10 @@ describe("subagent interruption", () => {
       } finally {
         runningMap.clear();
       }
-    });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
-  it("acknowledges Pi-backed interrupt requests and forces local status waiting", () => {
+  it("acknowledges Pi-backed requests with a distinct unconfirmed settlement state", async () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
     let sentSurface = "";
@@ -2683,13 +2716,20 @@ describe("subagent interruption", () => {
     try {
       runningMap.set("a1", makeRunning({ lifecycle: activeLifecycle }));
 
-      const result = withMockedNow(20_000, () => testApi.handleSubagentInterrupt({ name: "Worker" }, (surface: string) => {
-        sentSurface = surface;
-      }));
+      const running = runningMap.get("a1");
+      const owner = reserveSession(running.sessionFile, running.id);
+      owner.dispatched = true;
+      let result: any;
+      try {
+        result = await testApi.handleSubagentInterrupt({ name: "Worker" }, async (_owner: any, child: any) => {
+          sentSurface = child.surface;
+          return { status: "requested", requestId: "request", settlement: "unconfirmed" };
+        }, interruptCtx);
+      } finally { releaseSession(running.sessionFile, owner.runId); }
 
       assert.equal(sentSurface, "pane-1");
-      assert.equal(result.content[0].text, 'Interrupt requested for subagent "Worker".');
-      assert.deepEqual(result.details, { id: "a1", name: "Worker", status: "interrupt_requested" });
+      assert.match(result.content[0].text, /Interrupt requested.*Aborted settlement is not yet confirmed/);
+      assert.deepEqual(result.details, { id: "a1", name: "Worker", requestId: "request", status: "interrupt_requested", settlement: "unconfirmed" });
       const projection = projectLifecycle(runningMap.get("a1").lifecycle, 20_000);
       assert.equal(projection.kind, "interrupted");
       assert.equal(runningMap.has("a1"), true);
@@ -2698,30 +2738,70 @@ describe("subagent interruption", () => {
     }
   });
 
-  it("sends Escape again for repeated interrupt requests", () => {
+  it("does not mark a timed-out/rejected request as acknowledged or interrupt the supervisor", async () => {
     const testApi = (subagentsModule as any).__test__;
-    const runningMap = testApi.runningSubagents as Map<string, any>;
-    const surfaces: string[] = [];
-    runningMap.clear();
+    await withInterruptTarget(async (running) => {
+      const lifecycle = running.lifecycle;
+      for (const status of ["pending", "rejected"]) {
+        const result = await testApi.handleSubagentInterrupt({ id: running.id }, async () => ({
+          status, requestId: "request", settlement: "unconfirmed", reason: "No confirmed dispatch",
+        }), interruptCtx);
+        assert.equal(result.details.status, status);
+        assert.equal(running.lifecycle.turn, lifecycle.turn);
+        assert.equal(testApi.runningSubagents.get(running.id), running);
+      }
+    });
+  });
 
-    try {
-      runningMap.set("a1", makeRunning());
-
-      testApi.handleSubagentInterrupt({ name: "Worker" }, (surface: string) => {
-        surfaces.push(surface);
+  it("revalidates live ownership, custody and binding after the asynchronous acknowledgement", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    for (const mutation of ["owner", "run", "binding", "detached", "surface", "session", "header", "lease"]) {
+      await withInterruptTarget(async (running, owner) => {
+        let parentSession = "parent", parentHeader = "header", lease = true;
+        const ctx = { sessionManager: { getSessionFile: () => parentSession, getHeader: () => ({ id: parentHeader }) } };
+        running.durableStore = { assertCustody: () => { if (!lease) throw new Error("custody/binding/branch lease lost"); } };
+        const result = await testApi.requestSubagentInterrupt(running, async () => {
+          await Promise.resolve();
+          if (mutation === "owner") sessionOwners.set(running.sessionFile, { ...owner });
+          if (mutation === "run") testApi.runningSubagents.set(running.id, { ...running });
+          if (mutation === "binding") running.planTask = { planId: "changed" };
+          if (mutation === "detached") running.terminalActionsAllowed = false;
+          if (mutation === "surface") running.surface = "replacement";
+          if (mutation === "session") parentSession = "replacement";
+          if (mutation === "header") parentHeader = "replacement";
+          if (mutation === "lease") lease = false;
+          return { status: "requested", requestId: "request", settlement: "unconfirmed" };
+        }, ctx);
+        assert.match(result.error, /custody\/binding\/branch/);
       });
-      testApi.handleSubagentInterrupt({ name: "Worker" }, (surface: string) => {
-        surfaces.push(surface);
-      });
-
-      assert.deepEqual(surfaces, ["pane-1", "pane-1"]);
-      assert.equal(runningMap.has("a1"), true);
-    } finally {
-      runningMap.clear();
     }
   });
 
-  it("rejects Claude-backed interrupt requests before delivery", () => {
+  it("revalidates the outer tool await before changing lifecycle or reporting acknowledgement", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    await withInterruptTarget(async (running) => {
+      const result = await testApi.handleSubagentInterrupt({ id: running.id }, async () => {
+        // Run after the inner await's validation but before the tool handler resumes.
+        queueMicrotask(() => queueMicrotask(() => { running.terminalActionsAllowed = false; }));
+        return { status: "requested", requestId: "request", settlement: "unconfirmed" };
+      }, interruptCtx);
+      assert.match(result.details.error, /custody\/binding\/branch/);
+      assert.notEqual(running.lifecycle.turn.kind, "interrupted");
+    });
+  });
+
+  it("rejects detached recovered control before any request", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    await withInterruptTarget(async (running) => {
+      running.terminalActionsAllowed = false;
+      let dispatched = false;
+      const result = await testApi.handleSubagentInterrupt({ id: running.id }, async () => { dispatched = true; }, interruptCtx);
+      assert.equal(dispatched, false);
+      assert.match(result.details.error, /detached\/unverified/);
+    });
+  });
+
+  it("rejects Claude-backed interrupt requests before delivery", async () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
     let delivered = false;
@@ -2730,7 +2810,7 @@ describe("subagent interruption", () => {
     try {
       runningMap.set("a1", makeRunning({ cli: "claude" }));
 
-      const result = testApi.handleSubagentInterrupt({ name: "Worker" }, () => {
+      const result = await testApi.handleSubagentInterrupt({ name: "Worker" }, async () => {
         delivered = true;
       });
 

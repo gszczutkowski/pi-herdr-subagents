@@ -11,6 +11,13 @@ export async function withChildSession<T>(options: {
   skills?: string;
   respond?: (index: number) => Partial<AssistantMessage>;
   extensions?: Array<(pi: any) => void>;
+  liveContinuation?: boolean;
+  autoExit?: boolean;
+  systemPrompt?: string;
+  appendSystemPrompt?: string;
+  setup?: (manager: SessionManager) => void;
+  sessionFile?: string;
+  stream?: (model: any, context: any, streamOptions: any, index: number) => any;
 }, run: (fixture: { session: AgentSession; dir: string; requests: any[]; shutdowns: () => number }) => Promise<T>): Promise<T> {
   const dir = mkdtempSync(join(tmpdir(), "child-session-"));
   const envNames = ["PI_CODING_AGENT_DIR", "PI_SUBAGENT_ID", "PI_SUBAGENT_SESSION", "PI_SUBAGENT_AUTO_EXIT",
@@ -25,10 +32,12 @@ export async function withChildSession<T>(options: {
     const agentDir = join(dir, "agent");
     process.env.PI_CODING_AGENT_DIR = agentDir;
     process.env.PI_SUBAGENT_ID = `test-${basename(dir)}`;
-    process.env.PI_SUBAGENT_AUTO_EXIT = "1";
+    process.env.PI_SUBAGENT_AUTO_EXIT = options.autoExit === false ? "0" : "1";
     process.env.PI_SUBAGENT_INITIAL_SKILLS = options.skills ?? "";
-    const manager = SessionManager.create(dir, dir);
+    const manager = options.sessionFile ? SessionManager.open(options.sessionFile) : SessionManager.create(dir, dir);
     process.env.PI_SUBAGENT_SESSION = manager.getSessionFile();
+    if (options.liveContinuation) process.env.PI_SUBAGENT_ACTIVITY_FILE = join(dir, "activity.json");
+    options.setup?.(manager);
     for (const name of ["first", "second"]) {
       const skillDir = join(agentDir, "skills", name);
       mkdirSync(skillDir, { recursive: true });
@@ -37,13 +46,17 @@ export async function withChildSession<T>(options: {
     const settingsManager = SettingsManager.inMemory({ retry: { enabled: false } });
     const loader = new DefaultResourceLoader({ cwd: dir, agentDir, settingsManager,
       noPromptTemplates: true, noThemes: true, noContextFiles: true,
+      systemPrompt: options.systemPrompt,
+      appendSystemPrompt: options.appendSystemPrompt ? [options.appendSystemPrompt] : [],
+      appendSystemPromptOverride: () => options.appendSystemPrompt ? [options.appendSystemPrompt] : [],
       extensionFactories: [(pi) => {
         pi.registerProvider("child-test", { baseUrl: "https://example.invalid", apiKey: "test", api: "child-test-api",
           models: [{ id: "model", name: "model", reasoning: false, input: ["text"], contextWindow: 128000, maxTokens: 1000,
             cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }],
-          streamSimple(model, context) {
+          streamSimple(model, context, streamOptions) {
             requests.push(structuredClone(context));
             assert.ok(requests.length < 8, "unexpected agent loop");
+            if (options.stream) return options.stream(model, context, streamOptions, requests.length - 1);
             const message: AssistantMessage = { role: "assistant", provider: model.provider, model: model.id, api: model.api,
               content: [{ type: "text", text: "completed" }], stopReason: "stop", timestamp: Date.now(),
               usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
@@ -66,6 +79,9 @@ export async function withChildSession<T>(options: {
     assert.deepEqual(errors, [], "no silently ignored extension errors");
     return result;
   } finally {
+    // SDK disposal is not a CLI shutdown event. Close session-scoped extension
+    // watchers explicitly before invalidating their contexts.
+    if (session?.extensionRunner) await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
     session?.dispose();
     envNames.forEach((name, index) => { if (previous[index] === undefined) delete process.env[name]; else process.env[name] = previous[index]; });
     rmSync(dir, { recursive: true, force: true });

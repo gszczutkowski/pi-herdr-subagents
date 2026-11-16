@@ -23,25 +23,77 @@ const processSupported = probeProcess(process.pid).kind === "present";
 function hostCode(dir: string, branch: string, file = "parent.jsonl", headerId = "parent") {
   return `import extension from ${JSON.stringify(moduleURL("index"))};
     import fs from 'node:fs';
+    process.env.PI_CODING_AGENT_DIR=${JSON.stringify(dir)};
     const handlers=new Map(); const delivered=[]; const notices=[]; const tools=new Map();
+    const emit=async(name,event={})=>{const messages=[];for(const fn of handlers.get(name)??[]){const result=await fn(event,ctx);if(result?.message)messages.push(result.message);}return {messages};};
     const branch=${branch};
-    const pi=new Proxy({}, {get:(_,key)=>key==='on'?(name,fn)=>handlers.set(name,fn):key==='getAllTools'?()=>[]:
+    const pi=new Proxy({}, {get:(_,key)=>key==='on'?(name,fn)=>handlers.set(name,[...(handlers.get(name)??[]),fn]):key==='getAllTools'?()=>[]:
       key==='registerTool'?(tool)=>tools.set(tool.name,tool):
       key==='sendMessage'?(message)=>delivered.push(message.details.eventId):()=>{}});
-    const ctx={hasUI:true,scopedModels:[],modelRegistry:{getAvailable:()=>[]},ui:{notify:(m)=>notices.push(m)},
-      sessionManager:{getHeader:()=>({id:${JSON.stringify(headerId)}}),getSessionFile:()=>${JSON.stringify(join(dir, file))},getSessionDir:()=>${JSON.stringify(dir)},getBranch:()=>branch}};
-    extension(pi); await handlers.get('session_start')({reason:'startup'},ctx);
-    await handlers.get('session_start')({reason:'startup'},ctx);
+    const ctx={cwd:${JSON.stringify(dir)},hasUI:true,scopedModels:[],modelRegistry:{getAvailable:()=>[]},ui:{notify:(m)=>notices.push(m),setWidget:()=>{}},
+      sessionManager:{getHeader:()=>({id:${JSON.stringify(headerId)}}),getSessionId:()=>${JSON.stringify(headerId)},getSessionFile:()=>${JSON.stringify(join(dir, file))},getSessionDir:()=>${JSON.stringify(dir)},getBranch:()=>branch,buildSessionProjection:()=>({messages:[]})}};
+    extension(pi); await emit('session_start',{reason:'startup'});
+    await emit('session_start',{reason:'startup'});
     const runtime=globalThis[Symbol.for('pi-subagents/runtime')];
     const report=await tools.get('subagents_recovery').execute('report',{},undefined,undefined,ctx);
-    const projection=await handlers.get('context')({messages:[]},ctx);
+    const projection=await emit('before_agent_start',{systemPromptOptions:{toolGuidelines:{}}});
     fs.writeFileSync(${JSON.stringify(join(dir, "observed.json"))},JSON.stringify({report,projection,delivered,notices,error:runtime.recoveryError,runs:runtime.runningSubagents.size,owners:[...((await import(${JSON.stringify(moduleURL("ownership"))})).sessionOwners.values())]}));
-    handlers.get('session_shutdown')({reason:'quit'},ctx);`;
+    await emit('session_shutdown',{reason:'quit'});`;
 }
 function execute(code: string, timeout = 30000) {
   const result = spawnSync(process.execPath, ["--input-type=module", "-e", code], { encoding: "utf8", timeout });
   assert.equal(result.status, 0, result.stderr || String(result.error ?? ""));
 }
+
+test("harvest I/O failures pause only their run, report errors, and permit bounded explicit reconciliation without replay/relaunch", { skip: !processSupported }, () => {
+  const dir = mkdtempSync(join(tmpdir(), "recovery-harvest-io-"));
+  try {
+    execute(`import fs from 'node:fs';import {syncBuiltinESMExports} from 'node:module';import assert from 'node:assert/strict';
+      import {RuntimeStore} from ${JSON.stringify(moduleURL("runtime-store"))};
+      import {probeProcess} from ${JSON.stringify(moduleURL("process-identity"))};
+      import {canonicalSessionPath,releaseSession} from ${JSON.stringify(moduleURL("ownership"))};
+      const dir=${JSON.stringify(dir)},read=fs.readFileSync;let tick,failure;
+      globalThis.setInterval=fn=>{tick=fn;return {unref(){}}};globalThis.clearInterval=()=>{};
+      fs.readFileSync=(file,...args)=>{
+        if(failure&&String(file).includes('bad.jsonl.bad.exit.events'))throw Object.assign(Error(failure),{code:failure});
+        return String(file).endsWith('.response.json')?read(String(file).replace('.response.json','.challenge.json'),...args):read(file,...args);
+      };
+      syncBuiltinESMExports();
+      const {reconcileRuntime}=await import(${JSON.stringify(moduleURL("runtime-recovery"))});
+      const s=new RuntimeStore(dir+'/runtime',{sessionFile:'parent',headerId:'p',branchToken:'b',checkpoint:'c'});
+      const failures=[],seen=[];
+      for(const id of ['bad','good']){
+        const session=canonicalSessionPath(dir+'/'+id+'.jsonl');fs.writeFileSync(session,JSON.stringify({type:'session',id})+'\\n');
+        s.prepare({id,sessionFile:session,name:id,task:'task',cli:'pi',startTime:1});
+        const base=session+'.'+id+'.exit';fs.mkdirSync(base+'.events');
+        fs.writeFileSync(base+'.identity.json',JSON.stringify({schema:1,runId:id,sessionFile:session,headerId:id,nonce:id,process:probeProcess(process.pid).identity}));
+      }
+      const onEvidence=(run,event)=>{
+        const id='subagent:'+run.id+':completion:'+event.eventId;
+        s.enqueue(id,run.id,{message:{customType:'subagent_result',content:event.summary,details:{eventId:id}},options:{triggerTurn:true,deliverAs:'steer'}});seen.push(id);
+      };
+      const stop=await reconcileRuntime(s,onEvidence,()=>true,{maxEventsPerPass:1,onError:error=>{failures.push(error);if(failures.length===1)throw Error('broken diagnostic observer')}});
+      const put=(id,eventId)=>fs.writeFileSync(dir+'/'+id+'.jsonl.'+id+'.exit.events/'+eventId+'.json',JSON.stringify({type:'done',runId:id,eventId,summary:eventId}));
+      for(const code of ['ENOSPC','EACCES','EIO']){
+        failure=code;put('bad',code);put('good',code);
+        for(let pass=0;pass<3&&!failures.some(error=>error.runId==='bad'&&error.error.includes(code));pass++)assert.doesNotThrow(()=>tick());
+        assert.ok(failures.some(error=>error.runId==='bad'&&error.error.includes(code)),JSON.stringify(failures));
+        assert.equal(stop.status().state,'paused');assert.match(s.getRun('bad').reconciliation,/paused/);
+        tick();assert.ok(seen.includes('subagent:good:completion:'+code),'one failure cannot disable other recovered runs');
+        const count=failures.length;tick();assert.equal(failures.length,count,'paused runs do not auto-retry');
+        failure=undefined;const before=seen.length;stop.reconcile();assert.ok(seen.length-before<=1,'explicit reconciliation has a hard work bound');
+        assert.ok(seen.includes('subagent:bad:completion:'+code));assert.equal(stop.status().state,'active');
+        tick();assert.equal(seen.filter(id=>id==='subagent:bad:completion:'+code).length,1);
+      }
+      let current=true;s.isCurrent=()=>current;current=false;
+      assert.doesNotThrow(()=>tick());assert.equal(stop.status().state,'paused');
+      assert.doesNotThrow(()=>stop.reconcile());assert.equal(stop.status().state,'paused','lost custody cannot be resumed automatically');
+      current=true;stop.reconcile();assert.equal(stop.status().state,'active');
+      assert.equal(new Set(seen).size,seen.length);stop();assert.equal(stop.status().state,'stopped');
+      for(const id of ['bad','good'])releaseSession(dir+'/'+id+'.jsonl',id);s.close();
+    `, 30000);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
 
 test("registered recovery tool fails closed on unavailable hosts, recovery errors and custody loss", () => {
   const dir = mkdtempSync(join(tmpdir(), "recovery-access-"));
@@ -149,11 +201,20 @@ test("fresh parent resumes an exited recovered session only after fresh process 
         headerId:'child',nonce:'original-process',process:probeProcess(process.pid).identity}));`);
     execute(`import cp from 'node:child_process';import {syncBuiltinESMExports} from 'node:module';
       import {promisify} from 'node:util';import fs from 'node:fs';import assert from 'node:assert/strict';
-      let surfaces=0,dispatches=0;const inspections=[];
+      let surfaces=0,dispatches=0,auditSnapshots=0;const inspections=[];
       const original=cp.execFileSync;
       cp.execSync=()=> 'herdr';
       cp.execFileSync=(command,args,...options)=>{
-        if(command==='powershell.exe')return original(command,args,...options);
+        if(command==='powershell.exe'){
+          // This fixture never launches a real Pi writer. Isolate global Windows
+          // enumeration from unrelated/transient CLI processes while retaining
+          // real PID/birth probes for the recovered identity below. Audit parser,
+          // duplicate/uncertain writer cases have dedicated session-audit tests.
+          if(args.some(arg=>typeof arg==='string'&&arg.includes('ForEach-Object { @{pid=$_.ProcessId;parentPid='))){
+            auditSnapshots++;return '[]';
+          }
+          return original(command,args,...options);
+        }
         if(args[0]==='tab'&&args[1]==='create')return JSON.stringify({result:{root_pane:{pane_id:'new-'+(++surfaces)}}});
         if(args[1]==='run')dispatches++;
         return '';
@@ -163,6 +224,7 @@ test("fresh parent resumes an exited recovered session only after fresh process 
       }});syncBuiltinESMExports();
       process.env.HERDR_ENV='1';process.env.HERDR_WORKSPACE_ID='restart-test';process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS='0';
       for(const key of ['HC_TERMINAL_ID','HC_TERMINAL_SOCKET','PI_DENY_TOOLS','PI_SUBAGENT_ID','PI_SUBAGENT_LAYOUT'])delete process.env[key];
+      process.env.PI_CODING_AGENT_DIR=${JSON.stringify(dir)};
       const {default:extension}=await import(${JSON.stringify(moduleURL("index"))});
       const {canonicalSessionPath,sessionOwners}=await import(${JSON.stringify(moduleURL("ownership"))});
       const {runCompletionFile}=await import(${JSON.stringify(moduleURL("run-artifacts"))});
@@ -198,6 +260,7 @@ test("fresh parent resumes an exited recovered session only after fresh process 
       const attempts=await Promise.allSettled([resume(),resume()]);
       assert.equal(attempts.filter(r=>r.status==='fulfilled').length,1);
       assert.match(String(attempts.find(r=>r.status==='rejected').reason),/already owned/);
+      if(process.platform==='win32')assert.ok(auditSnapshots>0,'verified enumeration fixture must run');
       const result=attempts.find(r=>r.status==='fulfilled').value;
       assert.equal(result.details.status,'started');assert.notEqual(result.details.id,'run');
       assert.equal(sessionOwners.get(session).runId,result.details.id);
@@ -292,10 +355,10 @@ test("durable observer preserves original settlements across reload gaps and rec
       import {runCompletionFile} from ${JSON.stringify(moduleURL("run-artifacts"))};
       import {canonicalSessionPath} from ${JSON.stringify(moduleURL("ownership"))};
       import assert from 'node:assert/strict';import fs from 'node:fs';
-      const directory=${JSON.stringify(dir)};
+      const directory=${JSON.stringify(dir)};process.env.PI_CODING_AGENT_DIR=directory;
       const parent={sessionFile:canonicalSessionPath(directory+'/parent.jsonl'),headerId:'parent',branchToken:'token',checkpoint:'checkpoint'};
       const branch=[{id:'checkpoint',type:'custom',customType:'subagent-custody',data:{branchToken:'token'}}];
-      const ctx={hasUI:false,scopedModels:[],modelRegistry:{getAvailable:()=>[]},sessionManager:{
+      const ctx={cwd:directory,hasUI:false,scopedModels:[],modelRegistry:{getAvailable:()=>[]},sessionManager:{
         getHeader:()=>({id:'parent'}),getSessionFile:()=>parent.sessionFile,getSessionDir:()=>directory,getBranch:()=>branch}};
       const delivered=[];const stale=[];
       function host(messages){const handlers=new Map();extension(new Proxy({}, {get:(_,key)=>key==='on'?(n,f)=>handlers.set(n,f):key==='getAllTools'?()=>[]:key==='sendMessage'?m=>messages.push(m):()=>{}}));return handlers;}
@@ -358,7 +421,7 @@ test("real Pi tree cancellation, summary abort/error resume original custody; ch
       import {createAgentSession,DefaultResourceLoader,SessionManager,SettingsManager,ModelRuntime} from '@earendil-works/pi-coding-agent';
       import {getModel} from '@earendil-works/pi-ai/compat';
       import assert from 'node:assert/strict';
-      const directory=${JSON.stringify(dir)};const delivered=[];const errors=[];
+      const directory=${JSON.stringify(dir)};process.env.PI_CODING_AGENT_DIR=directory;const delivered=[];const errors=[];
       let mode='cancel',release,entered=false,summaryStarted=false;
       const settingsManager=SettingsManager.inMemory({compaction:{enabled:false},retry:{enabled:false}});
       const modelRuntime=await ModelRuntime.create({authPath:directory+'/auth.json',modelsPath:directory+'/models.json',refreshOnCreate:false});

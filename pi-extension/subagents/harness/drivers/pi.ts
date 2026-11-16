@@ -10,6 +10,7 @@ import type { ResolvedRuntimePlan } from "../../runtime-routing.ts";
 import { ASSIGNMENT_ENV, type SubagentAssignment } from "../../assignment.ts";
 import { getSubagentActivityFile } from "../../activity.ts";
 import { INITIAL_SKILLS_ENV } from "../../initial-skills.ts";
+import { shellComment } from "../../shell.ts";
 
 const SUBAGENT_CONTROL_TOOLS = ["caller_ping", "subagent_done"] as const;
 
@@ -36,6 +37,8 @@ export function buildPiPromptArgs(params: {
 }): string[] {
   // Skills expand inside the child input hook, in the same task input. CLI
   // positional messages are separate turns and must never carry startup skills.
+  // The driver supplies a controlled @artifact, even for direct/fork delivery:
+  // Pi parses @file after -- too, so raw task text is not a safe CLI argument.
   return [params.taskArg];
 }
 
@@ -79,6 +82,7 @@ export class PiHarnessDriver implements HarnessDriver {
     const profile = context.launchProfile ?? resolveLaunchProfile(context, "pi",
       buildSubagentToolAllowlist(params.tools ?? agentDefs?.tools));
     const parts: string[] = ["pi"];
+    if (profile.projectTrust === false || context.denyProjectConfig) parts.push("--no-approve");
     parts.push("--session", shellQuote(subagentSessionFile));
 
     const subagentDonePath = join(subagentsDir, "subagent-done.ts");
@@ -126,27 +130,27 @@ export class PiHarnessDriver implements HarnessDriver {
 
     const correlation = profile.planTask
       ? `\n\nCorrelation (report only; do not mutate the parent plan): planId=${profile.planTask.planId}, taskId=${profile.planTask.taskId}, attemptId=${profile.planTask.attemptId}, runId=${params.id}` : "";
-    const fullTask = (context.resume || taskDelivery === "direct"
+    const fullTask = (context.resume
       ? params.task
-      : `${roleBlock ?? ""}\n\n${modeHint ?? ""}\n\n${params.task}\n\n${summaryInstruction ?? ""}`) + correlation;
+      : taskDelivery === "direct"
+        ? `${roleBlock ? `${roleBlock}\n\n` : ""}${params.task}`
+        : `${roleBlock ?? ""}\n\n${modeHint ?? ""}\n\n${params.task}\n\n${summaryInstruction ?? ""}`) + correlation;
 
-    let taskArg: string;
-    if (taskDelivery === "direct") {
-      taskArg = fullTask;
-    } else {
-      const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-      const safeName = params.name
-        .toLowerCase()
-        .replace(/[^a-z0-9\s-]/g, "")
-        .replace(/\s+/g, "-")
-        .replace(/-+/g, "-")
-        .replace(/^-|-$/g, "");
-      const artifactName = `context/${safeName || "subagent"}-${timestamp}-${params.id}.md`;
-      const artifactPath = join(artifactDir, artifactName);
-      mkdirSync(dirname(artifactPath), { recursive: true });
-      writeFileSync(artifactPath, fullTask, "utf8");
-      taskArg = `@${artifactPath}`;
-    }
+    // taskDelivery controls the prompt's shape, not CLI interpretation. Always
+    // attach one controlled file, whose contents Pi reads once without treating
+    // leading --approve/--no-session/@file as flags or recursive attachments.
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const safeName = params.name
+      .toLowerCase()
+      .replace(/[^a-z0-9\s-]/g, "")
+      .replace(/\s+/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-|-$/g, "");
+    const artifactName = `context/${safeName || "subagent"}-${timestamp}-${params.id}.md`;
+    const artifactPath = join(artifactDir, artifactName);
+    mkdirSync(dirname(artifactPath), { recursive: true });
+    writeFileSync(artifactPath, fullTask, { encoding: "utf8", mode: 0o600 });
+    const taskArg = `@${artifactPath}`;
 
     const effectiveSkills = params.skills ?? agentDefs?.skills;
     envParts.push(`${INITIAL_SKILLS_ENV}=${shellQuote(context.resume ? "" : effectiveSkills ?? "")}`);
@@ -184,12 +188,12 @@ export class PiHarnessDriver implements HarnessDriver {
       sessionFile: subagentSessionFile,
       cli: "pi",
       launchScriptPreamble: [
-        `# Subagent launch script for ${params.name}`,
-        `# Generated: ${new Date().toISOString()}`,
-        `# Session: ${subagentSessionFile}`,
-        `# Surface: ${surface}`,
-        `# Runtime: ${runtimePlan.model} (thinking: ${runtimePlan.thinking})`,
-      ],
+        `Subagent launch script for ${params.name}`,
+        `Generated: ${new Date().toISOString()}`,
+        `Session: ${subagentSessionFile}`,
+        `Surface: ${surface}`,
+        `Runtime: ${runtimePlan.model} (thinking: ${runtimePlan.thinking})`,
+      ].map(shellComment),
     };
   }
 }

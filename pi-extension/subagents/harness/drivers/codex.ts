@@ -7,6 +7,8 @@ import type {
 } from "../types.ts";
 import type { ResolvedRuntimePlan } from "../../runtime-routing.ts";
 import { extractPaneSummary } from "../pane-summary.ts";
+import { resolveRoleInstructions } from "../../role-instructions.ts";
+import { shellComment } from "../../shell.ts";
 
 export class CodexHarnessDriver implements HarnessDriver {
   readonly id = "codex";
@@ -30,14 +32,13 @@ export class CodexHarnessDriver implements HarnessDriver {
       surface,
       shellQuote,
       inheritsConversationContext,
-      roleBlock,
       modeHint,
       summaryInstruction,
     } = context;
 
     const fullTask = inheritsConversationContext
       ? params.task
-      : `${roleBlock ?? ""}\n\n${modeHint ?? ""}\n\n${params.task}\n\n${summaryInstruction ?? ""}`;
+      : `${modeHint ?? ""}\n\n${params.task}\n\n${summaryInstruction ?? ""}`;
 
     const cmdParts: string[] = ["codex"];
 
@@ -49,7 +50,7 @@ export class CodexHarnessDriver implements HarnessDriver {
       cmdParts.push("--reasoning-effort", shellQuote(effectiveThinking));
     }
 
-    const sp = params.systemPrompt ?? agentDefs?.body;
+    const sp = context.identity ?? resolveRoleInstructions(agentDefs?.body, params.systemPrompt);
     if (sp) {
       cmdParts.push("--system-prompt", shellQuote(sp));
     }
@@ -63,10 +64,10 @@ export class CodexHarnessDriver implements HarnessDriver {
       command,
       cli: "codex",
       launchScriptPreamble: [
-        `# Codex subagent launch script for ${params.name}`,
-        `# Generated: ${new Date().toISOString()}`,
-        `# Surface: ${surface}`,
-      ],
+        `Codex subagent launch script for ${params.name}`,
+        `Generated: ${new Date().toISOString()}`,
+        `Surface: ${surface}`,
+      ].map(shellComment),
     };
   }
 

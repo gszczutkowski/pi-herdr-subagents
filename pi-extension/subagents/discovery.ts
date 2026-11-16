@@ -1,4 +1,6 @@
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { canonicalSessionPath } from "./ownership.ts";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -23,6 +25,10 @@ export interface AgentDefaults {
   commandTemplate?: string;
   body?: string;
   disableModelInvocation?: boolean;
+  source?: AgentSource;
+  sourcePath?: string;
+  sourceHash?: string;
+  sourceCwd?: string;
 }
 
 export type AgentSource = "package" | "global" | "project";
@@ -107,24 +113,29 @@ export function parseAgentDefinition(content: string, fallbackName: string): Age
   };
 }
 
-export function discoverAgentDefinitions(): ListedAgentDefinition[] {
+export interface DiscoveryOptions { cwd?: string; projectAgents?: boolean }
+
+/** Project sources require an explicitly authorized caller; default is user/package only. */
+export function discoverAgentDefinitions(options: DiscoveryOptions = {}): ListedAgentDefinition[] {
   const agents = new Map<string, ListedAgentDefinition>();
   const dirs: Array<{ path: string; source: AgentSource }> = [
     { path: getBundledAgentsDir(), source: "package" },
     { path: join(getAgentConfigDir(), "agents"), source: "global" },
-    { path: join(process.cwd(), ".pi", "agents"), source: "project" },
+    ...(options.projectAgents && options.cwd
+      ? [{ path: join(options.cwd, ".pi", "agents"), source: "project" as const }] : []),
   ];
 
   for (const { path: dir, source } of dirs) {
     if (!existsSync(dir)) continue;
     for (const file of readdirSync(dir).filter((entry) => entry.endsWith(".md"))) {
       try {
-        const parsed = parseAgentDefinition(
-          readFileSync(join(dir, file), "utf8"),
-          file.replace(/\.md$/, ""),
-        );
+        const sourcePath = canonicalSessionPath(join(dir, file));
+        const content = readFileSync(sourcePath, "utf8");
+        const parsed = parseAgentDefinition(content, file.replace(/\.md$/, ""));
         if (!parsed) continue;
-        agents.set(parsed.name, { ...parsed, source });
+        const sourceHash = createHash("sha256").update(content).digest("hex");
+        agents.set(parsed.name, { ...parsed, source, sourcePath, sourceHash,
+          ...(source === "project" ? { sourceCwd: realpathSync(options.cwd!) } : {}) });
       } catch {
         // Skip unreadable or racy entries rather than aborting discovery
         // for every other agent definition.
@@ -165,7 +176,7 @@ export function buildAvailableAgentCatalog(
   return lines.join("\n");
 }
 
-export function loadAgentDefaults(agentName: string): AgentDefaults | null {
+export function loadAgentDefaults(agentName: string, options: DiscoveryOptions = {}): AgentDefaults | null {
   // The advertised frontmatter name, not the filename, is the lookup key.
-  return discoverAgentDefinitions().find((agent) => agent.name === agentName) ?? null;
+  return discoverAgentDefinitions(options).find((agent) => agent.name === agentName) ?? null;
 }

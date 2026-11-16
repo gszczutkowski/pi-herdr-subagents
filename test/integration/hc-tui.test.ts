@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, copyFileSync } from "node:fs";
+import { existsSync, readFileSync, copyFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { it } from "node:test";
 import { HcTuiRun, jsonLines, until } from "./hc-tui-harness.ts";
@@ -158,6 +158,202 @@ journey("interrupt live continuation", async run => {
   assert.equal(run.observed().filter(e => e.kind === "session_start" && e.session === child.sessionFile).length, 1);
   run.assertions.liveContinuation = { id: child.id, live, terminal: owned.surface };
 });
+
+// These journeys each own a fresh parent and exactly one child. Observe disk
+// publication as well as parent messages: a delayed watcher is not a pass.
+function retainedCompletions(child: any) {
+  const base = runCompletionFile(child.sessionFile, child.id), directory = `${base}.events`;
+  const files = [
+    ...(existsSync(base) ? [base] : []),
+    ...(existsSync(directory) ? readdirSync(directory).filter(name => name.endsWith(".json")).map(name => join(directory, name)) : []),
+  ];
+  return files.map(path => ({ path, modifiedAt: statSync(path).mtimeMs, payload: JSON.parse(readFileSync(path, "utf8")) }));
+}
+async function assertNoChildPublication(run: HcTuiRun, child: any) {
+  const owned = metadata(run, child);
+  assert.equal(retainedCompletions(child).length, 0, "No original run completion sidecar may be published");
+  assert.equal(run.messages().filter(m => m.customType === "subagent_result" || m.customType === "subagent_ping").length, 0,
+    "Neither a result nor a ping may reach this fresh parent");
+  assert.equal(run.observed().filter(e => e.terminal === owned.surface && e.kind === "session_shutdown" && e.data.reason === "quit").length, 0,
+    "The owned child must not request quit");
+  const text = await run.hc.readAsync(owned.surface, 0);
+  assert.equal(text.split(`__SUBAGENT_DONE_${child.id}_`).slice(1).some(tail => /^\d+__/.test(tail)), false,
+    "No actual launcher exit sentinel (as distinct from echoed script source)");
+}
+
+journey("manual Escape live continuation", async run => {
+  const child = await run.spawn("ManualEscape", "Run only bash with command node gate.mjs manual-escape and timeout 300. Do not call subagent_done or caller_ping before this gate finishes.", "verify-open");
+  await run.marker("manual-escape.started", "STARTED");
+  const owned = metadata(run, child);
+  const start = run.observed().find(e => e.kind === "session_start" && e.session === child.sessionFile && e.terminal === owned.surface);
+  assert.equal(start?.mode, "tui"); assert.ok(start?.pid);
+  const gate = run.observed().find(e => e.kind === "tool_start" && e.session === child.sessionFile && e.data.toolName === "bash" && e.data.args?.command === "node gate.mjs manual-escape");
+  assert.ok(gate, "Unmet precondition: actual child bash gate required before manual Escape");
+  assert.equal(gate.pid, start.pid); assert.equal(gate.terminal, owned.surface);
+  assert.equal(run.observed().some(e => e.session === child.sessionFile && e.kind === "tool_end" && e.data.toolCallId === gate.data.toolCallId), false, "Gate must still be active");
+  assert.equal(run.observed().some(e => e.session === child.sessionFile && e.kind === "tool_start" && ["subagent_done", "caller_ping"].includes(e.data.toolName)), false, "Abort must be unstaged");
+  await assertNoChildPublication(run, child);
+  await run.capture("before-manual-escape");
+  const at = Date.now();
+  run.keys(owned.surface, "escape"); // Literal Escape in our child, not subagent_interrupt or Ctrl+C.
+  const aborted = await until(run.evidence, () => run.observed().find(e => e.kind === "settled" && e.session === child.sessionFile && e.pid === start.pid && e.at >= at && e.data.aborted === true), "manual Escape aborted child settlement");
+  assert.equal(run.results("subagent_interrupt").length, 0);
+  assert.equal(existsSync(join(run.scratch, "manual-escape.release")), false);
+  assert.equal(existsSync(join(run.scratch, "manual-escape.txt")), false);
+  assert.equal(probeProcess(start.pid).kind, "present");
+  assert.equal((await run.hc.inspect(owned.surface)).kind, "present");
+  await assertNoChildPublication(run, child);
+  run.assertions.manualEscape = { start, gate, aborted, noAbortPublication: true };
+  const resumed = await run.resume(child, "Run bash: printf MANUAL_SURVIVED > manual-escape-followup.txt . Then call subagent_done exactly once with close false, and wait without exiting.", false);
+  assert.equal(resumed.id, child.id);
+  await run.marker("manual-escape-followup.txt", "MANUAL_SURVIVED");
+  const result = await run.completion(child);
+  assert.equal(result[0].details.keepOpen, true);
+  const followup = run.observed().find(e => e.kind === "tool_start" && e.session === child.sessionFile && e.data.toolName === "bash" && e.data.args?.command?.includes("manual-escape-followup.txt"));
+  assert.ok(followup); assert.equal(followup.pid, start.pid); assert.equal(followup.terminal, owned.surface);
+  assert.equal(run.observed().filter(e => e.kind === "session_start" && e.terminal === owned.surface).length, 1, "Continuation must not relaunch Pi");
+  assert.equal(probeProcess(start.pid).kind, "present");
+  assert.equal((await run.hc.inspect(owned.surface)).kind, "present");
+  assert.equal(existsSync(join(run.scratch, "manual-escape.txt")), false);
+  run.assertChildBash(child, "node gate.mjs manual-escape"); run.assertChildBash(child, "manual-escape-followup.txt");
+  run.assertions.manualEscapeContinuation = { resumed, followup, eventId: result[0].details.eventId };
+});
+
+journey("literal new after guarded abort detaches original supervision", async run => {
+  const child = await run.spawn("NewSession", "Run only bash with command node gate.mjs before-new and timeout 300. Do not call subagent_done or caller_ping before this gate finishes.", "verify-open");
+  await run.marker("before-new.started", "STARTED");
+  const owned = metadata(run, child);
+  const start = run.observed().find(e => e.kind === "session_start" && e.session === child.sessionFile && e.terminal === owned.surface);
+  assert.equal(start?.mode, "tui"); assert.ok(start?.pid); assert.ok(start?.sessionId);
+  const header = jsonLines(child.sessionFile).find(e => e.type === "session");
+  assert.equal(header?.id, start.sessionId);
+  const gate = run.observed().find(e => e.kind === "tool_start" && e.session === child.sessionFile && e.data.toolName === "bash" && e.data.args?.command === "node gate.mjs before-new");
+  assert.ok(gate, "Unmet precondition: unstaged active bash gate required before /new");
+  assert.equal(gate.pid, start.pid); assert.equal(gate.terminal, owned.surface);
+  const gateActive = () => !run.observed().some(e => e.session === child.sessionFile && e.kind === "tool_end" && e.data.toolCallId === gate.data.toolCallId);
+  assert.ok(gateActive(), "Gate must still be active");
+  assert.equal(run.observed().some(e => e.session === child.sessionFile && e.kind === "tool_start" && ["subagent_done", "caller_ping"].includes(e.data.toolName)), false);
+  await assertNoChildPublication(run, child);
+  await run.capture("before-literal-new");
+  const at = Date.now();
+  // HC's named-key transport can wait indefinitely for a quiet active TUI.
+  // Prove idle /new explicitly; this is NOT manual Escape or busy-/new proof.
+  run.action(run.parent, `Call subagent_interrupt exactly once with id ${JSON.stringify(child.id)}. Do not use other tools or retry. End your turn.`);
+  const requested = await until(run.evidence, () => run.results("subagent_interrupt").find(e => e.at >= at), "guarded abort before idle /new");
+  assert.equal(requested.data.result.details?.status, "interrupt_requested");
+  await until(run.evidence, () => run.observed().find(e => e.kind === "settled" && e.session === child.sessionFile && e.pid === start.pid && e.at >= at && e.data.aborted === true), "confirmed abort before idle /new");
+  await run.idle(at);
+  await assertNoChildPublication(run, child);
+  const precondition = "literal idle /new after guarded tool abort and confirmed aborted settlement; NOT manual Escape or direct busy /new proof";
+  run.assertions.newSessionPrecondition = precondition;
+  run.action(owned.surface, "/new"); // Literal HC keys, never a tagged model prompt.
+  const replacement = await until(run.evidence, () => run.observed().find(e => e.kind === "session_start" && e.terminal === owned.surface && e.data.reason === "new" && e.at >= at), "literal idle /new replacement");
+  assert.equal(replacement.mode, "tui"); assert.equal(replacement.pid, start.pid); assert.equal(replacement.terminal, owned.surface);
+  assert.ok(replacement.session); assert.ok(replacement.sessionId);
+  assert.notEqual(canonicalSessionPath(replacement.session), canonicalSessionPath(child.sessionFile));
+  assert.notEqual(replacement.sessionId, header.id, "Replacement must have a different session header, not just another path");
+  const aborted = run.observed().find(e => e.kind === "settled" && e.session === child.sessionFile && e.pid === start.pid && e.data.aborted === true && e.at >= at && e.at <= replacement.at);
+  const shutdown = run.observed().find(e => e.kind === "session_shutdown" && e.session === child.sessionFile && e.terminal === owned.surface && e.data.reason === "new" && e.at >= at && e.at <= replacement.at);
+  assert.ok(aborted); assert.ok(shutdown); assert.ok(aborted.at <= shutdown.at);
+  assert.equal(existsSync(join(run.scratch, "before-new.release")), false);
+  assert.equal(existsSync(join(run.scratch, "before-new.txt")), false);
+  await assertNoChildPublication(run, child);
+  const replacementAt = Date.now();
+  run.action(owned.surface, "Run bash: printf NEW_SESSION_SURVIVED > new-session-marker.txt . After bash succeeds reply exactly NEW_SESSION_SURVIVED. Do not call subagent_done, caller_ping, or any other tool; do not quit.");
+  await run.marker("new-session-marker.txt", "NEW_SESSION_SURVIVED");
+  const settled = await until(run.evidence, () => run.observed().find(e => e.kind === "settled" && e.session === replacement.session && e.pid === start.pid && e.at >= replacementAt && e.data.aborted === false), "replacement real bash turn settled");
+  const replacementHeader = jsonLines(replacement.session).find(e => e.type === "session");
+  assert.equal(replacementHeader?.id, replacement.sessionId); assert.notEqual(replacementHeader.id, header.id);
+  run.assertChildBash({ sessionFile: replacement.session }, "new-session-marker.txt");
+  const replacementBash = run.observed().find(e => e.kind === "tool_start" && e.session === replacement.session && e.data.toolName === "bash" && e.data.args?.command?.includes("new-session-marker.txt"));
+  assert.equal(replacementBash?.pid, start.pid); assert.equal(replacementBash?.terminal, owned.surface);
+  assert.ok(jsonLines(replacement.session).some(e => e.message?.role === "assistant" && e.message.content?.some((c: any) => c.type === "text" && c.text.trim() === "NEW_SESSION_SURVIVED")));
+  assert.equal(probeProcess(start.pid).kind, "present");
+  assert.equal((await run.hc.inspect(owned.surface)).kind, "present");
+  assert.equal(run.observed().filter(e => e.kind === "session_start" && e.terminal === owned.surface).length, 2, "No replacement process or extra session launch");
+  await assertNoChildPublication(run, child);
+  copyFileSync(child.sessionFile, join(run.evidence, `child-${child.id}-before-new.jsonl`));
+  copyFileSync(replacement.session, join(run.evidence, `child-${child.id}-after-new.jsonl`));
+  run.assertions.newSession = { precondition, start, header, gate, aborted, shutdown, replacement, replacementHeader, settled, noOriginalPublication: true, sameProcessSurvived: true };
+  await run.capture("replacement-survived");
+});
+
+for (const intent of ["done", "ping"] as const) {
+  journey(`staged ${intent} waits for same batch bash sibling`, async run => {
+    const gateName = `staged-${intent}`, command = `node gate.mjs ${gateName}`;
+    const toolName = intent === "done" ? "subagent_done" : "caller_ping";
+    const finalText = `FINAL_AFTER_${intent.toUpperCase()}_SIBLING`;
+    const pingMessage = `HC_PING_AFTER_SIBLING_${run.id}`;
+    const args = intent === "done" ? { close: false } : { message: pingMessage };
+    const child = await run.spawn(`Batch${intent}`, `This task specifically requires an actual two-tool-call assistant response. In your FIRST assistant response issue ${toolName} with arguments ${JSON.stringify(args)} AND bash with arguments ${JSON.stringify({ command, timeout: 300 })} in the SAME assistant message/tool batch, with ${toolName} first. Do not call them in separate messages, simulate tool results, use a wrapper tool, or release the gate yourself. The harness releases the bash gate. Once both tools really finish, reply exactly ${finalText} without further tool calls. This is an intentional sibling-settlement verification, despite the usual preference to call completion tools alone.`, "verify-open");
+    const owned = metadata(run, child);
+    const attempt = await until(run.evidence, () => {
+      const batch = jsonLines(child.sessionFile).find(e => e.message?.role === "assistant" && e.message.content?.some((c: any) => c.type === "toolCall" && c.name === "bash" && c.arguments?.command === command));
+      const settled = run.observed().find(e => e.kind === "settled" && e.session === child.sessionFile);
+      return batch || settled ? { batch, settled } : undefined;
+    }, `Unmet precondition: model must generate ${toolName} and gated bash in the same assistant tool batch`);
+    run.assertions.sameBatchPrecondition = { toolName, attempt };
+    assert.ok(attempt.batch, `Unmet precondition: child settled without the required ${toolName} + bash assistant batch; no sequential substitute is allowed`);
+    const calls = attempt.batch.message.content.filter((c: any) => c.type === "toolCall");
+    assert.equal(calls.length, 2, "Unmet precondition: exactly the two requested real sibling calls are required");
+    assert.equal(calls[0].name, toolName, "Unmet precondition: staged intent must be in the gate's actual assistant message");
+    assert.deepEqual(calls[0].arguments, args);
+    assert.equal(calls[1].name, "bash"); assert.equal(calls[1].arguments.command, command);
+    const start = run.observed().find(e => e.kind === "session_start" && e.session === child.sessionFile && e.terminal === owned.surface);
+    assert.equal(start?.mode, "tui"); assert.ok(start?.pid);
+    const staged = await until(run.evidence, () => run.observed().find(e => e.kind === "tool_end" && e.session === child.sessionFile && e.data.toolCallId === calls[0].id), "actual recorded staged intent while bash sibling is blocked");
+    assert.equal(staged.data.toolName, toolName); assert.equal(staged.data.isError, false);
+    assert.match(staged.data.result.content.map((c: any) => c.text || "").join("\n"), intent === "done" ? /Result staged for settlement/ : /Ping staged/);
+    await run.marker(`${gateName}.started`, "STARTED");
+    const gate = run.observed().find(e => e.kind === "tool_start" && e.session === child.sessionFile && e.data.toolCallId === calls[1].id && e.data.toolName === "bash");
+    assert.ok(gate); assert.equal(gate.pid, start.pid); assert.equal(gate.terminal, owned.surface);
+    assert.equal(staged.pid, start.pid); assert.equal(staged.terminal, owned.surface);
+    assert.equal(run.observed().some(e => e.session === child.sessionFile && e.kind === "tool_end" && e.data.toolCallId === calls[1].id), false, "Intent must actually be staged while its real bash sibling is still blocked");
+    assert.equal(run.observed().some(e => e.kind === "settled" && e.session === child.sessionFile), false, "No settlement before sibling release");
+    assert.equal(existsSync(join(run.scratch, `${gateName}.release`)), false);
+    assert.equal(existsSync(join(run.scratch, `${gateName}.txt`)), false);
+    await assertNoChildPublication(run, child);
+    assert.equal(probeProcess(start.pid).kind, "present");
+    assert.equal((await run.hc.inspect(owned.surface)).kind, "present");
+    run.assertions.stagedWhileSiblingBlocked = { assistantEntryId: attempt.batch.id, calls, staged, gate, noPublication: true, noQuit: true };
+    await run.capture("staged-sibling-blocked");
+    const releasedAt = Date.now();
+    run.release(gateName);
+    await run.marker(`${gateName}.txt`, gateName);
+    const ended = await until(run.evidence, () => run.observed().find(e => e.kind === "tool_end" && e.session === child.sessionFile && e.data.toolCallId === calls[1].id), "actual gated bash sibling finished");
+    assert.equal(ended.data.isError, false); assert.ok(ended.at >= releasedAt);
+    const settled = await until(run.evidence, () => run.observed().find(e => e.kind === "settled" && e.session === child.sessionFile && e.pid === start.pid && e.at >= ended.at && e.data.aborted === false), "actual child settlement after sibling completion");
+    let delivery: any;
+    if (intent === "done") {
+      [delivery] = await run.completion(child);
+      assert.equal(delivery.details.keepOpen, true); assert.equal(delivery.details.response, finalText);
+      assert.equal((await run.hc.inspect(owned.surface)).kind, "present");
+      assert.equal(probeProcess(start.pid).kind, "present");
+      assert.equal(run.observed().some(e => e.kind === "session_shutdown" && e.terminal === owned.surface), false);
+      assert.equal(run.messages().filter(m => m.customType === "subagent_ping").length, 0);
+    } else {
+      const pings = () => run.messages().filter(m => m.customType === "subagent_ping" && m.details?.sessionFile === child.sessionFile);
+      delivery = await until(run.evidence, () => pings()[0], "actual parent subagent_ping after sibling settlement");
+      const timestamp = typeof delivery.timestamp === "number" ? delivery.timestamp : Date.parse(delivery.timestamp);
+      await run.idle(timestamp);
+      assert.equal(pings().length, 1); assert.equal(delivery.details.message, pingMessage);
+      assert.equal(run.deliveries(child.id).length, 0, "Ping must not also produce a result");
+      const quit = await until(run.evidence, () => run.observed().find(e => e.kind === "session_shutdown" && e.session === child.sessionFile && e.data.reason === "quit"), "ping child quits only after real settlement");
+      assert.ok(quit.at >= settled.at); assert.ok(quit.at >= releasedAt);
+      copyFileSync(child.sessionFile, join(run.evidence, `child-${child.id}.jsonl`));
+    }
+    const deliveredAt = typeof delivery.timestamp === "number" ? delivery.timestamp : Date.parse(delivery.timestamp);
+    assert.ok(deliveredAt >= settled.at, "Parent notification must follow actual agent_settled, not merely intent staging");
+    const retained = retainedCompletions(child);
+    assert.equal(retained.length, 1); assert.equal(retained[0].payload.type, intent === "done" ? "done" : "ping");
+    assert.ok(retained[0].modifiedAt >= settled.at, "Immutable completion bytes must be written after actual settlement, not staged early for delayed delivery");
+    assert.equal(retained[0].payload.summary, finalText, "Publication must contain the real final post-sibling assistant response");
+    run.save("settled-sibling-completion.json", retained);
+    run.assertChildBash(child, command);
+    assert.equal(run.observed().filter(e => e.kind === "session_start" && e.terminal === owned.surface).length, 1);
+    run.assertions.siblingSettlement = { intent, assistantEntryId: attempt.batch.id, releasedAt, ended, settled, deliveredAt, delivery, retained };
+  });
+}
 
 journey("parent OS death and recovery", async run => {
   const child = await run.spawn("Recovery", "Run bash: node gate.mjs recovery . Summarize, then wait. Do not call subagent_done until the user's explicit completion request.", "verify-open");

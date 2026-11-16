@@ -543,6 +543,24 @@ describe("Generic Harness Driver & Templates", () => {
   });
 });
 
+describe("external harness role composition", () => {
+  for (const cli of ["claude", "opencode", "codex", "grok", "custom", "custom-template"]) {
+    it(`${cli} delivers the named body and explicit instructions once each`, () => {
+      const context = createMockLaunchContext({
+        params: { id: "role-run", name: "Role", task: "ROLE_TASK", systemPrompt: "EXPLICIT_INSTRUCTIONS" },
+        agentDefs: { name: "Named", body: "NAMED_INSTRUCTIONS",
+          ...(cli === "custom-template" ? { commandTemplate: "custom {task}" } : {}) },
+        inheritsConversationContext: false,
+        roleBlock: "NAMED_INSTRUCTIONS\n\nEXPLICIT_INSTRUCTIONS",
+      });
+      const command = getHarnessDriver(cli).buildCommand(context).command;
+      assert.equal(command.split("NAMED_INSTRUCTIONS").length - 1, 1);
+      assert.equal(command.split("EXPLICIT_INSTRUCTIONS").length - 1, 1);
+      assert.ok(command.indexOf("NAMED_INSTRUCTIONS") < command.indexOf("EXPLICIT_INSTRUCTIONS"));
+    });
+  }
+});
+
 describe("run-bound harness completion", () => {
   for (const cli of ["pi", "claude", "codex", "opencode", "grok", "custom"]) {
     it(`${cli} emits only its run-qualified shell trailer`, () => {

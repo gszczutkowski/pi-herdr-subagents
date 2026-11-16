@@ -8,6 +8,7 @@ import { isPlanTaskBinding, type PlanTaskBinding } from "./plan-runtime.ts";
 import { contractTask, isAssignmentContract, type AssignmentContract } from "./contracts.ts";
 import type { ResolvedRuntimePlan } from "./runtime-routing.ts";
 import { isLineage, type Lineage } from "./lineage.ts";
+import type { DefinitionSource } from "./project-trust.ts";
 
 /** Resolved, noncredential launch inputs only; never snapshot process.env or auth/config contents. */
 export interface LaunchProfile {
@@ -17,6 +18,9 @@ export interface LaunchProfile {
   harness: string;
   sessionFile: string;
   role: string | null;
+  definitionSource?: DefinitionSource;
+  /** A denial remains a launch restriction, never an implicit --approve. */
+  projectTrust?: false;
   identity: string | null;
   cwd: string;
   agentDir: string;
@@ -41,6 +45,9 @@ export function resolveLaunchProfile(context: SubagentLaunchContext, harness: st
     version: 1, harness, sessionFile: canonicalSessionPath(context.subagentSessionFile),
     ...(context.lineage ? { lineage: context.lineage } : {}),
     role: context.params.agent ?? context.agentDefs?.name ?? null,
+    ...(context.agentDefs?.source && context.agentDefs.sourcePath && context.agentDefs.sourceHash
+      ? { definitionSource: { source: context.agentDefs.source, sourcePath: context.agentDefs.sourcePath, sourceHash: context.agentDefs.sourceHash,
+        ...(context.agentDefs.sourceCwd ? { sourceCwd: context.agentDefs.sourceCwd } : {}) } } : {}),
     identity: context.identity ?? null, cwd: resolve(context.effectiveCwd),
     agentDir: resolve(context.localAgentDir && existsSync(context.localAgentDir)
       ? context.localAgentDir : process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent")),
@@ -75,6 +82,12 @@ export function readPiLaunchProfile(sessionFile: string): LaunchProfile {
   if ((p?.lineage !== undefined && (!isLineage(p.lineage) || p.lineage.child.sessionFile !== p.sessionFile)) || p?.version !== 1 || p.harness !== "pi" || p.sessionFile !== canonicalSessionPath(sessionFile) ||
     (p.planTask !== undefined && !isPlanTaskBinding(p.planTask)) ||
     (p.assignmentContract !== undefined && !isAssignmentContract(p.assignmentContract)) ||
+    (p.projectTrust !== undefined && p.projectTrust !== false) ||
+    (p.definitionSource !== undefined && (!p.definitionSource ||
+      !["package", "global", "project"].includes(p.definitionSource.source) ||
+      typeof p.definitionSource.sourcePath !== "string" || !isAbsolute(p.definitionSource.sourcePath) ||
+      typeof p.definitionSource.sourceHash !== "string" || !/^[a-f0-9]{64}$/.test(p.definitionSource.sourceHash) ||
+      (p.definitionSource.source === "project" && (typeof p.definitionSource.sourceCwd !== "string" || !isAbsolute(p.definitionSource.sourceCwd))))) ||
     typeof p.cwd !== "string" || !isAbsolute(p.cwd) ||
     typeof p.agentDir !== "string" || !isAbsolute(p.agentDir) ||
     ![p.role, p.identity, p.tools, p.skills].every(nullableString) ||

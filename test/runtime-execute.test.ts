@@ -35,6 +35,7 @@ test("spawn and closed-session resume durably record intent before terminal disp
   syncBuiltinESMExports();
   process.env.HERDR_ENV = "1"; process.env.HERDR_WORKSPACE_ID = "test";
   process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
+  process.env.PI_CODING_AGENT_DIR = dir; // Isolated, explicitly selected user-level profile.
   for (const key of ["HC_TERMINAL_ID", "HC_TERMINAL_SOCKET", "PI_DENY_TOOLS", "PI_SUBAGENT_LAYOUT"]) delete process.env[key];
   const tools = new Map<string, any>(); const handlers = new Map<string, any>(); const branch: any[] = [];
   const notifications: any[] = [];

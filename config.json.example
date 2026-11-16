@@ -16,6 +16,7 @@
     "reserveTokens": 50000,
     "reservePercent": 20,
     "keepRecentTokens": 20000,
-    "maxReportBytes": 12000
+    "maxReportBytes": 12000,
+    "providerPayloadWarningBytes": {}
   }
 }

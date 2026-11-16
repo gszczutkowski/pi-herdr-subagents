@@ -76,8 +76,9 @@ test("native plan UI and context are read-only projections independent of durabl
       await commands.get("plan-view").handler(mode, ctx);
       assert.match(render(), /accepted/);
       for (const width of [1, 20, 80]) widgets.get(PLAN_WIDGET)({}, { fg: (_: string, text: string) => text }).render(width);
-      const context = await emit("context", { messages: [] });
-      assert.match(JSON.stringify(context), /accepted/);
+      const context = await emit("before_agent_start");
+      assert.match(context.message.content, /accepted/);
+      assert.equal(await emit("context", { messages: sm.buildSessionContext().messages }), undefined, "no ordinary request-time projection");
     }
     await emit("session_start", { reason: "reload" });
     await emit("session_tree");
@@ -103,7 +104,7 @@ test("native plan UI and context are read-only projections independent of durabl
     await emit("session_tree");
     assert.equal(read().tasks[0].attempts[0].results.length, 0);
     assert.equal(read().tasks[0].status, "accepted");
-    assert.match(JSON.stringify(await emit("context", { messages: [] })), /accepted/);
+    assert.match((await emit("before_agent_start")).message.content, /accepted/);
     assert.equal(readFileSync(sm.getSessionFile()!, "utf8"), sessionBytes);
     assert.deepEqual(runtime.snapshot().outbox, beforeOutbox);
 

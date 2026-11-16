@@ -10,7 +10,7 @@ import * as store from "../pi-extension/subagents/plan-store.ts";
 import {
   clipCheckpointText, CONTEXT_CHECKPOINT_BYTES, CONTEXT_CHECKPOINT_CONTEXT_TYPE, CONTEXT_CHECKPOINT_ENTRY,
   CONTEXT_CHECKPOINT_ITEMS, CONTEXT_CHECKPOINT_PLAN_BYTES, CONTEXT_CHECKPOINT_PREFIX, CONTEXT_CHECKPOINT_STATE_BYTES,
-  decodeContextCheckpoint, projectContextCheckpoint, registerContextCheckpoint, validateCheckpointWorkingState,
+  decodeContextCheckpoint, checkpointContext, registerContextCheckpoint, validateCheckpointWorkingState,
   type CheckpointWorkingState, type ContextCheckpointInput,
 } from "../pi-extension/subagents/context-checkpoint.ts";
 
@@ -40,7 +40,7 @@ function registration(sm: SessionManager, plans: PlanPersistence, child = false,
   return {
     controller, ctx, events, tools, appends: () => appends,
     invoke: (params: ContextCheckpointInput) => tools.get("context_checkpoint").execute("checkpoint-call", params, undefined, undefined, ctx),
-    project: (messages: any[] = sm.buildSessionContext().messages) => events.get("context")!({ messages }, ctx).messages as any[],
+    project: (messages: any[] = sm.buildSessionContext().messages) => previewCheckpoint(messages, controller.read(ctx)),
   };
 }
 function fixture(conversation = true) {
@@ -52,6 +52,13 @@ function fixture(conversation = true) {
 }
 const save = (state: CheckpointWorkingState = workingState): ContextCheckpointInput => ({ action: "save", ...state });
 const checkpointText = (messages: any[]) => messages.filter(message => message.role === "custom" && message.customType === CONTEXT_CHECKPOINT_CONTEXT_TYPE).map(message => message.content).join("\n");
+// Formatting-only preview for the storage/bounds tests below. Native hook
+// ordering, receipt dedup and provider prefixes are tested separately.
+function previewCheckpoint(messages: any[], view: Parameters<typeof checkpointContext>[0]) {
+  const retained = messages.filter(message => !(message.role === "custom" && message.customType === CONTEXT_CHECKPOINT_CONTEXT_TYPE && message.details?.preview));
+  const content = checkpointContext(view);
+  return content ? [...retained, { role: "custom", customType: CONTEXT_CHECKPOINT_CONTEXT_TYPE, content, details: { preview: true } }] : retained;
+}
 
 test("native retain-none compaction, reopen and extension reload preserve explicit state and plan pointer", async () => {
   const { sm, plans, cleanup } = fixture();
@@ -59,6 +66,10 @@ test("native retain-none compaction, reopen and extension reload preserve explic
     const plan = plans.create(sm, 0, "Checkpoint plan");
     const r = registration(sm, plans);
     const saved = await r.invoke(save());
+    assert.deepEqual(JSON.parse(saved.content[0].text), { status: "saved", entryId: saved.details.entryId, durable: true });
+    assert.ok(Buffer.byteLength(saved.content[0].text) < 200);
+    assert.doesNotMatch(saved.content[0].text, /Finish checkpoint|planSummary/);
+    assert.match((await r.invoke({ action: "read" })).content[0].text, /Finish checkpoint implementation/);
     assert.deepEqual(saved.details.checkpoint.workingState, workingState);
     assert.equal(saved.details.checkpoint.originSessionId, sm.getSessionId());
     assert.equal(saved.details.checkpoint.reason, "save");
@@ -72,7 +83,7 @@ test("native retain-none compaction, reopen and extension reload preserve explic
     assert.doesNotMatch(JSON.stringify(sm.buildSessionContext().messages), /Finish checkpoint|Checkpoint plan/);
     const bytes = readFileSync(sm.getSessionFile()!, "utf8");
     assert.match(checkpointText(r.project()), /Finish checkpoint implementation 日本語 🚀/);
-    assert.match(checkpointText(r.project()), new RegExp(plan.planId));
+    assert.doesNotMatch(checkpointText(r.project()), /planSummary|Checkpoint plan/, "working notes do not duplicate the captured plan summary");
     const reopened = SessionManager.open(sm.getSessionFile()!);
     const restoredPlans = new PlanPersistence(() => assert.fail("Read must not mutate plan"), false);
     const reopenedRuntime = registration(reopened, restoredPlans);
@@ -148,8 +159,8 @@ test("all compaction reasons freshly capture plan changes, preserve explicit sta
     for (let i = 0; i < 5; i++) { r.controller.read(r.ctx); await r.invoke({ action: "read" }); r.project(r.project()); }
     assert.equal(r.appends(), count);
     assert.equal(readFileSync(sm.getSessionFile()!, "utf8"), disk);
-    assert.equal(r.events.has("before_agent_start"), false);
-    assert.deepEqual([...r.events.keys()].sort(), ["context", "session_before_compact"]);
+    assert.equal(r.events.has("before_agent_start"), true);
+    assert.deepEqual([...r.events.keys()].sort(), ["before_agent_start", "context", "session_before_compact", "turn_end"]);
   } finally { cleanup(); }
 });
 
@@ -283,11 +294,11 @@ test("bounded Unicode state, total JSON escaping budget and replaceable projecti
     const sameType = { ...other, customType: CONTEXT_CHECKPOINT_CONTEXT_TYPE }; // not our marked projection
     const input: any[] = [user, other, sameType];
     const copy = structuredClone(input);
-    const output = projectContextCheckpoint(input, r.controller.read(r.ctx));
+    const output = previewCheckpoint(input, r.controller.read(r.ctx));
     assert.deepEqual(input, copy);
     assert.equal(output[0], user); assert.equal(output[1], other); assert.equal(output[2], sameType);
     assert.equal(output.length, 4);
-    assert.deepEqual(projectContextCheckpoint(output, r.controller.read(r.ctx)), output);
+    assert.deepEqual(previewCheckpoint(output, r.controller.read(r.ctx)), output);
     const text = String((output.at(-1) as any).content);
     assert.ok(Buffer.byteLength(text, "utf8") <= CONTEXT_CHECKPOINT_BYTES);
     assert.equal(text.isWellFormed(), true);
@@ -319,9 +330,9 @@ test("real native disk append failure hides memory-only data and latches across 
     const projected = r.project([]);
     const file = sm.getSessionFile()!;
     const backup = `${file}.backup`;
-    renameSync(file, backup); mkdirSync(file); // Pi advances memory, then appendFileSync throws.
+    renameSync(file, backup); mkdirSync(file); // appendFileSync fails on a directory.
     await assert.rejects(() => r.invoke(save({ ...workingState, goal: "MEMORY_ONLY_CHECKPOINT" })), /durability uncertain/);
-    assert.match(JSON.stringify(sm.getBranch().at(-1)), /MEMORY_ONLY_CHECKPOINT/);
+    assert.doesNotMatch(JSON.stringify(sm.getBranch().at(-1)), /MEMORY_ONLY_CHECKPOINT/, "Pi 1.5.2 rolls back the failed native append; the extension still conservatively latches uncertainty");
     rmSync(file, { recursive: true }); renameSync(backup, file);
     assert.doesNotMatch(readFileSync(file, "utf8"), /MEMORY_ONLY_CHECKPOINT/);
     assert.equal(r.controller.read(r.ctx).checkpoint, undefined);
@@ -408,7 +419,7 @@ test("actual Pi lifecycle and model-issued checkpoint tool survive native retain
     await session.prompt("Save concise working state");
     assert.equal(requests, 2);
     assert.equal(projections[0], "");
-    assert.match(projections[1], /Finish checkpoint implementation/);
+    assert.equal(projections[1], "", "the persistent save receipt and its call already carry the replacement notes");
     const plan = plans.create(sm, 0, "Runtime plan pointer");
     assert.equal(controller.capture(runtimeCtx, "proactive").status, "saved");
     const captures = sm.getEntries().filter(entry => entry.type === "custom" && entry.customType === CONTEXT_CHECKPOINT_ENTRY).length;
@@ -421,8 +432,8 @@ test("actual Pi lifecycle and model-issued checkpoint tool survive native retain
     await session.prompt("Continue from the persisted checkpoint");
     assert.equal(requests, 3);
     assert.match(projections[2], /Finish checkpoint implementation/);
-    assert.match(projections[2], new RegExp(plan.planId));
-    assert.equal(sm.getEntries().filter(entry => entry.type === "custom_message" && entry.customType === CONTEXT_CHECKPOINT_CONTEXT_TYPE).length, 0);
+    assert.doesNotMatch(projections[2], new RegExp(plan.planId), "no stale duplicate plan summary");
+    assert.equal(sm.getEntries().filter(entry => entry.type === "custom_message" && entry.customType === CONTEXT_CHECKPOINT_CONTEXT_TYPE).length, 1);
     assert.deepEqual(errors, []);
     const reopened = SessionManager.open(sm.getSessionFile()!);
     assert.deepEqual(registration(reopened, plans).controller.read({ sessionManager: reopened } as ExtensionContext).checkpoint?.workingState, workingState);
