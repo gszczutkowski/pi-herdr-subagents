@@ -2,7 +2,7 @@
 
 ## Status i zakres
 
-Dokument zapisuje ustalenia przeglądu bieżącego drzewa roboczego, obejmującego również istniejące niezacommitowane zmiany. **Implementacja w toku na gałęzi `fix/subagent-repair-sequence`.** Stan zaznaczonych punktów odnosi się do testów lokalnych; testy rzeczywistych terminali herdr pozostają niewykonane (brak herdr w bieżącym środowisku).
+Dokument zapisuje ustalenia przeglądu bieżącego drzewa roboczego, obejmującego również istniejące niezacommitowane zmiany. **Implementacja w toku na gałęzi `fix/subagent-repair-sequence`.** Stan zaznaczonych punktów odnosi się do testów lokalnych; testy rzeczywistych terminali herdr pozostają niewykonane (brak herdr w bieżącym środowisku). Bieżący zbiorczy status i zależności: [BACKLOG.md](BACKLOG.md); końcowe dowody: `test/REPAIR-VERIFICATION.md`.
 
 Zakres: przekazywanie kontekstu, instrukcji i wyników; uruchamianie i kończenie pracy; przerywanie, wznawianie oraz zgodność z planem rodzica. To lista usterek i kryteriów naprawy, nie zapis stanu uruchomionych agentów ani zamiennik istniejącego planu rozwoju.
 
@@ -114,8 +114,10 @@ Wdrożono `reconcileContinuation`: walidacja żądania, sesji, runId, tokenu i p
 
 ## 6. Niespójne stany po Escape
 
-- [ ] Oddzielić żądanie przerwania od potwierdzonego przerwania tury.
-- [ ] Dodać test ręcznego Escape oraz Escape wysłanego do bezczynnego dziecka.
+- [x] Oddzielić żądanie przerwania od potwierdzonego przerwania tury.
+- [x] Dodać test ręcznego Escape oraz Escape wysłanego do bezczynnego dziecka.
+
+Wdrożono: etykieta rodzica jest obserwacją, nie potwierdzeniem Escape. Kontynuację dopuszcza aktualny token bezczynności dziecka powiązany z run/session, po sprawdzeniu procesu, panelu i custody. `test/live-continuation-native.test.ts` przechodzi przez natywne `AgentSession.abort()` i kontynuację tej samej sesji; testy jednostkowe odrzucają stare/obce tokeny i pracujące dziecko. Dostarczenie fizycznego klawisza Escape przez terminal nie jest tu zweryfikowane.
 
 **Miejsce:** `pi-extension/subagents/live-continuation.ts:114–135`; `pi-extension/subagents/index.ts:1022`, `markInterruptRequested()`.
 
@@ -130,8 +132,10 @@ Wdrożono `reconcileContinuation`: walidacja żądania, sesji, runId, tokenu i p
 
 ## 7. Nowy wynik może zawierać podsumowanie poprzedniego zadania
 
-- [ ] Ograniczyć ekstrakcję podsumowania do bieżącej tury i aktywnej gałęzi.
-- [ ] Dodać test kończenia tury bez tekstu asystenta.
+- [x] Ograniczyć ekstrakcję podsumowania do bieżącej tury i aktywnej gałęzi.
+- [x] Dodać test kończenia tury bez tekstu asystenta.
+
+Wdrożono: granica nadzorowanego zadania to zbiór identyfikatorów wpisów sprzed `before_agent_start`; tekst wybierany jest wyłącznie z nowych wpisów aktywnej gałęzi. Brak tekstu ma jawny komunikat, aby legacy fallback rodzica nie odczytał poprzedniego zadania. `test/completion-turn.test.ts` obejmuje keepOpen, wznowienie i porzuconą gałąź; wynik strukturalny zachowuje niezależność.
 
 **Miejsce:** `pi-extension/subagents/run-artifacts.ts:31`, `writeRunCompletion()`; pomocniczo `findLastAssistantMessage()` w `session.ts`.
 
@@ -146,9 +150,11 @@ Wdrożono `reconcileContinuation`: walidacja żądania, sesji, runId, tokenu i p
 
 ## 8. Instrukcje roli i `systemPrompt` bywają pomijane
 
-- [ ] Zachować instrukcje roli przy bezpośrednim przekazaniu zadania w fork.
-- [ ] Ustalić i udokumentować semantykę `systemPrompt` obok treści nazwanego agenta.
-- [ ] Sprawdzić instrukcje faktycznie otrzymywane przez model.
+- [x] Zachować instrukcje roli przy bezpośrednim przekazaniu zadania w fork.
+- [x] Ustalić i udokumentować semantykę `systemPrompt` obok treści nazwanego agenta.
+- [x] Sprawdzić instrukcje faktycznie otrzymywane przez model.
+
+Wdrożono: `systemPrompt` uzupełnia treść nazwanego agenta (body najpierw), nigdy jej nie zastępuje. Tryb append/replace zachowuje dotychczasową semantykę wobec promptu Pi; bez tego trybu rola trafia razem z zadaniem również w fork. `test/role-delivery.test.ts` sprawdza 21 przypadków przez rzeczywisty builder/CLI parser i natywny kontekst modelu Pi; zewnętrzne CLI mają testy poleceń i braku duplikacji, nie kontekstu ich providerów.
 
 **Miejsce:** `pi-extension/subagents/index.ts:1211–1214`; `pi-extension/subagents/harness/drivers/pi.ts:138–140`.
 
@@ -163,8 +169,10 @@ Wdrożono `reconcileContinuation`: walidacja żądania, sesji, runId, tokenu i p
 
 ## 9. Kontrakt omija walidację wymaganej wiadomości kontynuacji
 
-- [ ] Walidować oryginalną wiadomość przed dopisaniem metadanych.
-- [ ] Dodać testy braku wiadomości, pustego tekstu i samych białych znaków.
+- [x] Walidować oryginalną wiadomość przed dopisaniem metadanych.
+- [x] Dodać testy braku wiadomości, pustego tekstu i samych białych znaków.
+
+Wdrożono: live resume sprawdza surowe `params.message` przed `contractTask`; closed resume nadal dopuszcza brak wiadomości. Testy zarejestrowanego narzędzia w `test/plan-runtime.test.ts` i `test/ownership-execute.test.ts` obejmują warianty z kontraktem i bez, bez publikacji żądania przy odrzuceniu.
 
 **Miejsce:** `pi-extension/subagents/index.ts:2120`, budowa `continuationParams`.
 
@@ -179,8 +187,10 @@ Wdrożono `reconcileContinuation`: walidacja żądania, sesji, runId, tokenu i p
 
 ## 10. Projekcja planu wyprzedza import oczekujących wyników
 
-- [ ] Wykonać ponowienie importów przed projekcją planu do kontekstu modelu.
-- [ ] Dodać test kolejności handlerów po odzyskaniu sprawności zapisu.
+- [x] Wykonać ponowienie importów przed projekcją planu do kontekstu modelu.
+- [x] Dodać test kolejności handlerów po odzyskaniu sprawności zapisu.
+
+Wdrożono: ponowienie importów poprzedza publikację w `before_agent_start` i `turn_end`; zwykły context hook pozostaje bez mutacji. Awaryjne odtworzenie po kompakcji ma osobne ponowienie importów bezpośrednio przed fallbackiem. `test/plan-import-publication.test.ts` sprawdza produkcyjną kolejność oraz aktualną rewizję/status, bez ponownej dostawy ani dodatkowej tury. Niezależny przegląd zaakceptował tę implementację; pełne `npm test`: 626/626 bez pominięć.
 
 **Miejsce:** `pi-extension/subagents/index.ts:1485, 1500–1502`; rejestracja `registerPlanContext()` przez `plan-tools.ts`.
 

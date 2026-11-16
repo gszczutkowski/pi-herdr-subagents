@@ -2,6 +2,8 @@
 
 Async subagents for [pi](https://github.com/earendil-works/pi) running exclusively in [herdr](https://herdr.dev). Spawn, orchestrate, and manage sub-agent sessions in dedicated herdr tabs or panes. **Fully non-blocking** — the main agent keeps working while subagents run in the background.
 
+Current repair status and external dependencies: [BACKLOG.md](BACKLOG.md).
+
 ## How It Works
 
 Call `subagent()` and it **returns immediately**. The sub-agent runs in its own terminal pane. A live widget above the input shows all tracked agents with their projected state — for example `starting`, `active`, `waiting`, `interrupted`, `stalled`, `running`, or `finalizing`. The header summarizes **active** (processing) vs **open** (not processing). When every tracked subagent is open, the border switches to amber. When a sub-agent finishes, its result is **steered back** into the main session as an async notification — triggering a new turn so the agent can process it.
@@ -112,8 +114,9 @@ guarantee is made.
 
 After terminal loss, **resume the original saved parent session and branch**.
 Startup announces recorded assignments, including runs with no plan binding;
-a replaceable, request-time context projection (4KB maximum) makes them visible
-to the model without appending reminders or starting a turn. Use
+a bounded native context publication (4KB maximum) makes them visible
+at an existing agent/turn boundary, without starting a turn. A read-only
+post-compaction fallback preserves visibility until the next durable boundary. Use
 `/subagents-recovery [runId]` or `subagents_recovery({})` for the read-only report.
 The tool accepts `{ offset, limit }` (default 10, maximum 20) or `{ runId }` for
 detail, capped at 24KB with explicitly truncated fields. Detail includes the
@@ -154,6 +157,9 @@ Existing-plan commands also require `planId`. Criteria/artifact IDs are UUIDs.
 Results require their original `{ sessionId, branchInstanceId }` authority.
 Definition edits invalidate acceptance; acceptance requires evidence for every
 criterion. These are parent commands, not worker-controlled snapshot replacement.
+Mutations return compact planId/revision/authority and changed-task receipts,
+including newly created IDs; they do not repeat every task's history. Full UI
+details are retained; use an explicit read when missing details are needed.
 
 Full validated immutable snapshots use native `pi-subagents-plan/v1` entries.
 They survive terminal closure, reload, resume and native compaction. Only the
@@ -167,7 +173,8 @@ Unknown future plan schemas fail closed, never silently create an empty plan.
 Restored `in_progress` tasks stay unchanged and are reported as
 `recoveryUncertain`: persistence is not process-liveness or completion proof.
 Read/update commands never launch work, accept it automatically or restore
-runtime supervision. A request-time context projection reads this same store.
+runtime supervision. Native context publications read this same store at
+existing agent/turn boundaries; a post-compaction fallback preserves exact state.
 This is single-parent serialization, not multi-process CAS or an OS sandbox.
 
 ### Optional runtime provenance
@@ -205,7 +212,9 @@ outbox envelopes (including handed-off ones) remain retry sources after reload
 or recovery. Wrong-branch/origin imports are deferred, not redirected; select the
 original branch and reconcile any plan storage fault. `/subagents-recovery`
 shows bounded pending-import diagnostics but is read-only and does not retry
-imports; context requests retry pending imports.
+imports. Existing agent/turn boundaries retry pending imports **before** publishing
+context; emergency post-compaction restoration retries immediately before its
+read-only fallback. Ordinary request-time projection does not mutate the plan.
 Existing runtime writer leases, branch custody and recovery identity gates still
 apply. Recovery never relaunches work.
 
@@ -368,7 +377,7 @@ Subagent tabs and panes are created without stealing keyboard focus. Launch comm
 
 Bundled agents use model defaults from `config.json` when configured; otherwise they inherit the parent model. Thinking defaults still come from agent frontmatter or the parent level. For a named agent, callers should omit `model` and `thinking` so those configured defaults apply. Passing either field explicitly is a one-off override and takes precedence over agent frontmatter.
 
-Agent discovery follows priority: **project-local** (`.pi/agents/`) > **global** (`~/.pi/agent/agents/`) > **package-bundled**. Override any bundled agent by placing your own version in the higher-priority location. The discovered names, descriptions, and runtime defaults are included in the subagent tool guidance so the orchestrator can select by role instead of treating one agent as a generic default.
+Agent discovery follows priority: **explicitly authorized project-local** (`.pi/agents/`) > **global** (`~/.pi/agent/agents/`) > **package-bundled**. Project sources require the separate [source approval](#project-source-trust) below; merely selecting a `cwd` does not authorize executable configuration. The discovered names, descriptions, and runtime defaults are included in the subagent tool guidance so the orchestrator can select by role instead of treating one agent as a generic default.
 
 ### Supported Harness CLIs
 
@@ -504,7 +513,7 @@ The copyable example is model-neutral, so it works without requiring credentials
 
 ## Notification policy
 
-Plan mutations and active-branch restoration refresh the native plan widget directly from the store. Process/activity refresh uses the process widget. Neither UI path sends a model message or schedules an extra model turn; a tool's normal response is not an additional notification. Widgets are presentation, not model context: the existing `context` hook projects the current plan on the next naturally required model request, without starting one.
+Plan mutations and active-branch restoration refresh the native plan widget directly from the store. Process/activity refresh uses the process widget. Neither UI path sends a model message or schedules an extra model turn; a tool's normal response is not an additional notification. Widgets are presentation, not model context: append-only native publications make changed plan/checkpoint/recovery state visible at existing agent/turn boundaries, without starting a turn. Visible receipts suppress duplicate publications. A narrow post-compaction fallback retains exact state when the host offers no durable pre-request boundary; that restoration can reset incremental transport continuation.
 
 The centralized `notification-policy.ts` gates the production completion outbox: results, explicit help/blockers, questions, errors and required decisions wake the immediate parent (`triggerTurn:true`, `deliverAs:"steer"`). Classification uses event types/structured error fields, never words in a progress message. Unknown/progress events cannot enter the waking outbox. Question/decision event categories reserve policy vocabulary only; they do not add a child tool or protocol. Existing durable retry, deduplication and UNKNOWN-handoff recovery semantics remain unchanged.
 
@@ -552,7 +561,9 @@ subagent_interrupt({ id: "abcd1234" });
 subagent_interrupt({ name: "Scout" });
 ```
 
-This sends Escape to the child pane, cancelling the in-progress model turn. The subagent session stays alive — the pane, session file, and background polling all remain intact. After the interrupt, the widget immediately labels the child as `interrupted` (counted as **open**, not active processing). Stale pre-interrupt activity snapshots are ignored so a lagging Herdr/`active` reading cannot overwrite the interrupt. The process elapsed timer keeps running because the pane is still open; only the interrupted-state duration freezes relative to the interrupt request. If the child starts work later, newer observations return it to `active`; completion, failure, and `caller_ping` still flow through normally.
+This requests Pi's public `ctx.abort()` through a child-issued `interrupt-v1` capability, not terminal keys or process signals. A fresh active token binds the run, canonical session/header and PID/birth identity; the child durably claims the request before aborting. The process, pane, session and result watcher remain alive. Parent custody and task binding are revalidated across asynchronous waits.
+
+`interrupt_requested` acknowledges the child API request, **not** completed cancellation. `settlement: aborted` requires a separate correlated `agent_settled({ aborted: true })` artifact; otherwise settlement is `unconfirmed`. The widget's local interrupted marker is a request observation. Resume still requires the child's fresh settled-idle proof. Missing/expired capability, idle/legacy children and conflicting controls reject; uncertain acknowledgement returns `pending`. Never blindly retry or fall back to Escape, Ctrl+C or process termination. Claimed requests are not replayed after reload or storage/API ambiguity. Manual Escape is a separate Pi/terminal path, not what this tool sends.
 
 This is a turn-level interrupt, not a method for forcibly terminating a subagent session.
 
@@ -585,7 +596,7 @@ The `caller_ping` tool lets a subagent request help from its parent agent. When 
 - `message`: Follow-up prompt; required and nonempty for live continuation, optional for closed-session resume.
 - `autoExit` (optional): Must match the saved launch profile; omission preserves it.
 
-For an owned, tracked Pi child interrupted with Escape, resume continues the **same process, run, pane and watcher** only after the child confirms `agent_settled` with an aborted run and idle state. Active, starting, finalizing or unknown states reject. The launch configuration is unchanged. The child advertises `artifact-v1` continuation support and watches its run-specific request directory from `session_start` until shutdown/reload. After binding/custody validation, the parent atomically publishes a UUID/run/session/idle-token-bound request; the child passes the exact follow-up to `sendUserMessage` with template/command expansion disabled (not terminal/shell input or `@file` expansion). HC `idle` or `done` is only coarse pane evidence: a fresh child-issued settled token is also required. Unsupported legacy children fail with update/reload guidance; no blind terminal fallback is attempted.
+For an owned, tracked Pi child interrupted through guarded abort or manual Escape, resume continues the **same process, run, pane and watcher** only after the child confirms `agent_settled` with an aborted run and idle state. Starting, finalizing or unknown states reject, as do actually busy children. A stale active parent observation after cancellation can be overridden only by a fresh child `interrupted-idle` token and confirmed idle pane; ordinary settled-idle evidence cannot override it. The launch configuration is unchanged. The child advertises `artifact-v1` continuation support and watches its run-specific request directory from `session_start` until shutdown/reload. After binding/custody validation, the parent atomically publishes a UUID/run/session/idle-token-bound request; the child passes the exact follow-up to `sendUserMessage` with template/command expansion disabled (not terminal/shell input or `@file` expansion). HC `idle` or `done` is only coarse pane evidence: a fresh child-issued settled token is also required. Unsupported legacy children fail with update/reload guidance; no blind terminal fallback is attempted.
 
 A durable claim, separate from the immutable acceptance/rejection acknowledgement, deduplicates requests across reloads. These artifacts share the local OS/filesystem trust boundary; they do not authenticate against a malicious same-user process. A transport timeout or ambiguous dispatch returns `pending`, retains the in-flight reservation and never starts a replacement process; do not retry that continuation. This is a conservative synchronous API-dispatch acknowledgement, not proof that the provider processed the prompt. Unowned closed Pi sessions still use the saved-profile launch path. The same guarded transport supports tracked keep-open children after their completed turn and settled-idle acknowledgement.
 
@@ -653,6 +664,23 @@ Handoff means normal synchronous `sendMessage` return, not exactly-once executio
 Restart recovery is artifact-only after identity verification, never automatic
 relaunch or reuse of a saved pane (see Result delivery boundary above).
 
+Explicit `subagent_done` and `caller_ping` stage intent, not immediate completion:
+publication and shutdown wait for Pi's `agent_settled`, including sibling tools and
+native follow-ups. Ping wins a mixed ping/done batch. Completion-batch failures
+remain visible, but an earlier tool error successfully recovered before finishing
+does not poison the result. Session path and original header must still match;
+`/new`, unrelated `/resume` and `/fork` detach supervision rather than closing the
+new session, while `/reload` preserves the same supervised identity.
+
+A child publication failure retains the exact settled payload and retries three
+times (100/500/1000 ms), then visibly pauses. Use `/subagent_retry_completion` in
+the supervised child for an explicit retry without a model turn. Pending data
+survives in-process reload, not process death while storage is unavailable.
+Parent artifact-read/supervision failures pause without closing a working child;
+`/subagents-reconcile` explicitly retries bounded artifact reconciliation/imports,
+never launches children or replays uncertain dispatch. Recovery diagnostics show
+remaining errors; one recovered run's I/O failure does not disable healthy runs.
+
 **Interaction flow:**
 1. Child calls `caller_ping({ message: "Not sure which schema to use" })`
 2. Child session exits (like `subagent_done`)
@@ -708,7 +736,7 @@ This always forks the current session into a subagent with full conversation con
 
 ## Custom Agents
 
-Place a `.md` file in `.pi/agents/` (project) or `~/.pi/agent/agents/` (global). Keep the filename and frontmatter `name` aligned (for example, `researcher.md` must declare `name: researcher`) so discovery and direct invocation agree:
+Place a `.md` file in an explicitly authorized `.pi/agents/` (project) or `~/.pi/agent/agents/` (global). Lookup uses the frontmatter `name`; matching the filename is recommended but not required:
 
 ```markdown
 ---
@@ -763,7 +791,8 @@ Configure `config.json` (or copy the defaults from `config.json.example`):
     "reserveTokens": 50000,
     "reservePercent": 20,
     "keepRecentTokens": 20000,
-    "maxReportBytes": 12000
+    "maxReportBytes": 12000,
+    "providerPayloadWarningBytes": {}
   }
 }
 ```
@@ -795,6 +824,23 @@ custom native summarizers; native/manual/overflow compaction still does. Disable
 proactive compaction if another extension must own all summarization, and configure
 Pi's native `compaction.reserveTokens` instead.
 
+**Provider payload bytes (advisory).** `/context-bytes` reports numeric UTF-8 JSON
+sizes observed at `before_provider_request`, without logging request contents.
+Optional `providerPayloadWarningBytes` thresholds are keyed by provider or exact
+`provider/model` (model wins); for example `{ "openai-codex": 900000 }` is a
+user-chosen warning threshold, **not** a documented backend limit. Values must be
+safe integers of at least 1,024 bytes. The empty default assumes no universal
+limit. `enabled:false` disables warnings, not numeric observations.
+
+These are payload bytes at this hook position: later extensions may change the
+body, routed models may differ from the selected model, and Codex chooses
+full/delta WebSocket frames or compressed HTTP bodies afterward. Providers that
+omit `onPayload` (including installed Kiro 0.12.3) are unobserved. Hook exceptions
+are swallowed by Pi; `ctx.abort()` is not a guaranteed pre-send gate on a reused
+socket. Therefore this feature neither blocks sending nor automatically compacts
+on HTTP 400. Final-wire enforcement requires a host/provider API change. The
+incident's suspected 1 MiB boundary is not hardcoded as a universal limit.
+
 **Durable working state.** The parent should call `context_checkpoint` at milestones:
 
 ```json
@@ -808,7 +854,8 @@ Pi's native `compaction.reserveTokens` instead.
 }
 ```
 
-`context_checkpoint({"action":"read"})` reads the selected branch. Saving replaces
+`context_checkpoint({"action":"read"})` reads the selected branch. Save returns a
+short status/entry/durability receipt; full UI details remain available. Saving replaces
 all five fields; each list accepts up to 12 items. Explicit state is bounded to
 6,000 UTF-8 bytes. Before native or proactive compaction, the extension captures a
 fresh bounded plan summary/pointer alongside those notes. Unchanged snapshots are
@@ -817,9 +864,14 @@ revision, evidence and acceptance; checkpoints never grant authority or imply
 process liveness. Automation snapshots already saved notes and the plan—it cannot
 recover decisions the agent never recorded.
 
-Checkpoints live as native custom session entries, not repository files or chat
-messages. A replaceable request-time projection (up to 12,000 UTF-8 bytes) restores
-them after compaction/reload/reopen, independently of the conversational summary.
+Checkpoint state lives as native custom session entries, not repository files.
+Bounded model-visible publications carry working notes at existing agent/turn
+boundaries, deduplicated against actual visible context and successful save receipts.
+Restoration omits historical plan summaries/pointers beside the current plan.
+A narrow read-only post-compaction fallback restores notes (up to 12,000 UTF-8
+bytes) until the next durable boundary, independently of conversational summaries.
+Pi 1.3/1.5 lack an actionable post-compaction/pre-request publication hook, so
+full incremental-continuation stability for that fallback remains host-blocked.
 Only the active branch is read. Fork-inherited notes are read-only until an
 explicit save creates local notes; children cannot save parent checkpoints.
 Ephemeral/setup-only sessions cannot promise durable checkpoints. An append failure
@@ -891,7 +943,7 @@ response does not identify the cancellation source or prove context overflow.
 Check the session and Pi diagnostics before retrying: do not automatically replay
 subagent results or relaunch work whose model consumption is unknown.
 
-Pi supports all three modes by loading the selected session file. Claude, Codex, OpenCode, Grok, and generic command templates support only `standalone`: they do not consume seeded Pi JSONL. Requesting `lineage-only` or `fork` with those harnesses fails before creating a pane or session artifacts; it never silently drops the requested transfer.
+Pi supports all three modes by loading the selected session file. Every Pi task uses one controlled file attachment, including the `direct`/fork prompt shape: raw task text is never a CLI flag or recursively expanded `@file`. Role, skills and task share the initial input; closed resume does not replay the initial role/skills. Claude, Codex, OpenCode, Grok, and generic command templates support only `standalone`: they do not consume seeded Pi JSONL. Requesting `lineage-only` or `fork` with those harnesses fails before creating a pane or session artifacts; it never silently drops the requested transfer.
 
 `resumeSessionId` is a separate native-harness operation, supported only by Claude (`--resume`) and OpenCode (`--session`). It cannot be combined with Pi session transfer. Other harnesses reject it instead of ignoring it; use `subagent_resume` for Pi session-file resume. Turn-only interrupts and structured activity snapshots remain Pi-only.
 
@@ -944,6 +996,35 @@ subagent({ name: "Scout", agent: "scout", interactive: true, task: "..." });
 ```
 
 ---
+
+## Project source trust
+
+Project definitions can select executable CLI templates, tools and role-specific working
+folders. Pi's standard trust check does not prompt for an agents-only `.pi/agents/`
+checkout. Therefore this extension requires a separate, user-owned allowlist at
+`<parent-agentDir>/subagent-trust.json` (default `~/.pi/agent/subagent-trust.json`):
+
+```json
+{
+  "projectAgentDirectories": ["E:/trusted-project/.pi/agents"],
+  "agentDirectories": ["E:/trusted-project/.pi/agent"]
+}
+```
+
+Approve only reviewed sources. Entries must be absolute paths and match the exact
+canonical source directory; approving a parent folder does not approve descendants.
+The first list enables project roles/overrides. The second separately permits that
+checkout's `.pi/agent` as the child's **user-level configuration**, including startup
+extensions. Both lists default to empty. Normal project `.pi/extensions`, skills and
+settings remain subject to Pi's own project trust.
+
+A host trust denial, missing host trust API, or saved denial for a target cwd blocks
+these approvals. Children otherwise inherit the parent's agentDir; merely finding a
+local `.pi/agent` no longer promotes it. Discovery uses the current authorized cwd,
+and dispatch checks source identity/content again after asynchronous preparation.
+Resume rechecks the saved agentDir and recorded definition source against current
+approval; revocation is not bypassed by a saved profile. These controls are not a
+sandbox: Bash and explicitly trusted custom commands retain normal OS permissions.
 
 ## Tool Access Control
 
@@ -1031,7 +1112,7 @@ Every sub-agent session displays a compact tools widget showing available and de
 
 ## Requirements
 
-- [pi](https://github.com/earendil-works/pi) 1.3.x, minimum 1.3.0. The extension is tested on this line only.
+- [pi](https://github.com/earendil-works/pi) 1.5.2 or a compatible 1.5.x patch. The audit repairs were also verified offline on 1.3.0, but that host pins vulnerable dependencies and is no longer the recommended/supported install. Updating this repository's local dependencies does not update your global Pi executable.
 - [herdr](https://herdr.dev) — the required terminal workspace
 
 ```bash

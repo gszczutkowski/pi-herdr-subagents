@@ -36,6 +36,22 @@ revalidates authority in `beforeSend`. The helper is not a new execution engine.
 `test/runtime-execute.test.ts` checks both production projections against the disk
 manifest and saved profiles; ownership/continuation tests cover same-run resume.
 
+## Guarded active-turn interruption
+
+`interrupt-control.ts` owns child-issued `interrupt-v1` active tokens and immutable
+request/claim/ack/settlement artifacts. Tokens bind run, canonical session/header,
+process birth and nonce. The child validates and durably claims synchronously
+before public `ctx.abort()`, without terminal keys, signals or shutdown. Settlement,
+reload and session replacement invalidate active proofs. An ambiguous claim never
+replays. The asynchronous parent path rechecks custody/binding across both awaits;
+`interrupt_requested` is API acknowledgement, while correlated `agent_settled`
+with `aborted: true` is distinct evidence. Missing support fails closed.
+
+`test/interrupt-control.test.ts` includes deterministic native Pi abort/staged-result
+regressions. Actual HC TUI interrupt/resume is included in
+`test/integration/HC-WORKFLOW-VERIFICATION.md`; manual HC Escape is a separate
+unresolved terminal path, not proof of this capability.
+
 ## One parent task command boundary
 
 Audit: `plan-tools.ts` routes model commands to `PlanPersistence.create`, `detach`
@@ -65,9 +81,14 @@ The active native `SessionManager.getBranch()` selects plan snapshots appended a
 custom `pi-subagents-plan/v1` session entries. Custom entries are state, not model
 messages. Widget factories (`ctx.ui.setWidget`) and `/plan-view` are disposable
 projections of `PlanPersistence`; neither the widget cache nor the JSONL physical
-tail is authoritative. `plan-context.ts` separately projects the same selected
-snapshot at the request-time `context` hook, including after compaction. It does
-not append entries or send messages to refresh context.
+tail is authoritative. `plan-context.ts` reads the same selected snapshot;
+`context-publication.ts` publishes changed state at existing native
+`before_agent_start` / structural `turn_end` boundaries without requesting a turn.
+Deduplication checks visible projected content, matching call/receipt hashes and
+previous-state identity, not process caches or merely surviving custom metadata.
+Ordinary context reads do not churn the tail. A narrow post-compaction read-only
+fallback preserves exact state until the next persistent boundary; this path can
+reset incremental continuation and remains an explicit host-API dependency.
 
 `delivery.ts` and `RuntimeStore` retain immutable result envelopes, event cursors,
 retry/uncertain handoff state and tombstones outside presentation. Transport can
@@ -97,10 +118,13 @@ history; abort signals and generation/leaf checks fence stale work. Boundary dra
 do not emit native compaction notification hooks or invoke custom native summarizers.
 
 `context-checkpoint.ts` independently owns bounded advisory working-state notes
-and a fresh derived plan pointer/summary in native custom branch entries. It never
+and a fresh derived plan pointer/summary in native custom branch entries. Working
+notes are published without duplicating historical plan summaries beside the
+current plan. Save/mutation receipts are compact; full UI details remain available.
+It never
 mutates the plan, grants task authority, infers runtime liveness or stores raw
 conversation automatically. Native hooks and the proactive guard capture before
-compaction; request-time projection only reads. Explicit parent saves are required
+compaction; emergency request-time restoration only reads checkpoint data. Explicit parent saves are required
 to replace fork-inherited notes. Append faults latch across reload and suppress
 uncertain content; a fresh Pi process is required for checkpoint fault recovery.
 
@@ -118,7 +142,17 @@ integration, native retain-none checkpoint recovery, production outbox wiring,
 and inherited child-environment test isolation. No live external provider or
 herdr-terminal end-to-end protection claim is made.
 
-## Verification limits
+## Current repair verification
+
+See `BACKLOG.md` and `test/integration/HC-WORKFLOW-VERIFICATION.md` for current
+status: 734/734 integrated automated tests and seven named authenticated HC TUI
+journeys pass, with explicit extra-live-path limitations. `test/REPAIR-VERIFICATION.md`
+and counts below describe historical milestones, not the current tree. Provider payload diagnostics are
+advisory UTF-8 JSON measurements at one hook position, not final-wire enforcement.
+Pending result imports run before native publication; only emergency
+post-compaction restoration retains a context-phase import retry.
+
+## Historical verification limits
 
 Section 7 boundary work: discovery + existing tests 185/185; launch/ownership/
 profile/continuation/keep-open 31/31; authority/persistence/branches/runtime 14/14;

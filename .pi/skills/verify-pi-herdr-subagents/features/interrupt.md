@@ -24,6 +24,7 @@ Preconditions: healthy baseline; Pi-backed child actively executing a long task.
 
 ## Gotchas
 
+- `subagent_interrupt` now uses child-issued `interrupt-v1` plus public Pi `ctx.abort()`, not a terminal key. Require the child's correlated aborted settlement; `interrupt_requested` alone is API acknowledgement. Unsupported/idle/legacy children fail closed, without a key/signal fallback.
 - A shell sleep interrupted with Ctrl+C does not prove `subagent_interrupt`. Do not replace the real Pi task with that stand-in.
 - The helper's generic `send` does not wait; capture only after checking the real active-task precondition.
 - Escape interrupts the Pi turn; it does not promise to roll back already completed file writes or external work. Record observed side effects, including the STARTED marker.
@@ -31,5 +32,6 @@ Preconditions: healthy baseline; Pi-backed child actively executing a long task.
 - `interactive: true` on a named agent does not change its exit behavior; that comes from the agent's `auto-exit` frontmatter. It suppresses stall and recovery steers only.
 - After an interrupt the extension's own state is `interrupted`, not idle, and it outranks herdr's coarse status. A successful tool acknowledgment does not prove a turn was running; only the child pane's state does.
 - **Historical legacy observation, not a current HC blocker.** An earlier auto-exit `verify-worker` interrupted inside a tool settled with `stopReason: error`, wrote an error sidecar, closed, and delivered `The operation was aborted.` That run did not prove interruption survival. Current HC acceptance uses the non-auto-exit `verify-open` role and separately requires aborted settlement, a surviving child and no abort-only completion. It does not retest the legacy auto-exit variant.
+- Current HC workflow proof is in `test/integration/HC-WORKFLOW-VERIFICATION.md`. The guarded tool path passes, but direct automated HC named-key Escape timed out and is not accepted by that result. Generic `hc interrupt` can choose Ctrl+C and must not be used as an Escape-only substitute.
 - For HC use the isolated `interrupt live continuation` test in `test/integration/hc-tui.test.ts`: the `verify-open` role disables automatic exit, a real bash gate proves active work, and aborted settlement plus surviving process/pane and no result are required before `subagent_resume`. Resume must retain the same run and process. The earlier HC tagged-private-command transport failure was corrected by production `artifact-v1` continuation; see `test/integration/HC-CONTINUATION-VERIFICATION.md`. Pending dispatch alone is still not proof: require the child's accepted acknowledgement and completed follow-up.
 - Completion delivery is not suppressed for interactive children. Ordinary progress is panel-only; actual results and help requests still wake the parent.

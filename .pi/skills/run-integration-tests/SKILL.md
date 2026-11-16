@@ -15,7 +15,7 @@ command -v herdr
 npm test
 ```
 
-Stop and ask the user to start pi inside herdr if `HERDR_ENV` is not `1` or the CLI is missing.
+If the legacy preflight fails but `HC_TERMINAL_ID` + `HC_TERMINAL_SOCKET` and `hc` are present, load `../verify-pi-herdr-subagents/SKILL.md` and use its separate explicit HC TUI workflow. Do not claim the legacy suite passed through HC. Otherwise stop and ask the user to start Pi inside herdr.
 
 ## Integration suite
 
