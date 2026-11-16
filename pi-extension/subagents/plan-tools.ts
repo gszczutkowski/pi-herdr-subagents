@@ -1,8 +1,9 @@
-import { truncateHead, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type, type Static, type TProperties } from "@sinclair/typebox";
 import { Value } from "@sinclair/typebox/value";
 import * as store from "./plan-store.ts";
 import { PlanPersistence } from "./plan-persistence.ts";
+import { PlanReadParams, preparePlanRead } from "./plan-read.ts";
 import { PLAN_CONTEXT_TYPE, planContext, registerPlanContext } from "./plan-context.ts";
 import { contextReceipt, publicationState } from "./context-publication.ts";
 import { registerPlanView } from "./plan-view-registration.ts";
@@ -58,10 +59,10 @@ function apply(plan: store.PlanSnapshot, context: store.CommandContext, command:
 
 function response(details: Record<string, unknown>, current?: string) {
   const json = JSON.stringify(details, null, 2);
-  const output = truncateHead(json, { maxBytes: 40000, maxLines: 2000 });
-  const content = [{ type: "text" as const, text: output.content + (output.truncated ? "\n[Truncated; use plan_read with taskId for details]" : "") }];
+  if (Buffer.byteLength(json, "utf8") > 40000 || json.split("\n").length > 2000) throw new Error("plan_read metadata exceeds the bounded response budget");
+  const content = [{ type: "text" as const, text: json }];
   return { content, details: { ...details,
-    ...contextReceipt(content, current && !output.truncated ? [publicationState(PLAN_CONTEXT_TYPE, current)] : []) } };
+    ...contextReceipt(content, current ? [publicationState(PLAN_CONTEXT_TYPE, current)] : []) } };
 }
 
 /** Compact mutation content; the full legacy details shape remains available to UI consumers. */
@@ -89,14 +90,14 @@ export function registerPlanTools(pi: ExtensionAPI, options: { publish?: boolean
   pi.on("session_tree", restore);
   pi.registerTool({
     name: "plan_read", label: "Read plan",
-    description: "Read the active branch's durable plan, revision and recovery uncertainty. Optional taskId returns full task details. No runtime liveness is implied. Output bounded to 40KB.",
-    parameters: object({ taskId: Type.Optional(text()), reconcile: Type.Optional(Type.Boolean()) }),
+    description: "Read the active branch's durable plan, revision and recovery uncertainty; no runtime liveness implied. Small taskId reads return full details. Large reads provide section navigation. Collection sections use zero-based offset/limit (default 50, max 100); results/runs flatten attempts with attemptId. Tasks section requires no taskId; other collections require taskId. json pages (default 4096, max 8192 UTF-16 characters) reconstruct the complete view by joining jsonText then parsing JSON, including oversized individual items. Follow next cursors verbatim with planId/expectedRevision and JSON documentHash; restart if the plan or read document changed. Valid JSON bounded to 40KB/2000 lines per response.",
+    parameters: PlanReadParams,
     async execute(_id, params, _signal, _update, ctx) {
       try {
+        if (!Value.Check(PlanReadParams, params)) throw new Error("Invalid bounded plan read");
         const view = params.reconcile ? persistence.reconcile(ctx.sessionManager) : persistence.read(ctx.sessionManager);
-        const plan = view.snapshot;
-        if (params.taskId && !plan?.tasks.some(task => task.taskId === params.taskId)) throw new Error("Unknown task");
-        return response({ ...view, snapshot: plan ? { ...plan, tasks: params.taskId ? plan.tasks.filter(task => task.taskId === params.taskId) : plan.tasks.map(task => ({ taskId: task.taskId, title: task.title, status: task.status, statusReason: task.statusReason })) } : undefined }, params.taskId ? undefined : planContext(view));
+        const read = preparePlanRead(view, params);
+        return response(read.data, read.completeOverview ? planContext(view) : undefined);
       } finally { refresh(ctx); }
     },
   });

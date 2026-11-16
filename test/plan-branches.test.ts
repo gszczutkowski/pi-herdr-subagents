@@ -87,6 +87,42 @@ test("return to an unchanged main tip ignores explicitly detached alternatives",
   } finally { cleanup(); }
 });
 
+test("malformed abandoned detaches preserve the selected snapshot but cannot exempt historical writes", () => {
+  const corruptions: ((copy: any) => void)[] = [
+    copy => { delete copy.source.authority; },
+    copy => { copy.source.authority = null; },
+    copy => { copy.source.authority = {}; },
+    copy => { copy.source = null; },
+    copy => { delete copy.authority; },
+    copy => { copy.source.revision = -1; },
+    copy => { copy.tasks = null; },
+  ];
+  for (const corrupt of corruptions) {
+    const { sm, p, plan, cleanup } = fixture();
+    try {
+      const goodTip = sm.getLeafId()!;
+      const malformed = structuredClone(store.detachPlan(plan, { ...plan.authority, branchInstanceId: crypto.randomUUID() }, goodTip, "Alternate"));
+      corrupt(malformed);
+      sm.appendCustomEntry(PLAN_ENTRY, malformed);
+      sm.branch(goodTip);
+      for (const selected of [sm, SessionManager.open(sm.getSessionFile()!)]) {
+        selected.branch(goodTip);
+        const persistence = adapter(selected);
+        const view = persistence.restore(selected);
+        assert.deepEqual(view.snapshot, plan, "bad off-branch data cannot hide the valid active plan");
+        assert.equal(view.detachRequired, "historical");
+        assert.equal(view.writable, false);
+        assert.match(view.error!, /Historical.*read-only/);
+        assert.doesNotMatch(view.error!, /TypeError/);
+        assert.throws(() => update(persistence, selected, plan, "Unsafe write"), /Historical.*read-only/);
+      }
+      const detached = p.detach(sm, plan.planId, plan.revision, "Recover explicitly");
+      assert.equal(p.read(sm).writable, true);
+      assert.deepEqual(detached.source?.authority, plan.authority);
+    } finally { cleanup(); }
+  }
+});
+
 test("native fork/clone copies actual selected point, foreign read-only until parent detach; source stays untouched", () => {
   const { sm, p, plan: original, cleanup } = fixture();
   try {

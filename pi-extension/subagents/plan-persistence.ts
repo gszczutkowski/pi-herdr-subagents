@@ -67,13 +67,17 @@ export class PlanPersistence {
     type Node = ReturnType<Manager["getTree"]>[number];
     const abandonedFuture = (node: Node): boolean => {
       // An explicit detach marks a different branch, not a future of this one.
-      // Inspect identity only; never restore snapshot state from another path.
+      // Never restore snapshot state from another path. Only a validated detach
+      // can exempt that path from rollback detection; malformed data stays read-only.
       const entry = node.entry;
       if (entry.type === "custom" && entry.customType === PLAN_ENTRY) {
         const identity = entry.data as Partial<PlanSnapshot> | undefined;
         if (identity?.planId !== plan.planId && identity?.authority?.branchInstanceId !== plan.authority.branchInstanceId &&
-          identity?.source?.planId === plan.planId && identity.source.authority.sessionId === plan.authority.sessionId &&
-          identity.source.authority.branchInstanceId === plan.authority.branchInstanceId) return false;
+          identity?.source?.planId === plan.planId && identity.source.authority?.sessionId === plan.authority.sessionId &&
+          identity.source.authority?.branchInstanceId === plan.authority.branchInstanceId) {
+          try { deserializePlan(JSON.stringify(identity)); return false; }
+          catch { /* An invalid descendant is not proof of an independent branch. */ }
+        }
         return true;
       }
       return node.children.length === 0 || node.children.some(abandonedFuture);
