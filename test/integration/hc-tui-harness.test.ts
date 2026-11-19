@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { it } from "node:test";
-import { childSurface, HcTuiRun, jsonLines, until } from "./hc-tui-harness.ts";
+import { childSurface, HcTuiRun, jsonLines, literalHcKeys, trackTransportSurface, until } from "./hc-tui-harness.ts";
 import { sourceAuth } from "./hc-auth.ts";
 import { shellComment } from "../../pi-extension/subagents/shell.ts";
 
@@ -13,6 +13,14 @@ it("HC TUI harness extracts exactly one sanitized owned surface", () => {
   for (const script of ["Surface: t9", "# Surface: remote/t9", "# Surface: t9; echo unsafe", "# Surface: t9\n# # Surface: t8\n"]) {
     assert.throws(() => childSurface(script), /Exactly one commented child Surface required/);
   }
+});
+
+it("HC transport never records the caller's terminal or duplicates in its teardown list", () => {
+  const owned: string[] = [];
+  trackTransportSurface(owned, "t1", "tuser");
+  assert.throws(() => trackTransportSurface(owned, "tuser", "tuser"), /user's terminal/);
+  assert.throws(() => trackTransportSurface(owned, "t1", "tuser"), /distinct test terminal/);
+  assert.deepEqual(owned, ["t1"]);
 });
 
 it("HC auth bridge resolves only the selected original-store provider without persisting credentials", async () => {
@@ -39,7 +47,7 @@ it("HC cleanup continues past a missing artifact and reports unresolved custody"
       evidence: dir, scratch: dir, parentSession: join(dir, "parent.jsonl"), owned: new Set(["t1"]),
       save: (name: string, data: unknown) => { records[name] = data; },
       capture: async () => {}, results: () => [], observed: () => [], artifactDirectory: () => dir,
-      manifest: () => ({ runs: {
+      manifestIfPresent: () => ({ runs: {
         damaged: { id: "damaged", surface: "t3", launchScriptFile: join(dir, "missing.sh") },
         valid: { id: "valid", surface: "t2", launchScriptFile: script },
       } }),
@@ -51,6 +59,37 @@ it("HC cleanup continues past a missing artifact and reports unresolved custody"
     assert.equal(records["cleanup.json"].unresolved.length, 1);
     assert.equal(records["cleanup.json"].unresolved[0].surface, "t3");
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+it("HC literal command keys encode spaces without provenance-tagged model input", () => {
+  assert.deepEqual(literalHcKeys("/subagent verify-worker x"), [
+    ..."/subagent", "space", ..."verify-worker", "space", "x",
+  ]);
+  assert.deepEqual(literalHcKeys("/reload"), [..."/reload"]);
+  for (const unsupported of ["Uppercase", "token_with_underscore", "$(unsafe)", "two\nlines"]) {
+    assert.throws(() => literalHcKeys(unsupported), /not lossless/);
+  }
+});
+
+it("HC cleanup accepts no-launch parents but fails closed when a child manifest vanishes", async () => {
+  for (const lostManifest of [false, true]) {
+    const dir = mkdtempSync(join(tmpdir(), "hc-cleanup-empty-"));
+    const records: Record<string, any> = {}, closed: string[] = [];
+    try {
+      const fake = Object.assign(Object.create(HcTuiRun.prototype), {
+        evidence: dir, scratch: dir, parent: "t1", parentSession: join(dir, "parent.jsonl"),
+        owned: new Set(lostManifest ? ["t1", "t2"] : ["t1"]),
+        save: (name: string, data: unknown) => { records[name] = data; },
+        capture: async () => {}, results: () => [], observed: () => [], manifestIfPresent: () => undefined,
+        hc: { close: (id: string) => closed.push(id), inspect: async () => ({ kind: "missing" }) },
+      });
+      if (lostManifest) await assert.rejects(fake.finish(), /unresolved ownership/);
+      else await fake.finish();
+      assert.equal(records["cleanup.json"].allMissing, !lostManifest);
+      assert.equal(records["assertions.json"].passed, !lostManifest, "Cleanup failure cannot leave passing evidence");
+      assert.deepEqual(closed, lostManifest ? ["t2", "t1"] : ["t1"]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }
 });
 
 it("HC TUI harness observes atomic filesystem progress without a model", async () => {

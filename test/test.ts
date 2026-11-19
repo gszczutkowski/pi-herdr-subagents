@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@earendil-works/pi-tui";
+import { ProjectTrustStore } from "@earendil-works/pi-coding-agent";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 import { canonicalSessionPath, reserveSession, releaseSession, sessionOwners } from "../pi-extension/subagents/ownership.ts";
 import { captureGuidanceRequests } from "./guidance-session.ts";
@@ -1298,6 +1299,30 @@ describe("subagent discovery", () => {
       testApi.buildPiPromptArgs({ effectiveSkills: "review", taskDelivery: "direct", taskArg: "do the task" }),
       ["do the task"],
     );
+  });
+
+  it("approves the current project's local agent directory through /subagents-approve", async () => {
+    await withIsolatedAgentEnv(async ({ projectDir, projectAgentsDir, globalDir }) => {
+      rmSync(join(globalDir, "subagent-trust.json"));
+      const { api, registeredCommands } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+
+      const command = registeredCommands.find((entry) => entry.name === "subagents-approve");
+      assert.ok(command, "expected /subagents-approve to be registered");
+      const trustedContext = { cwd: projectDir, hasUI: false, isProjectTrusted: () => true };
+      await assert.rejects(command.handler("", { cwd: projectDir, hasUI: false, isProjectTrusted: () => false }), /not trusted/);
+      await assert.rejects(command.handler("", { cwd: projectDir, hasUI: false }), /not trusted/);
+      new ProjectTrustStore(globalDir).set(projectDir, false);
+      await assert.rejects(command.handler("", trustedContext), /has denied/);
+      assert.equal(existsSync(join(globalDir, "subagent-trust.json")), false);
+      new ProjectTrustStore(globalDir).set(projectDir, null);
+      await command.handler("", trustedContext);
+
+      const policy = JSON.parse(readFileSync(join(globalDir, "subagent-trust.json"), "utf8"));
+      assert.deepEqual(policy.projectAgentDirectories, [canonicalSessionPath(projectAgentsDir)]);
+      assert.deepEqual(policy.agentDirectories, []);
+      await assert.rejects(command.handler("unexpected", trustedContext), /Usage/);
+    });
   });
 
   it("lists visible agents from discovery", async () => {

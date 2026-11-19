@@ -159,7 +159,7 @@ export async function continueLiveChild(owner: SessionOwner, child: LiveChild | 
     return previous; // A recheck never dispatches the newly supplied message.
   }
   if (!child || child.id !== owner.runId || child.cli !== "pi" || !child.activityFile ||
-      child.lifecycle.process.kind !== "running" || !["interrupted", "waiting", "active"].includes(child.lifecycle.turn.kind)) {
+      child.lifecycle.process.kind !== "running" || !["interrupted", "waiting", "active", "starting"].includes(child.lifecycle.turn.kind)) {
     throw new Error("Owned session is not a tracked interrupted or settled idle live Pi child; close its process before closed-session resume.");
   }
   if (typeof params.message !== "string" || !params.message.trim()) throw new Error("Live continuation requires a nonempty message.");
@@ -172,7 +172,7 @@ export async function continueLiveChild(owner: SessionOwner, child: LiveChild | 
     // HC reports a completed turn as done even while the Pi process remains open.
     // Neither coarse status authorizes dispatch without the child-issued idle token below.
     if (pane.kind !== "present" || !["idle", "done"].includes(pane.agentStatus ?? "")) throw new Error("Live child pane is not confirmed idle.");
-    if (child.lifecycle.process.kind !== "running" || !["interrupted", "waiting", "active"].includes(child.lifecycle.turn.kind)) {
+    if (child.lifecycle.process.kind !== "running" || !["interrupted", "waiting", "active", "starting"].includes(child.lifecycle.turn.kind)) {
       throw new Error("Live child changed state during continuation inspection.");
     }
     const dir = continuationDir(child.activityFile);
@@ -181,11 +181,12 @@ export async function continueLiveChild(owner: SessionOwner, child: LiveChild | 
         !["interrupted-idle", "settled-idle"].includes(state?.state) || !uuid.test(state?.idleToken)) {
       throw new Error("Child has not confirmed settled interrupted idle.");
     }
-    // Native cancellation can emit a final turn_start after the parent's local
-    // interrupt marker. That stale active label cannot outrank the child's fresh
-    // interrupted-idle token. Ordinary settled-idle does NOT get this exception.
-    if (child.lifecycle.turn.kind === "active" && state.state !== "interrupted-idle") {
-      throw new Error("Child has not confirmed interrupted idle over an active parent observation.");
+    // Cancellation drain can replace the local interrupt marker with active.
+    // If HC never sampled working, subsequent idle inspection calls it starting.
+    // Neither stale label outranks a fresh interrupted-idle token from this run
+    // and session. Ordinary settled-idle does NOT get this exception.
+    if (["active", "starting"].includes(child.lifecycle.turn.kind) && state.state !== "interrupted-idle") {
+      throw new Error(`Child has not confirmed interrupted idle over the ${child.lifecycle.turn.kind} parent observation.`);
     }
     // Parent turn labels are observations, not an acknowledgement of Escape.
     // A manually aborted child can be `waiting` without any result; conversely

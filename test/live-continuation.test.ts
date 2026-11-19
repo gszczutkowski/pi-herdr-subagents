@@ -8,7 +8,8 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { CONTINUE_COMMAND, continuationCommand, continuationDir, continueLiveChild, registerLiveContinuation } from "../pi-extension/subagents/live-continuation.ts";
 import { canonicalSessionPath, type SessionOwner } from "../pi-extension/subagents/ownership.ts";
-import { createLifecycle, markInterruptRequested, markProcessRunning } from "../pi-extension/subagents/lifecycle.ts";
+import { createLifecycle, markInterruptRequested, markProcessRunning, observeActivity, observePaneInspection, projectLifecycle } from "../pi-extension/subagents/lifecycle.ts";
+import { createSubagentActivityRecorder, readSubagentActivityFile } from "../pi-extension/subagents/activity.ts";
 
 function fixture() {
   const dir = mkdtempSync(join(tmpdir(), "live-continuation-"));
@@ -55,6 +56,75 @@ function fixture() {
       rmSync(dir, { recursive: true, force: true });
     } };
 }
+
+/** Fixed parent sampling of real recorder snapshots, including cancellation drain. */
+function sampleInterruptedLifecycle(f: ReturnType<typeof fixture>, observedWorking = false, observedDrain = true) {
+  let now = 1000;
+  const recorder = createSubagentActivityRecorder({ runningChildId: f.runId, activityFile: f.activityFile, now: () => now });
+  recorder.sessionStart();
+  let lifecycle = observePaneInspection(createLifecycle(now), { kind: "present", agentStatus: "idle", observedAt: 1001 }, 1001);
+  if (observedWorking) lifecycle = observePaneInspection(lifecycle, { kind: "present", agentStatus: "working", observedAt: 1005 }, 1005);
+  lifecycle = markInterruptRequested(lifecycle, 1010);
+  now = 1015;
+  recorder.turnStart(1); // Newer activity can replace the local interrupt marker.
+  if (observedDrain) {
+    lifecycle = observeActivity(lifecycle, readSubagentActivityFile(f.activityFile, f.runId), now);
+    assert.equal(lifecycle.turn.kind, "active", "parent really samples intermediate cancellation activity");
+  }
+  now = 1020;
+  recorder.agentEndWaiting();
+  lifecycle = observeActivity(lifecycle, readSubagentActivityFile(f.activityFile, f.runId), now);
+  assert.equal(lifecycle.activityDetail, null);
+  for (const at of [1030, 1040, 1050]) {
+    lifecycle = observePaneInspection(lifecycle, { kind: "present", agentStatus: "idle", observedAt: at }, at);
+  }
+  return lifecycle;
+}
+
+for (const scenario of ["missed-working-and-observed-drain", "observed-working", "unobserved-drain"] as const) {
+  test(`interrupted sampling: ${scenario} continues the existing child`, async () => {
+    const f = fixture();
+    try {
+      f.child.lifecycle = sampleInterruptedLifecycle(f, scenario === "observed-working", scenario !== "unobserved-drain");
+      assert.equal(f.child.lifecycle.hasWorked, scenario === "observed-working");
+      const expected = scenario === "observed-working" ? "waiting" : scenario === "unobserved-drain" ? "interrupted" : "starting";
+      assert.equal(f.child.lifecycle.turn.kind, expected);
+      assert.equal(projectLifecycle(f.child.lifecycle, 1060).kind, expected);
+      f.settle(true);
+      let validations = 0;
+      const result = await continueLiveChild(f.owner, f.child, { message: "resume after cancellation" }, {
+        ...f.transport, beforeSend: () => { validations++; },
+      });
+      assert.equal(result.status, "accepted");
+      assert.equal(validations, 1);
+      assert.deepEqual(f.sent, [["resume after cancellation", { expandPromptTemplates: false }]]);
+      assert.equal(f.owner.continuationRequestId, undefined);
+      const dir = continuationDir(f.activityFile);
+      assert.equal(readdirSync(dir).filter(name => name.endsWith(".request.json")).length, 1);
+      assert.equal(readdirSync(dir).filter(name => name.endsWith(".claim.json")).length, 1);
+    } finally { f.cleanup(); }
+  });
+}
+
+test("starting parent needs interrupted proof; genuinely unstarted and ordinary settled children still reject", async () => {
+  const f = fixture();
+  try {
+    f.child.lifecycle = observePaneInspection(createLifecycle(1), { kind: "present", agentStatus: "idle", observedAt: 2 }, 2);
+    await assert.rejects(continueLiveChild(f.owner, f.child, { message: "unstarted" }, f.transport), /not confirmed settled/);
+    f.child.lifecycle = sampleInterruptedLifecycle(f);
+    f.settle(false);
+    for (const hasTurnResult of [false, true]) {
+      await assert.rejects(continueLiveChild(f.owner, { ...f.child, hasTurnResult }, { message: "ordinary idle" }, f.transport), /starting parent/);
+    }
+    f.settle(true);
+    const lifecycle = f.child.lifecycle;
+    f.child.lifecycle = { ...lifecycle, process: createLifecycle(1).process };
+    await assert.rejects(continueLiveChild(f.owner, f.child, { message: "process not confirmed running" }, f.transport), /not a tracked/);
+    assert.equal(f.owner.continuationRequestId, undefined);
+    assert.equal(readdirSync(continuationDir(f.activityFile)).some(name => name.endsWith(".request.json")), false);
+    assert.equal(f.sent.length, 0);
+  } finally { f.cleanup(); }
+});
 
 test("native watcher callbacks contain ENOSPC/EACCES/EIO even when diagnostics also fail; claimed dispatch never replays", () => {
   const url = pathToFileURL(resolve("pi-extension/subagents/live-continuation.ts")).href;
@@ -140,41 +210,105 @@ test("manual Escape reconciles a waiting parent without inventing a completed re
   } finally { f.cleanup(); }
 });
 
-test("only a fresh interrupted-idle capability can override a stale active parent label", async () => {
+for (const kind of ["active", "starting"] as const) {
+  test(`only a fresh interrupted-idle capability can override a stale ${kind} parent label`, async () => {
+    const f = fixture();
+    try {
+      f.child.lifecycle = kind === "starting" ? sampleInterruptedLifecycle(f)
+        : { ...f.child.lifecycle, turn: { kind: "active", source: "activity", startedAt: 4 } };
+      await assert.rejects(continueLiveChild(f.owner, f.child, { message: "busy must not dispatch" }, f.transport), /not confirmed settled/);
+      f.settle(false);
+      await assert.rejects(continueLiveChild(f.owner, f.child, { message: "ordinary idle cannot override stale label" }, f.transport), /active parent|starting parent/);
+      assert.equal(f.sent.length, 0);
+      f.settle(true);
+      const result = await continueLiveChild(f.owner, f.child, { message: "confirmed interrupted follow-up" }, f.transport);
+      assert.equal(result.status, "accepted");
+      assert.equal(f.sent.length, 1);
+      assert.deepEqual(f.sent[0], ["confirmed interrupted follow-up", { expandPromptTemplates: false }]);
+      f.events.get("before_agent_start")!({}, f.ctx);
+      await assert.rejects(continueLiveChild(f.owner, f.child, { message: "expired must not dispatch" }, f.transport), /not confirmed settled/);
+      assert.equal(f.sent.length, 1);
+    } finally { f.cleanup(); }
+  });
+}
+
+for (const kind of ["interrupted", "starting"] as const) {
+  test(`foreign, malformed and busy child state cannot authorize continuation from ${kind}`, async () => {
+    const f = fixture();
+    try {
+      if (kind === "starting") f.child.lifecycle = sampleInterruptedLifecycle(f);
+      f.settle();
+      const dir = continuationDir(f.activityFile);
+      const path = join(dir, "state.json");
+      const state = JSON.parse(readFileSync(path, "utf8"));
+      for (const patch of [{ runId: randomUUID() }, { sessionFile: "foreign" }, { state: "busy" }, { idleToken: "stale" }]) {
+        writeFileSync(path, JSON.stringify({ ...state, ...patch }));
+        await assert.rejects(continueLiveChild(f.owner, f.child, { message: "must not dispatch" }, f.transport), /not confirmed settled/);
+        assert.equal(f.owner.continuationRequestId, undefined);
+        assert.equal(readdirSync(dir).some(name => name.endsWith(".request.json")), false);
+      }
+      assert.equal(f.sent.length, 0);
+    } finally { f.cleanup(); }
+  });
+}
+
+test("starting reconciliation preserves pane, custody, ownership and inspection-race fences", async () => {
   const f = fixture();
   try {
-    f.child.lifecycle = { ...f.child.lifecycle, turn: { kind: "active", source: "activity", startedAt: 4 } };
-    await assert.rejects(continueLiveChild(f.owner, f.child, { message: "busy must not dispatch" }, f.transport), /not confirmed settled/);
-    f.settle(false);
-    await assert.rejects(continueLiveChild(f.owner, f.child, { message: "ordinary idle cannot override active" }, f.transport), /active parent/);
-    assert.equal(f.sent.length, 0);
+    f.child.lifecycle = sampleInterruptedLifecycle(f);
     f.settle(true);
-    const result = await continueLiveChild(f.owner, f.child, { message: "confirmed interrupted follow-up" }, f.transport);
-    assert.equal(result.status, "accepted");
-    assert.equal(f.sent.length, 1);
-    assert.deepEqual(f.sent[0], ["confirmed interrupted follow-up", { expandPromptTemplates: false }]);
-    f.events.get("before_agent_start")!({}, f.ctx);
-    await assert.rejects(continueLiveChild(f.owner, f.child, { message: "expired must not dispatch" }, f.transport), /not confirmed settled/);
-    assert.equal(f.sent.length, 1);
+    const lifecycle = f.child.lifecycle;
+    const reject = async (transport: Parameters<typeof continueLiveChild>[3] = f.transport, owner = f.owner, child = f.child) => {
+      await assert.rejects(continueLiveChild(owner, child, { message: "must not dispatch" }, transport));
+      assert.equal(f.owner.continuationRequestId, undefined);
+      assert.equal(readdirSync(continuationDir(f.activityFile)).some(name => name.endsWith(".request.json")), false);
+      assert.equal(f.sent.length, 0);
+    };
+    for (const agentStatus of ["working", "blocked", "unknown"] as const) {
+      await reject({ ...f.transport, inspect: async () => ({ kind: "present", agentStatus, observedAt: 1060 }) });
+    }
+    for (const kind of ["missing", "unavailable"] as const) {
+      await reject({ ...f.transport, inspect: async () => ({ kind }) });
+    }
+    await reject({ ...f.transport, beforeSend: () => { throw new Error("custody lost"); } });
+    await reject(f.transport, { ...f.owner, runId: randomUUID() });
+    await reject(f.transport, { ...f.owner, closeRequestId: randomUUID() });
+    await reject(f.transport, f.owner, { ...f.child, cli: "claude" });
+    for (const changed of [
+      { ...lifecycle, process: createLifecycle(1).process },
+      { ...lifecycle, turn: { kind: "blocked" as const, startedAt: 1060 } },
+      { ...lifecycle, turn: { kind: "unknown" as const } },
+    ]) {
+      await reject({ ...f.transport, inspect: async () => {
+        f.child.lifecycle = changed;
+        return f.transport.inspect();
+      } });
+      f.child.lifecycle = lifecycle;
+    }
   } finally { f.cleanup(); }
 });
 
-test("foreign, malformed and busy child state cannot authorize continuation", async () => {
-  const f = fixture();
-  try {
-    f.settle();
-    const dir = continuationDir(f.activityFile);
-    const path = join(dir, "state.json");
-    const state = JSON.parse(readFileSync(path, "utf8"));
-    for (const patch of [{ runId: randomUUID() }, { sessionFile: "foreign" }, { state: "busy" }, { idleToken: "stale" }]) {
-      writeFileSync(path, JSON.stringify({ ...state, ...patch }));
-      await assert.rejects(continueLiveChild(f.owner, f.child, { message: "must not dispatch" }, f.transport), /not confirmed settled/);
+for (const fence of ["stale-token", "busy", "pending-messages", "changed-session"] as const) {
+  test(`starting reconciliation still rejects child-side ${fence} after parent validation`, async () => {
+    const f = fixture();
+    try {
+      f.child.lifecycle = sampleInterruptedLifecycle(f);
+      f.settle(true);
+      const stateFile = join(continuationDir(f.activityFile), "state.json");
+      if (fence === "stale-token") {
+        const expired = readFileSync(stateFile, "utf8");
+        f.settle(true); // Token has rotated but the parent's file is stale.
+        writeFileSync(stateFile, expired);
+      } else if (fence === "busy") f.idle(false);
+      else if (fence === "pending-messages") f.pending(true);
+      else f.ctx.sessionManager.getSessionFile = () => join(f.dir, "other.jsonl");
+      await assert.rejects(continueLiveChild(f.owner, f.child, { message: "must not reach API" }, f.transport), /Child rejected/);
       assert.equal(f.owner.continuationRequestId, undefined);
-      assert.equal(readdirSync(dir).some(name => name.endsWith(".request.json")), false);
-    }
-    assert.equal(f.sent.length, 0);
-  } finally { f.cleanup(); }
-});
+      assert.equal(f.sent.length, 0);
+      assert.equal(readdirSync(continuationDir(f.activityFile)).some(name => name.endsWith(".claim.json")), false);
+    } finally { f.cleanup(); }
+  });
+}
 
 test("reservation happens before asynchronous inspection; concurrent resumes cannot duplicate", async () => {
   const f = fixture();

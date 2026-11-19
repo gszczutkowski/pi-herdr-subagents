@@ -83,6 +83,11 @@ schemas fail closed rather than resetting state.
 Synchronous throws retain the original envelope for bounded-backoff retries.
 Outbox `dispatching` is persisted before `sendMessage`, and `handedOff` afterward.
 A crash between them is UNKNOWN, not permission to resend. Tombstones are retained.
+Storage/custody failures park delivery with per-event stage/error diagnostics in
+`/subagents-recovery`. After fixing storage, `/subagents-reconcile` can recover up
+to 100 proven-unsent pre-send failures per call, only under current writer/branch
+custody with the identical durable `pending` envelope. It never replays UNKNOWN
+`dispatching` events or post-send failures, and never starts another child turn.
 These records do not promise exactly-once processing or Pi persistence. In-process
 reload retains watchers; session replacement suppresses their late callbacks.
 Restart policy B: **never automatically relaunch a task from a manifest**.
@@ -305,15 +310,19 @@ npm test
 npm run lint
 ```
 
-Run the real end-to-end suite from inside herdr with an explicit test model:
+Run integration tests **inside the terminal backend being verified**:
 
 ```bash
-PI_TEST_MODEL="deepseek/deepseek-v4-flash" PI_TEST_TIMEOUT=180000 npm run test:integration
+npm run test:integration:transport       # real terminals, no model requests
+PI_TEST_MODEL="openai-codex/gpt-6.1-sol" npm run test:integration:plugin
+PI_TEST_MODEL="openai-codex/gpt-6.1-sol" npm run test:integration
 ```
 
-The full suite launches real Pi sessions and can take several minutes. `PI_TEST_TIMEOUT` is the per-test timeout in milliseconds; use at least `180000` for the lifecycle suite.
+Use an exact model authenticated on your host; the example is not a credential guarantee. Pi journeys make real, potentially billable requests. The runner detects HC versus legacy herdr, checks prerequisites, and fails rather than reporting an all-skipped success outside either environment. `--backend=hc` or `--backend=legacy` explicitly selects one; HC never substitutes for legacy compatibility.
 
-`PI_TEST_MODEL` is applied to both the parent Pi sessions and the project-local test subagents created by the harness.
+`test:integration:plugin` covers discovery and literal `/subagent`, forked context, invalid-agent rejection/recovery, and durable plan/checkpoint reload on HC. `test:integration:pi` adds the existing lifecycle/recovery journeys; the default runs transport plus both Pi groups. Legacy uses its existing transport/lifecycle/Claude-adapter fixtures. Results are backend-specific, and known failing journeys remain enabled. `PI_TEST_MODEL` pins parents and seeded children. `PI_TEST_TIMEOUT` controls legacy per-test waits (default `180000` ms); HC uses bounded per-step waits and a ten-minute journey deadline.
+
+See [the integration test matrix](test/integration/README.md) for coverage, evidence, filtering, and limitations. Inspect both `assertions.json` and `cleanup.json` in each HC journey's `.git/verification/` directory; skips or terminal creation alone are not end-to-end proof.
 
 ## Install
 
@@ -1047,8 +1056,12 @@ Approve only reviewed sources. Entries must be absolute paths and match the exac
 canonical source directory; approving a parent folder does not approve descendants.
 The first list enables project roles/overrides. The second separately permits that
 checkout's `.pi/agent` as the child's **user-level configuration**, including startup
-extensions. Both lists default to empty. Normal project `.pi/extensions`, skills and
-settings remain subject to Pi's own project trust.
+extensions. Both lists default to empty. To approve the current checkout's existing
+`.pi/agents` directory interactively, run `/subagents-approve`; it adds only
+that canonical directory to `projectAgentDirectories`. It does not approve the
+checkout's `.pi/agent` or override Pi's regular project-trust decision. Normal
+project `.pi/extensions`, skills and settings remain subject to Pi's own project
+trust.
 
 A host trust denial, missing host trust API, or saved denial for a target cwd blocks
 these approvals. Children otherwise inherit the parent's agentDir; merely finding a

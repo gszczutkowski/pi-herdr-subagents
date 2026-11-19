@@ -5,26 +5,30 @@ description: Run the integration test suite and verify all sessions end-to-end. 
 
 # Run integration tests
 
-Run this workflow from inside herdr. This project supports no other terminal backend.
+Run from the repository root inside **the backend being verified**: legacy herdr or herdr-core (HC). Read `test/integration/README.md` for the test matrix and evidence rules. No other terminal backend is supported.
 
-## Preflight
+## Preflight and transport
 
 ```bash
-echo "HERDR_ENV=$HERDR_ENV"
-command -v herdr
+node --version
 npm test
+npm run lint
+npm run test:integration:transport
 ```
 
-If the legacy preflight fails but `HC_TERMINAL_ID` + `HC_TERMINAL_SOCKET` and `hc` are present, load `../verify-pi-herdr-subagents/SKILL.md` and use its separate explicit HC TUI workflow. Do not claim the legacy suite passed through HC. Otherwise stop and ask the user to start Pi inside herdr.
+Node 24+ and installed dependencies are required. The runner detects HC from `HC_TERMINAL_ID` + `HC_TERMINAL_SOCKET`, or legacy herdr from `HERDR_ENV=1` + `HERDR_WORKSPACE_ID`. It checks the CLI/server and local Pi installation, and fails instead of silently reporting all-skipped success when prerequisites are absent. Never fabricate environment variables to force another backend. Transport scope starts no model.
 
-## Integration suite
+## Real Pi journeys
 
-From the repository root, run the suite with the project's reliable test model:
+Choose an **exact authenticated provider/model-id** from the host's available models. The example below works only where that model's credentials are configured:
 
 ```bash
-PI_TEST_MODEL="deepseek/deepseek-v4-flash" PI_TEST_TIMEOUT=180000 npm run test:integration
+PI_TEST_MODEL="openai-codex/gpt-6.1-sol" npm run test:integration:plugin
+PI_TEST_MODEL="openai-codex/gpt-6.1-sol" npm run test:integration
 ```
 
-The full suite launches real Pi sessions and can take several minutes. `PI_TEST_TIMEOUT` is the per-test timeout in milliseconds; use at least `180000` for the lifecycle suite.
+These commands make real, potentially billable requests. The model is pinned for both parent and seeded child sessions. `plugin` runs public feature journeys; default `all` adds transport and existing lifecycle/recovery/control journeys. `test:integration:pi` omits transport. Use `-- --backend=hc` or `-- --backend=legacy` to require a specific backend; HC cannot count as legacy proof. Legacy waits default to `PI_TEST_TIMEOUT=180000` ms; HC uses bounded per-step waits and a ten-minute journey deadline.
 
-The harness loads the extension directly from the working tree and creates isolated test agents. `PI_TEST_MODEL` controls every real Pi/LLM session in the lifecycle suite; use `deepseek/deepseek-v4-flash` instead of the slower, less predictable `openrouter/free` default. Report passing, failing, and skipped tests. Do not claim full verification when herdr-dependent tests were skipped.
+The harness loads the extension from the working tree, seeds isolated test agents, and targets only owned terminals. HC TUI journeys retain source hashes, actions, real sessions, observer events and captures under `.git/verification/`. Inspect **both** `assertions.json` and `cleanup.json`: require `passed: true` and `allMissing: true`. Cleanup failure or unresolved custody is not acceptance. Keep evidence private; never copy credential files.
+
+Report passing, failing, skipped and blocked tests, and the exact backend/model/command. A filter, missing provider, failed model-input precondition, or skipped journey is not full verification. Existing advanced journeys retain their strong assertions and may reveal unresolved behavior; do not silently exclude them to obtain green results. Direct `node --test` HC invocations still require opt-in environment flags and otherwise skip. For targeted manual journeys, load `../verify-pi-herdr-subagents/SKILL.md`.

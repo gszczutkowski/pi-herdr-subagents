@@ -9,6 +9,8 @@ Read [features/README.md](features/README.md), then the relevant feature recipe.
 
 ## HC TUI journeys (opt-in authenticated model requests)
 
+For the maintained backend-aware suite, use `npm run test:integration:transport` (no model) and `PI_TEST_MODEL="openai-codex/gpt-6.1-sol" npm run test:integration` (real model requests). The runner selects only the matching backend, enables its opt-in tests, and fails on missing prerequisites. `test:integration:plugin` runs the four public HC feature journeys; `test:integration:pi` also runs existing lifecycle tests. See `test/integration/README.md` and `INTEGRATION-EXPANSION-VERIFICATION.md` in that directory for scope and unresolved outcomes. The lower-level commands below remain available; skips are not live evidence.
+
 When `HC_TERMINAL_ID` and `HC_TERMINAL_SOCKET` are present but legacy `herdr`/`HERDR_ENV` are absent, **do not** claim the legacy helper passed. Use:
 
 ```bash

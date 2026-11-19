@@ -1,5 +1,5 @@
-import { existsSync, readFileSync } from "node:fs";
-import { createHash } from "node:crypto";
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { ProjectTrustStore } from "@earendil-works/pi-coding-agent";
 import { canonicalSessionPath } from "./ownership.ts";
@@ -31,6 +31,68 @@ export function readSubagentTrust(agentDir: string): SubagentTrust {
     return entries.map(entry => canonicalSessionPath(entry));
   };
   return { projectAgentDirectories: paths("projectAgentDirectories"), agentDirectories: paths("agentDirectories") };
+}
+
+/** Add exactly this checkout's existing .pi/agents directory to the user-owned
+ * project-source allowlist. The caller must present this as an explicit approval. */
+export function assertProjectApprovalPermitted(ctx: TrustContext, agentDir: string): void {
+  if (ctx.isProjectTrusted?.() !== true) {
+    throw new Error("Pi has not trusted this project; approve the project trust prompt before approving local subagents.");
+  }
+  if (new ProjectTrustStore(agentDir).get(ctx.cwd) === false) {
+    throw new Error("Pi has denied this project; remove that denial before approving local subagents.");
+  }
+}
+
+function acquirePolicyLock(agentDir: string): string {
+  const lock = join(agentDir, "subagent-trust.lock");
+  try {
+    closeSync(openSync(lock, "wx", 0o600));
+  } catch (error: any) {
+    if (error?.code !== "EEXIST") throw error;
+    // Never wait on the TUI thread or remove a lock another process may own.
+    throw new Error(`Subagent trust policy is locked: ${lock}. Retry when the other update finishes. If an update was interrupted, stop all Pi processes using this profile before removing the lock file.`);
+  }
+  return lock;
+}
+
+export function approveProjectAgentDirectory(agentDir: string, cwd: string): { path: string; added: boolean } {
+  const source = join(cwd, ".pi", "agents");
+  if (!existsSync(source) || !statSync(source).isDirectory()) {
+    throw new Error(`No project agent directory exists at: ${source}`);
+  }
+
+  const canonicalSource = canonicalSessionPath(source);
+  mkdirSync(agentDir, { recursive: true });
+  const lock = acquirePolicyLock(agentDir);
+  try {
+    const policy = readSubagentTrust(agentDir);
+    if (policy.projectAgentDirectories.includes(canonicalSource)) {
+      return { path: canonicalSource, added: false };
+    }
+
+    const updated: SubagentTrust = {
+      projectAgentDirectories: [...policy.projectAgentDirectories, canonicalSource],
+      agentDirectories: policy.agentDirectories,
+    };
+    const file = join(agentDir, "subagent-trust.json");
+    const temporary = join(agentDir, `.subagent-trust-${randomUUID()}.tmp`);
+    let fd: number | undefined;
+    try {
+      fd = openSync(temporary, "wx", 0o600);
+      writeFileSync(fd, `${JSON.stringify(updated, null, 2)}\n`, "utf8");
+      fsyncSync(fd);
+      closeSync(fd);
+      fd = undefined;
+      renameSync(temporary, file);
+    } finally {
+      if (fd !== undefined) closeSync(fd);
+      rmSync(temporary, { force: true });
+    }
+    return { path: canonicalSource, added: true };
+  } finally {
+    rmSync(lock, { force: true });
+  }
 }
 
 /** Missing host trust APIs fail closed. In agents-only checkouts Pi may report
