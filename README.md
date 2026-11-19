@@ -83,6 +83,11 @@ schemas fail closed rather than resetting state.
 Synchronous throws retain the original envelope for bounded-backoff retries.
 Outbox `dispatching` is persisted before `sendMessage`, and `handedOff` afterward.
 A crash between them is UNKNOWN, not permission to resend. Tombstones are retained.
+Storage/custody failures park delivery with per-event stage/error diagnostics in
+`/subagents-recovery`. After fixing storage, `/subagents-reconcile` can recover up
+to 100 proven-unsent pre-send failures per call, only under current writer/branch
+custody with the identical durable `pending` envelope. It never replays UNKNOWN
+`dispatching` events or post-send failures, and never starts another child turn.
 These records do not promise exactly-once processing or Pi persistence. In-process
 reload retains watchers; session replacement suppresses their late callbacks.
 Restart policy B: **never automatically relaunch a task from a manifest**.
@@ -150,7 +155,30 @@ supervision; keep its session for manual recovery instead.
 ## Durable task plans (Pi)
 
 `plan_read` reads the active branch's plan/revision; pass `taskId` for full
-criteria, attempts, results, evidence and decision history. `plan_update` takes
+criteria, attempts, results, evidence and decision history when they fit the
+40,000-byte/2,000-line response budget. Larger reads return section navigation,
+not truncated JSON or a request to repeat the same call:
+
+- `plan_read({ taskId: "...", section: "results", limit: 50 })` reads results
+  across all attempts, each with its `attemptId`. `runs` works the same way.
+- Other task sections: `definition`, `criteria`, `dependencies`, `artifacts`,
+  `attempts` (metadata/counts), `evidence`, `decisions`, `statusHistory`.
+  `section: "tasks"` pages the plan overview and must omit `taskId`.
+- Collection offsets are zero-based; limits default to 50, maximum 100. Follow
+  `next` verbatim until null. Cursors pin `planId`/`expectedRevision`; restart the
+  read if a concurrent update invalidates them. JSON continuations additionally
+  carry `documentHash`: a restore/access/diagnostic change at the same revision
+  rejects the old document cursor too. Do not remove fields from `next`.
+- An oversized individual item provides `jsonRead`. `section: "json"` pages the
+  complete view, including authority and full recovery diagnostics. Concatenate
+  `jsonText` values, then parse JSON. Offsets/limits are UTF-16 string positions
+  (not bytes or lines); the default limit is 4,096, maximum 8,192. With `taskId`
+  the document contains only that task; without it, all full task records.
+- Pages retain access/error/uncertainty indicators but are explicitly `partial`;
+  they do not certify that the model has seen the complete plan context. No full
+  snapshot is duplicated in their hidden tool details. Reads never grant writes.
+
+`plan_update` takes
 `expectedRevision` and a discriminated `command`: `create`, `add`, `edit`,
 `attempt` (start/retry), `run`, `result`, `evidence`, `status`, `accept`, or `detach`.
 Existing-plan commands also require `planId`. Criteria/artifact IDs are UUIDs.
@@ -169,6 +197,9 @@ line. An actual persisted session with a user/assistant message is required:
 disable writes across reload. Reopen the durable session, then call
 `plan_read({ reconcile: true })`; an in-memory leaf ahead of disk is not trusted.
 Unknown future plan schemas fail closed, never silently create an empty plan.
+Malformed abandoned detach records cannot hide the valid selected snapshot:
+rollback detection stays conservatively read-only until an explicit detach.
+Only a fully validated detached alternative is exempt from that detection.
 
 Restored `in_progress` tasks stay unchanged and are reported as
 `recoveryUncertain`: persistence is not process-liveness or completion proof.
@@ -240,8 +271,8 @@ for import retry; no blocker is fabricated on another plan branch.
   status history, artifact and child-session references. These are recorded
   references, not independently verified tests or proof that a process is live.
   Details wrap to terminal width; previews over 120 lines are explicitly clipped.
-- `plan_read({ taskId: "..." })` provides full structured task data in non-TUI
-  modes too (existing 40KB text limit; no new mutation tool).
+- `plan_read({ taskId: "..." })` provides structured task data in non-TUI modes
+  too; large tasks use the collection/JSON pagination described above.
 
 Commands change presentation only and do not start model turns or create another
 checklist. Store changes and session restore/navigation refresh the widget without
@@ -279,15 +310,19 @@ npm test
 npm run lint
 ```
 
-Run the real end-to-end suite from inside herdr with an explicit test model:
+Run integration tests **inside the terminal backend being verified**:
 
 ```bash
-PI_TEST_MODEL="deepseek/deepseek-v4-flash" PI_TEST_TIMEOUT=180000 npm run test:integration
+npm run test:integration:transport       # real terminals, no model requests
+PI_TEST_MODEL="openai-codex/gpt-6.1-sol" npm run test:integration:plugin
+PI_TEST_MODEL="openai-codex/gpt-6.1-sol" npm run test:integration
 ```
 
-The full suite launches real Pi sessions and can take several minutes. `PI_TEST_TIMEOUT` is the per-test timeout in milliseconds; use at least `180000` for the lifecycle suite.
+Use an exact model authenticated on your host; the example is not a credential guarantee. Pi journeys make real, potentially billable requests. The runner detects HC versus legacy herdr, checks prerequisites, and fails rather than reporting an all-skipped success outside either environment. `--backend=hc` or `--backend=legacy` explicitly selects one; HC never substitutes for legacy compatibility.
 
-`PI_TEST_MODEL` is applied to both the parent Pi sessions and the project-local test subagents created by the harness.
+`test:integration:plugin` covers discovery and literal `/subagent`, forked context, invalid-agent rejection/recovery, and durable plan/checkpoint reload on HC. `test:integration:pi` adds the existing lifecycle/recovery journeys; the default runs transport plus both Pi groups. Legacy uses its existing transport/lifecycle/Claude-adapter fixtures. Results are backend-specific, and known failing journeys remain enabled. `PI_TEST_MODEL` pins parents and seeded children. `PI_TEST_TIMEOUT` controls legacy per-test waits (default `180000` ms); HC uses bounded per-step waits and a ten-minute journey deadline.
+
+See [the integration test matrix](test/integration/README.md) for coverage, evidence, filtering, and limitations. Inspect both `assertions.json` and `cleanup.json` in each HC journey's `.git/verification/` directory; skips or terminal creation alone are not end-to-end proof.
 
 ## Install
 
@@ -798,7 +833,9 @@ Configure `config.json` (or copy the defaults from `config.json.example`):
 ```
 
 **Early compaction.** The parent targets a reserve of the larger of 50,000 tokens
-and 20% of the model's window, capped at 40% for small models. For example, the
+and 20% of the effective context window reported by Pi's usage API, capped at 40%
+for small models. This honors the latest physical response's limits for virtual
+model selections, even when their declared limits differ or are unknown. For example, the
 128k-window threshold is 78k; a 1M-window threshold is 800k. The recent tail is
 capped at half the remaining usable window; a smaller native/per-model retention
 setting is honored between turns. `enabled:false` disables proactive compaction;
@@ -816,8 +853,12 @@ meaningfully shrink the prefix (at least 1,024 tokens or 2% of the window); fail
 or unusable summaries retain history and enter a three-completed-turn cooldown.
 Cancelled idle compaction also cancels submission of that pending prompt.
 
-Between-turn guard summaries use the active configured provider/model, with an
-output cap of 8,192 tokens (or the smaller model/window budget). They are additional
+Between-turn guard summaries use the active configured selection through public
+`modelRegistry.streamSimple(...).result()`. Virtual selections invoke their router
+with reason `direct`; Pi caps the positive requested budget to the routed physical
+model's output limit. The guard cap is 8,192 tokens (or the smaller known
+model/effective-window budget); unknown virtual output limits are not zero-token
+requests. A physical model merely named `auto` is not treated as virtual. They are additional
 billable calls. These boundary drafts do **not** emit Pi's native
 `session_before_compact`/`session_compact` notifications or use other extensions'
 custom native summarizers; native/manual/overflow compaction still does. Disable
@@ -1015,8 +1056,12 @@ Approve only reviewed sources. Entries must be absolute paths and match the exac
 canonical source directory; approving a parent folder does not approve descendants.
 The first list enables project roles/overrides. The second separately permits that
 checkout's `.pi/agent` as the child's **user-level configuration**, including startup
-extensions. Both lists default to empty. Normal project `.pi/extensions`, skills and
-settings remain subject to Pi's own project trust.
+extensions. Both lists default to empty. To approve the current checkout's existing
+`.pi/agents` directory interactively, run `/subagents-approve`; it adds only
+that canonical directory to `projectAgentDirectories`. It does not approve the
+checkout's `.pi/agent` or override Pi's regular project-trust decision. Normal
+project `.pi/extensions`, skills and settings remain subject to Pi's own project
+trust.
 
 A host trust denial, missing host trust API, or saved denial for a target cwd blocks
 these approvals. Children otherwise inherit the parent's agentDir; merely finding a

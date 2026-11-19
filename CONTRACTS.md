@@ -26,6 +26,33 @@ publication. None of these changes grants acceptance, process liveness or termin
 custody. A narrow post-compaction read-only fallback preserves exact state; full
 delta stability on that path is a documented host dependency, not a solved guarantee.
 
+## Plan read pagination
+
+`plan_read` keeps the existing small overview/task shape; every successful text
+response is valid JSON within 40,000 UTF-8 bytes and 2,000 lines. Large default
+reads return navigation instead of a clipped document. Collection `section`
+reads accept zero-based `offset` and `limit` (default 50, max 100): `tasks`
+without `taskId`; `definition`, `criteria`, `dependencies`, `artifacts`,
+`attempts`, `runs`, `results`, `evidence`, `decisions`, `statusHistory` with it.
+Attempts pages expose metadata/counts; results/runs carry their `attemptId`.
+
+Follow `next` as returned: its `planId` and `expectedRevision` pin the snapshot.
+A changed identity/revision rejects the cursor; restart instead of mixing pages.
+JSON cursors additionally pin `documentHash` (SHA-256 of the entire serialized
+view). Restore/reconcile/access diagnostics can change without a plan revision;
+that change rejects the old document cursor as well. Nonzero JSON offsets require
+this returned cursor, not a manually incremented offset without the hash.
+A single oversized item is not skipped: `oversizedItem` and `jsonRead` identify
+recovery through `section: "json"`. Join all `jsonText` fragments and parse the
+resulting complete view, including authority/recovery diagnostics. JSON offsets
+and limits are UTF-16 string positions (default 4,096, max 8,192), not bytes or
+lines. Without `taskId` that document includes every full task.
+
+Pages are explicitly partial, retain access/error/uncertainty indicators and
+never grant mutation authority or claim full plan-context publication. Their
+hidden tool details contain only the page. Small reads retain their existing
+snapshot/details/receipt semantics. Read cursors do not certify runtime liveness.
+
 ## Interrupt control boundary
 
 `subagent_interrupt` requests the public Pi abort API through a child-issued
@@ -43,8 +70,10 @@ also clears trailing active activity snapshots. Same-user filesystem trust appli
 
 ## Verification boundaries
 
-Current evidence and limitations: `test/integration/HC-WORKFLOW-VERIFICATION.md`
-(734 integrated automated tests and seven named authenticated HC TUI journeys).
+Current automated evidence: `test/M4-M5-M6-VERIFICATION.md` (747/747 integrated
+tests, including independent review and the document-cursor follow-up fix).
+Historical live evidence: `test/integration/HC-WORKFLOW-VERIFICATION.md`
+(seven named authenticated HC TUI journeys; not rerun for these three repairs).
 Manual HC Escape and authenticated same-batch stress paths are not accepted.
 `test/REPAIR-VERIFICATION.md` and the boundary below are historical evidence.
 

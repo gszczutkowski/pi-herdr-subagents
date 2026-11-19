@@ -9,6 +9,14 @@ import { HcClient, bashPath, findHcExecutable } from "../../pi-extension/subagen
 import { runScriptInPane, shellQuote } from "../../pi-extension/subagents/terminal.ts";
 import { isProtectedProcess, probeProcess, sameProcess } from "../../pi-extension/subagents/process-identity.ts";
 import { canonicalSessionPath } from "../../pi-extension/subagents/ownership.ts";
+import { localPiCli, localPiShellCommand } from "./local-pi.ts";
+
+/** Validate ownership before adding anything to the transport teardown list. */
+export function trackTransportSurface(owned: string[], surface: string, protectedTerminal = process.env.HC_TERMINAL_ID): void {
+  assert.notEqual(surface, protectedTerminal, "Never target the user's terminal");
+  assert.ok(!owned.includes(surface), "HC must allocate a distinct test terminal");
+  owned.push(surface);
+}
 
 export function jsonLines(path: string): any[] {
   if (!existsSync(path)) return [];
@@ -39,6 +47,13 @@ export function childSurface(script: string): string {
   const matches = [...script.matchAll(/^#(?:[ \t]*#)*[ \t]*Surface: (t[a-z0-9]+)\r?$/gm)];
   assert.equal(matches.length, 1, "Exactly one commented child Surface required");
   return matches[0][1];
+}
+
+/** HC 0.1.21 lowercases printable named keys and does not translate shifted
+ * punctuation. Fail rather than silently changing a command's task or token. */
+export function literalHcKeys(text: string): string[] {
+  assert.match(text, /^[a-z0-9/. -]*$/, "HC literal commands require lowercase letters, digits, spaces, slash, dot or hyphen; other named keys are not lossless");
+  return Array.from(text, character => character === " " ? "space" : character);
 }
 
 export class HcTuiRun {
@@ -73,7 +88,7 @@ export class HcTuiRun {
     if (!executable) throw new Error("HC executable unavailable");
     this.hc = new HcClient(executable);
     const entry = join(this.root, "pi-extension/subagents/index.ts");
-    const cli = join(this.root, "node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js");
+    const cli = localPiCli;
     const cliVersion = execFileSync(process.execPath, [cli, "--version"], { encoding: "utf8" }).trim();
     const sourceFiles = (directory: string): string[] => readdirSync(directory, { withFileTypes: true }).flatMap(item =>
       item.isDirectory() ? sourceFiles(join(directory, item.name)) : [join(directory, item.name)]);
@@ -99,7 +114,7 @@ export class HcTuiRun {
     writeFileSync(join(this.scratch, "gate.mjs"), `import fs from 'node:fs';\nconst n=process.argv[2];fs.writeFileSync(n+'.started','STARTED');\nawait new Promise((resolve,reject)=>{let w;const t=setTimeout(()=>{w?.close();reject(Error('gate timeout'))},240000);const check=()=>{if(fs.existsSync(n+'.release')){clearTimeout(t);w?.close();resolve()}};w=fs.watch('.',check);check()});\nfs.writeFileSync(n+'.txt',n);\n`);
     const bin = join(this.scratch, "bin"); mkdirSync(bin);
     const originalProfile = getAgentConfigDir();
-    writeFileSync(join(bin, "pi"), `#!/bin/bash\nexport PI_TEST_HC_TUI=1 PI_TEST_MODEL=${shellQuote(process.env.PI_TEST_MODEL || "openai-codex/gpt-6.1-sol")} PI_TEST_HC_AUTH_DIR=${shellQuote(originalProfile)} PI_CODING_AGENT_DIR=${shellQuote(this.profile)} PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 PI_TEST_HC_EVENTS=${shellQuote(this.events)} PI_TEST_HC_SCRATCH=${shellQuote(this.scratch)}\nexec ${shellQuote(bashPath(process.execPath))} ${shellQuote(bashPath(cli))} -ne -e ${shellQuote(join(this.root, "test/integration/hc-auth.ts"))} -e ${shellQuote(join(this.root, "test/integration/hc-observer.ts"))} "$@"\n`, { mode: 0o755 });
+    writeFileSync(join(bin, "pi"), `#!/bin/bash\nexport PI_TEST_HC_TUI=1 PI_TEST_MODEL=${shellQuote(process.env.PI_TEST_MODEL || "openai-codex/gpt-6.1-sol")} PI_TEST_HC_AUTH_DIR=${shellQuote(originalProfile)} PI_CODING_AGENT_DIR=${shellQuote(this.profile)} PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 PI_TEST_HC_EVENTS=${shellQuote(this.events)} PI_TEST_HC_SCRATCH=${shellQuote(this.scratch)}\nexec ${localPiShellCommand()} -ne -e ${shellQuote(join(this.root, "test/integration/hc-auth.ts"))} -e ${shellQuote(join(this.root, "test/integration/hc-observer.ts"))} "$@"\n`, { mode: 0o755 });
     this.save("state.json", { scratch: this.scratch, evidence: this.evidence, owned: [] });
   }
   save(name: string, data: unknown) { writeFileSync(join(this.evidence, name), JSON.stringify(data, null, 2)); }
@@ -109,7 +124,7 @@ export class HcTuiRun {
     // hc send adds provenance tags around agent messages. Slash commands must be
     // literal keystrokes; otherwise Pi receives <hc>...</hc> as a model prompt.
     if (text.startsWith("/")) {
-      execFileSync(this.hc.executable, ["keys", target, ...text.split(""), "enter"], { encoding: "utf8", timeout: 15_000 });
+      this.keys(target, ...literalHcKeys(text), "enter");
     } else this.hc.send(target, text);
   }
   keys(target: string, ...keys: string[]) {
@@ -225,7 +240,8 @@ export class HcTuiRun {
     }
   }
   async finish(error?: unknown) {
-    this.save("assertions.json", { journey: this.journey, passed: !error, assertions: this.assertions, error: error ? String(error) : undefined, at: Date.now(), parentToolOutcomes: this.observed().filter(e => e.session === this.parentSession && e.kind === "tool_end") });
+    const outcome = { journey: this.journey, passed: false, assertions: this.assertions, error: error ? String(error) : undefined, at: Date.now(), parentToolOutcomes: this.observed().filter(e => e.session === this.parentSession && e.kind === "tool_end") };
+    this.save("assertions.json", outcome);
     const cleanup: any[] = [];
     const unresolved: any[] = [];
     try { await this.capture("final"); } catch (error) { cleanup.push({ captureError: String(error) }); }
@@ -236,7 +252,13 @@ export class HcTuiRun {
     // Recover only surfaces recorded in this exact parent's prepared durable
     // runs, even if dispatch failed before a tool acknowledgement/start event.
     try {
-      for (const run of Object.values(this.manifest().runs) as any[]) {
+      const manifest = this.manifestIfPresent();
+      // A parent with no launches has no runtime store yet. Absence after a
+      // successful launch, however, is lost custody, not an empty successful run.
+      if (!manifest && (this.owned.size > (this.parent ? 1 : 0) || this.results().some(event => event.data.result.details?.status === "started"))) {
+        throw new Error("Runtime manifest missing after child launch");
+      }
+      for (const run of Object.values(manifest?.runs ?? {}) as any[]) {
         if (!run.surface || this.owned.has(run.surface)) continue;
         try {
           assert.match(run.surface, /^t[a-z0-9]+$/);
@@ -267,6 +289,7 @@ export class HcTuiRun {
     }
     const allMissing = unresolved.length === 0 && cleanup.filter(x => x.terminal).every(x => x.inspection?.kind === "missing");
     this.save("cleanup.json", { at: Date.now(), allMissing, unresolved, terminals: cleanup });
+    this.save("assertions.json", { ...outcome, passed: !error && allMissing, cleanupPassed: allMissing });
     // Retain scratch on failure: gate files and launch inputs are diagnostic evidence.
     // Windows may retain directory handles briefly after HC reports terminal removal.
     if (!error && allMissing) rmSync(this.scratch, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
@@ -298,11 +321,14 @@ export class HcTuiRun {
     assert.ok(header?.id);
     return join(dirname(this.parentSession), "artifacts", header.id);
   }
+  manifestIfPresent() {
+    if (!existsSync(this.parentSession)) return undefined;
+    const path = join(this.artifactDirectory(), "subagent-runtime", "manifest.json");
+    return existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) : undefined;
+  }
   manifest() {
-    const dir = this.artifactDirectory();
-    const files = readdirSync(dir, { recursive: true }).map(String);
-    const path = files.find(f => f.endsWith("manifest.json"));
-    assert.ok(path, "Durable manifest required");
-    return JSON.parse(readFileSync(join(dir, path), "utf8"));
+    const manifest = this.manifestIfPresent();
+    assert.ok(manifest, "Durable manifest required");
+    return manifest;
   }
 }

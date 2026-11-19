@@ -6,7 +6,8 @@ import { createAssistantMessageEventStream, type AssistantMessage } from "@earen
 import { withChildSession } from "./child-session.ts";
 import { canonicalSessionPath, type SessionOwner } from "../pi-extension/subagents/ownership.ts";
 import { continuationDir, continueLiveChild } from "../pi-extension/subagents/live-continuation.ts";
-import { createLifecycle, markInterruptRequested, markProcessRunning } from "../pi-extension/subagents/lifecycle.ts";
+import { createLifecycle, markInterruptRequested, markProcessRunning, observeActivity, observePaneInspection } from "../pi-extension/subagents/lifecycle.ts";
+import { readSubagentActivityFile } from "../pi-extension/subagents/activity.ts";
 
 async function until(predicate: () => boolean) {
   const deadline = Date.now() + 5000;
@@ -23,7 +24,7 @@ function response(model: any, aborted: boolean): AssistantMessage {
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
 }
 
-for (const scenario of ["manual-active-Escape", "idle-Escape"] as const) {
+for (const scenario of ["manual-active-Escape", "idle-Escape", "missed-HC-working-Escape"] as const) {
   test(`native continuation: ${scenario} resumes the same process with current model context`, async () => {
     await withChildSession({ liveContinuation: true, autoExit: false, stream(model, _context, options, index) {
       const stream = createAssistantMessageEventStream();
@@ -33,7 +34,7 @@ for (const scenario of ["manual-active-Escape", "idle-Escape"] as const) {
         else stream.push({ type: "done", reason: "stop", message });
         stream.end();
       };
-      if (index === 0 && scenario === "manual-active-Escape") {
+      if (index === 0 && scenario !== "idle-Escape") {
         options.signal.addEventListener("abort", () => finish(true), { once: true });
       } else finish(false);
       return stream;
@@ -44,21 +45,41 @@ for (const scenario of ["manual-active-Escape", "idle-Escape"] as const) {
       const dir = continuationDir(activityFile);
       const state = () => JSON.parse(readFileSync(join(dir, "state.json"), "utf8"));
       const child = { id: runId, name: "Worker", cli: "pi", sessionFile, activityFile, surface: "same-process",
-        lifecycle: { ...markProcessRunning(createLifecycle(1), 2), turn: { kind: "waiting" as const, startedAt: 3 } },
+        lifecycle: scenario === "missed-HC-working-Escape"
+          ? observePaneInspection(createLifecycle(1), { kind: "present", agentStatus: "idle", observedAt: 2 }, 2)
+          : { ...markProcessRunning(createLifecycle(1), 2), turn: { kind: "waiting" as const, startedAt: 3 } },
         hasTurnResult: false };
       const owner: SessionOwner = { runId, surface: child.surface, dispatched: true };
       const transport = { inspect: async () => ({ kind: "present", agentStatus: "idle", observedAt: Date.now() } as const), timeoutMs: 2000 };
       const initial = session.prompt("INITIAL_NATIVE_TASK");
       await until(() => requests.length === 1);
-      if (scenario === "manual-active-Escape") {
+      if (scenario !== "idle-Escape") {
         assert.equal(state().state, "busy");
         await assert.rejects(continueLiveChild(owner, child, { message: "must not dispatch while working" }, transport), /not confirmed settled/);
         assert.equal(readdirSync(dir).some(name => name.endsWith(".request.json")), false);
+        if (scenario === "missed-HC-working-Escape") {
+          // Control parent sampling only; activity and settlement are native Pi.
+          const active = readSubagentActivityFile(activityFile, runId);
+          assert.ok(active.ok);
+          assert.equal(active.activity.phase, "active");
+          child.lifecycle = markInterruptRequested(child.lifecycle, active.activity.updatedAt);
+          child.lifecycle = observeActivity(child.lifecycle, active, active.activity.updatedAt);
+          assert.equal(child.lifecycle.turn.kind, "active");
+        }
         // SDK abort is the same native AgentSession cancellation used by Escape;
         // no synthetic agent_settled event or fabricated child token.
         await session.abort();
         await initial;
         assert.equal(state().state, "interrupted-idle");
+        if (scenario === "missed-HC-working-Escape") {
+          const waiting = readSubagentActivityFile(activityFile, runId);
+          assert.ok(waiting.ok);
+          assert.equal(waiting.activity.phase, "waiting");
+          child.lifecycle = observeActivity(child.lifecycle, waiting, Date.now());
+          child.lifecycle = observePaneInspection(child.lifecycle, { kind: "present", agentStatus: "idle", observedAt: Date.now() }, Date.now());
+          assert.equal(child.lifecycle.hasWorked, false);
+          assert.equal(child.lifecycle.turn.kind, "starting");
+        }
         assert.equal(child.hasTurnResult, false, "manual Escape has no completion result");
       } else {
         await initial;
@@ -77,7 +98,7 @@ for (const scenario of ["manual-active-Escape", "idle-Escape"] as const) {
       assert.match(JSON.stringify(requests[1]), /INITIAL_NATIVE_TASK/);
       assert.equal(session.sessionFile, process.env.PI_SUBAGENT_SESSION);
       assert.equal(owner.continuationRequestId, undefined);
-      assert.equal(shutdowns(), 0, "the supervised child remains open in both scenarios");
+      assert.equal(shutdowns(), 0, "the supervised child remains open in every scenario");
       assert.equal(readdirSync(dir).filter(name => name.endsWith(".claim.json")).length, 1);
       // A stale parent idle label is insufficient after a new native run starts.
       assert.equal(requests.length, 2);

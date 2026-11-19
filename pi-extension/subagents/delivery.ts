@@ -24,6 +24,8 @@ interface PendingDelivery {
   retryAt: number;
   inFlight: boolean;
   parked?: boolean;
+  store?: import("./runtime-store.ts").RuntimeStore;
+  failure?: { stage: "before-send" | "retry-reset" | "after-send"; error: string };
 }
 
 export interface DeliveryState {
@@ -68,7 +70,7 @@ export function enqueueDelivery(
   });
   // Persist before publication; callbacks and owners are never serialized.
   state.store?.enqueue(eventId, owner.id, envelope);
-  state.pending.set(eventId, { envelope, owner, onHandoff, attempts: 0, retryAt: 0, inFlight: false });
+  state.pending.set(eventId, { envelope, owner, onHandoff, attempts: 0, retryAt: 0, inFlight: false, store: state.store });
   // Plan import is a separate projection: its failure must never suppress delivery.
   try { state.onEnvelope?.(owner.id, envelope); } catch { /* Retained in durable outbox for import retry. */ }
   flushDeliveries(state);
@@ -92,9 +94,52 @@ export function restoreDurableDeliveries(
       envelope: freeze(structuredClone(event.envelope)),
       owner: { id: event.runId, lifecycle: createLifecycle(Date.now()) },
       onHandoff: () => {}, attempts: 0, retryAt: 0, inFlight: false,
-      parked: event.status === "dispatching",
+      parked: event.status === "dispatching", store,
     });
   }
+}
+
+function parkDelivery(state: DeliveryState, id: string, entry: PendingDelivery,
+  stage: NonNullable<PendingDelivery["failure"]>["stage"], error: unknown): void {
+  entry.parked = true;
+  entry.failure = { stage, error: `Delivery ${id} paused at ${stage}: ${String(error)}` };
+  state.persistenceError = entry.failure.error;
+}
+
+/** Per-event errors survive later failures so recovery reports retain the actual stage. */
+export function deliveryDiagnostics(state: DeliveryState): string[] {
+  return [...new Set([
+    ...Array.from(state.pending.values()).flatMap(entry => entry.failure ? [entry.failure.error] : []),
+    ...(state.persistenceError ? [state.persistenceError] : []),
+  ])];
+}
+
+/** Explicit bounded recovery only for a proven-unsent event in this exact store.
+ * A failed dispatching commit can itself be ambiguous; pending on validated disk
+ * is mandatory. Never reset/replay dispatching or an after-send persistence fault. */
+export function reconcileUnsentDeliveries(state: DeliveryState, limit = 100): number {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) throw new Error("Invalid delivery reconciliation limit");
+  const store = state.store;
+  if (!store) return 0;
+  store.assertCustody();
+  if (store.snapshot().custodyPaused) throw new Error("Delivery reconciliation requires unpaused branch custody");
+  let recovered = 0;
+  for (const [id, entry] of state.pending) {
+    if (recovered >= limit) break;
+    if (!entry.parked || entry.failure?.stage !== "before-send" || entry.inFlight || entry.store !== store ||
+        entry.owner.lifecycle.delivery !== "pending" || entry.owner.source?.lifecycle.delivery === "suppressed") continue;
+    const event = store.getEvent(id);
+    if (event?.status !== "pending" || event.runId !== entry.owner.id ||
+        JSON.stringify(event.envelope) !== JSON.stringify(entry.envelope)) continue;
+    // assertCustody checks the writer, on-disk revision/content, and active branch.
+    store.assertCustody();
+    if (state.persistenceError === entry.failure.error) state.persistenceError = undefined;
+    entry.failure = undefined;
+    entry.parked = false;
+    entry.retryAt = 0;
+    recovered++;
+  }
+  return recovered;
 }
 
 export function pauseDeliveries(state: DeliveryState): void {
@@ -118,8 +163,7 @@ export function flushDeliveries(state: DeliveryState): void {
     try {
       state.store?.delivery(id, "dispatching");
     } catch (error) {
-      entry.parked = true;
-      state.persistenceError = String(error);
+      parkDelivery(state, id, entry, "before-send", error);
       entry.inFlight = false;
       continue;
     }
@@ -129,7 +173,7 @@ export function flushDeliveries(state: DeliveryState): void {
       // A synchronous rejection permits an in-process retry. A crash during
       // dispatch remains UNKNOWN on disk and must not be blindly replayed.
       try { state.store?.delivery(id, "pending"); }
-      catch (error) { entry.parked = true; state.persistenceError = String(error); }
+      catch (error) { parkDelivery(state, id, entry, "retry-reset", error); }
       entry.retryAt = Date.now() + Math.min(250 * 2 ** Math.min(entry.attempts++, 7), 30_000);
       continue;
     } finally {
@@ -137,8 +181,7 @@ export function flushDeliveries(state: DeliveryState): void {
     }
     try { state.store?.delivery(id, "handedOff"); }
     catch (error) {
-      entry.parked = true;
-      state.persistenceError = String(error);
+      parkDelivery(state, id, entry, "after-send", error);
       continue;
     }
     state.handedOff.add(id);

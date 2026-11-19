@@ -20,6 +20,8 @@ import {
   unlinkSync,
 } from "node:fs";
 import { join, resolve, dirname } from "node:path";
+import { usesHcBackend } from "../../pi-extension/subagents/herdr.ts";
+import { localPiShellCommand } from "./local-pi.ts";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import {
@@ -78,8 +80,9 @@ export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");
 
 // ── Backend detection ──
 
-/** Detect whether the required herdr backend is available. */
+/** This harness uses legacy workspace/pane commands, never the HC API. */
 export function getAvailableBackends(): MuxBackend[] {
+  if (process.env.HERDR_ENV !== "1" || !process.env.HERDR_WORKSPACE_ID || usesHcBackend()) return [];
   return isTerminalAvailable() ? ["herdr"] : [];
 }
 
@@ -260,7 +263,7 @@ export function startPi(
   // against whatever version is checked out under `~/.pi/agent/git/...`.
   const cmd = [
     `cd ${shellQuote(testDir)} &&`,
-    `pi`,
+    localPiShellCommand(),
     `-ne`,
     `-e ${shellQuote(EXTENSION_SOURCE)}`,
     `--model ${shellQuote(model)}`,

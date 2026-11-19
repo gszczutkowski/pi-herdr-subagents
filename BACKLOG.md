@@ -4,6 +4,49 @@ This is the current scope/status entry point. `HANDOFF.md` records an earlier,
 completed close/audit milestone; its completion is not completion of subsequent
 repair or context-optimization plans.
 
+## Interrupted resume and explicit unsent-result recovery repaired (2026-11-17)
+
+- Stale `starting` parent turn labels no longer prevent validation of a
+  confirmed-running child's fresh run/session-bound `interrupted-idle` proof.
+  Ordinary settled-idle, busy/foreign/stale children and custody failures still
+  fail closed. Permanent sampling-interleaving and native Pi regressions added.
+- Per-event delivery failure stages/errors are exposed in recovery diagnostics.
+  `/subagents-reconcile` now recovers at most 100 proven-unsent pre-send parked
+  events under exact store/writer/branch/payload validation. UNKNOWN dispatching
+  and post-send failures are never blindly replayed. Storage faults still require
+  repair and explicit reconciliation; automatic healing is not promised.
+- Integrated `npm test`: **778/778 pass**, zero skips; lint and diff-check pass.
+  Independent review approved both fixes. Live HC transport: **3/3 pass**.
+- The unfiltered authenticated full HC integration run was **14/17**, zero skips:
+  two same-batch model-input preconditions were unmet, and the owned audit journey
+  timed out on a retained pending first result without invoking reconciliation.
+  A later unchanged audit journey passed; a separate controlled real-HC fault
+  probe proved public reconciliation delivers the immutable result once with no
+  extra child turn. These passes do **not** erase the original full-run failure.
+- **Full integration is not green.** Exact transient fault details and live
+  authenticated same-batch coverage remain follow-up work; legacy/Linux are not
+  verified. No global deployment or commits were made in this repair session.
+- Scope, commands, original failures, review and cleanup evidence:
+  [test/integration/LIFECYCLE-DELIVERY-REPAIR-VERIFICATION.md](test/integration/LIFECYCLE-DELIVERY-REPAIR-VERIFICATION.md).
+
+## M5 / M4 / M6 implemented (2026-11-16)
+
+- **M5:** malformed abandoned detach records preserve the valid selected plan;
+  writes remain historical/read-only. Only validated independent detaches exempt
+  rollback detection.
+- **M4:** `plan_read` supports bounded collection pagination, revision-pinned
+  cursors and lossless JSON fragments for oversized records. JSON document hashes
+  also fence diagnostic changes at an unchanged revision. Small reads remain
+  compatible; partial pages never certify whole-plan context publication.
+- **M6:** proactive guard budgets use effective Pi context usage. Summary calls
+  route registered virtual models through public `streamSimple(...).result()`
+  with positive output budgets capped by the host's physical target.
+- Integrated local Pi **1.5.2** `npm test`: **747/747 pass**, zero failures,
+  skips or cancellations. These are offline deterministic/native SDK tests,
+  not a fresh authenticated HC/Kiro/legacy-herdr run or deployment.
+- Evidence and remaining limits: [test/M4-M5-M6-VERIFICATION.md](test/M4-M5-M6-VERIFICATION.md).
+  Implementation branch: `fix/plan-read-detach-virtual-models`.
+
 ## Core HC TUI workflow verified and interrupt repaired (2026-11-16)
 
 - Final precommit local Pi **1.5.2** automated suite: **734/734 pass**, zero failures,
@@ -30,7 +73,8 @@ repair or context-optimization plans.
   No legacy-herdr, Linux, Kiro, final-wire/billing or global deployment claim.
 - Report: [test/integration/HC-WORKFLOW-VERIFICATION.md](test/integration/HC-WORKFLOW-VERIFICATION.md).
   Implementation/tests are committed locally as `8f8d53c`; accompanying docs and
-  verification skills are committed separately. No push; global Pi remains unchanged.
+  verification skills are committed separately. This milestone was subsequently
+  pushed in PR #4 and merged as `75a355c`; global Pi remains unchanged.
 
 ## Audit repairs integrated (2026-11-16)
 
@@ -46,7 +90,8 @@ repair or context-optimization plans.
   [test/AUDIT-REPAIR-VERIFICATION.md](test/AUDIT-REPAIR-VERIFICATION.md).
 - At this audit milestone live herdr/provider e2e was unverified. The subsequent
   bounded HC workflow proof above supersedes that blanket limitation only for its
-  seven named journeys; optional audit items remain backlog.
+  seven named journeys. M4/M5/M6 are implemented in the newer milestone above;
+  unrelated optional audit/optimization items remain backlog.
 
 ## Earlier implementation/review milestone
 

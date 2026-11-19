@@ -1,11 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, mkdirSync, symlinkSync, writeFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, symlinkSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { DefaultResourceLoader, SettingsManager, ProjectTrustStore } from "@earendil-works/pi-coding-agent";
-import { authorizedDiscovery, assertAgentDirectoryAuthorized, assertDefinitionAuthorized, sourceAuthorized } from "../pi-extension/subagents/project-trust.ts";
+import { approveProjectAgentDirectory, authorizedDiscovery, assertAgentDirectoryAuthorized, assertDefinitionAuthorized, sourceAuthorized } from "../pi-extension/subagents/project-trust.ts";
 import { discoverAgentDefinitions, loadAgentDefaults } from "../pi-extension/subagents/discovery.ts";
+import { canonicalSessionPath } from "../pi-extension/subagents/ownership.ts";
 
 function fixture(run: (f: any) => void) {
   const dir = mkdtempSync(join(tmpdir(), "subagent-project-trust-"));
@@ -22,6 +23,45 @@ function fixture(run: (f: any) => void) {
   try { run({ base, cwd, target, source, local, grant, ctx }); }
   finally { if (old === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = old; rmSync(dir, { recursive: true, force: true }); }
 }
+
+test("approval writes an exact canonical source once and preserves agent-directory grants", () => fixture(({ base, cwd, local, grant }: any) => {
+  grant([], [local]);
+  const first = approveProjectAgentDirectory(base, cwd);
+  const second = approveProjectAgentDirectory(base, cwd);
+  const policy = JSON.parse(readFileSync(join(base, "subagent-trust.json"), "utf8"));
+
+  assert.equal(first.added, true);
+  assert.equal(second.added, false);
+  assert.deepEqual(policy.projectAgentDirectories, [first.path]);
+  assert.deepEqual(policy.agentDirectories, [canonicalSessionPath(local)]);
+}));
+
+test("approval refuses missing sources and malformed policies without overwriting them", () => fixture(({ base, cwd, source }: any) => {
+  rmSync(source, { recursive: true });
+  assert.throws(() => approveProjectAgentDirectory(base, cwd), /No project agent directory/);
+  writeFileSync(source, "not a directory");
+  assert.throws(() => approveProjectAgentDirectory(base, cwd), /No project agent directory/);
+
+  rmSync(source);
+  mkdirSync(source, { recursive: true });
+  const file = join(base, "subagent-trust.json");
+  writeFileSync(file, '{"unexpected":true}');
+  assert.throws(() => approveProjectAgentDirectory(base, cwd), /Invalid subagent trust policy/);
+  assert.equal(readFileSync(file, "utf8"), '{"unexpected":true}');
+}));
+
+test("approval fails fast on an existing lock and never removes another writer's lock", () => fixture(({ base, cwd }: any) => {
+  const lock = join(base, "subagent-trust.lock");
+  writeFileSync(lock, "existing writer");
+  const start = performance.now();
+  assert.throws(() => approveProjectAgentDirectory(base, cwd), /policy is locked: .*subagent-trust\.lock.*before removing/);
+  assert.ok(performance.now() - start < 3000, "Lock contention must not wait on the UI thread");
+  assert.equal(readFileSync(lock, "utf8"), "existing writer");
+  assert.equal(existsSync(join(base, "subagent-trust.json")), false);
+  rmSync(lock);
+  assert.equal(approveProjectAgentDirectory(base, cwd).added, true);
+  assert.equal(existsSync(lock), false);
+}));
 
 test("agents-only checkout needs explicit exact-source approval even if host returns trusted", () => fixture(({ ctx, base, source, grant }: any) => {
   assert.equal(loadAgentDefaults("trust-alias", authorizedDiscovery(ctx, base))?.body, "Global role");

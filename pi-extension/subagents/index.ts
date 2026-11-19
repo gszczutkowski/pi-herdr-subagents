@@ -66,7 +66,7 @@ import { registerPayloadDiagnostics } from "./payload-diagnostics.ts";
 import { registerCheckpointContext, registerContextCheckpoint } from "./context-checkpoint.ts";
 import { registerPlanContext } from "./plan-context.ts";
 import { getAgentConfigDir, loadAgentDefaults, discoverAgentDefinitions, buildAvailableAgentCatalog, type AgentDefaults, type SubagentSessionMode } from "./discovery.ts";
-import { authorizedDiscovery, sourceAuthorized, assertAgentDirectoryAuthorized, assertDefinitionAuthorized, type TrustContext } from "./project-trust.ts";
+import { approveProjectAgentDirectory, assertProjectApprovalPermitted, authorizedDiscovery, sourceAuthorized, assertAgentDirectoryAuthorized, assertDefinitionAuthorized, type TrustContext } from "./project-trust.ts";
 
 import {
   findLastAssistantMessage,
@@ -90,7 +90,7 @@ import type { PlanPersistence } from "./plan-persistence.ts";
 import { AssignmentContractSchema, resolveAssignmentContract, contractTask, normalizeStructuredResult, type StructuredResult } from "./contracts.ts";
 import { PlanTaskParams, bindPlanRun, importPlanEnvelope, recordDispatchFailure, resolveResumeContract, type PlanTaskBinding } from "./plan-runtime.ts";
 import { registerPlanCommand } from "./plan-preflight.ts";
-import { createDeliveryState, enqueueDelivery, flushDeliveries, pauseDeliveries, restoreDurableDeliveries, type DeliveryState } from "./delivery.ts";
+import { createDeliveryState, deliveryDiagnostics, enqueueDelivery, flushDeliveries, pauseDeliveries, reconcileUnsentDeliveries, restoreDurableDeliveries, type DeliveryState } from "./delivery.ts";
 import {
   createLifecycle,
   markCompleted,
@@ -553,7 +553,7 @@ function readRecoveryView(ctx: ExtensionContext): RecoveryView {
     if (runtime.recoveryError) return { error: runtime.recoveryError };
     runtime.store?.assertCustody();
     return { manifest, paused: manifest?.custodyPaused,
-      diagnostics: [...(runtime.planImportErrors?.values() ?? []), ...(delivery.persistenceError ? [delivery.persistenceError] : []),
+      diagnostics: [...(runtime.planImportErrors?.values() ?? []), ...deliveryDiagnostics(delivery),
         ...(runtime.stopRecovery?.status?.().errors.map(failure => `Supervision paused${failure.runId ? ` (${failure.runId})` : ""}: ${failure.error}`) ?? []),
         ...[...runningSubagents.values()].flatMap(child => child.observationError ? [`${child.name}: ${child.observationError}`] : [])] };
   } catch (error) { return { error: String(error) }; }
@@ -1671,8 +1671,25 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     }
     for (const { runId, envelope } of pendingImports.values()) delivery.onEnvelope?.(runId, envelope);
   };
+  pi.registerCommand("subagents-approve", {
+    description: "Approve this project's .pi/agents directory for local subagent definitions",
+    handler: async (args, ctx) => {
+      if (args.trim()) throw new Error("Usage: /subagents-approve");
+      const agentDir = getAgentConfigDir();
+      assertProjectApprovalPermitted(ctx, agentDir);
+      const approval = approveProjectAgentDirectory(agentDir, ctx.cwd);
+      if (ctx.hasUI) {
+        ctx.ui.notify(
+          approval.added
+            ? `Approved local subagent definitions: ${approval.path}.`
+            : `Local subagent definitions are already approved: ${approval.path}.`,
+          "info",
+        );
+      }
+    },
+  });
   pi.registerCommand("subagents-reconcile", {
-    description: "Explicit bounded retry of paused artifact supervision/imports; never relaunches or replays dispatch",
+    description: "Explicit bounded retry of paused supervision/imports and proven-unsent results; never relaunches or replays ambiguous dispatch",
     handler: async (_args, ctx) => {
       if (runtime.store && !ownsActiveBranch(ctx, runtime.store.snapshot().parent)) throw new Error("Reconciliation requires current branch custody");
       runtime.latestCtx = ctx;
@@ -1685,9 +1702,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         child.retryObservation();
       }
       retryPlanImports();
-      if (!runtime.recoveryError) { delivery.api = pi; flushDeliveries(delivery); }
+      if (!runtime.recoveryError) {
+        reconcileUnsentDeliveries(delivery);
+        delivery.api = pi;
+        flushDeliveries(delivery);
+      }
       if (ctx.hasUI) {
-        const errors = runtime.stopRecovery?.status().errors ?? [];
+        const errors = [...(runtime.stopRecovery?.status().errors ?? []), ...deliveryDiagnostics(delivery)];
         ctx.ui.notify(runtime.recoveryError ?? (errors.length ? `Supervision remains paused for ${errors.length} error(s); see /subagents-recovery.` : "Artifact reconciliation requested; no child was relaunched. Review recovery diagnostics for remaining errors."),
           runtime.recoveryError || errors.length ? "warning" : "info");
       }

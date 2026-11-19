@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { getSubagentConfig } from "../pi-extension/subagents/config.ts";
-import { createDeliveryState, enqueueDelivery, flushDeliveries, pauseDeliveries } from "../pi-extension/subagents/delivery.ts";
+import { createDeliveryState, deliveryDiagnostics, enqueueDelivery, flushDeliveries, pauseDeliveries, reconcileUnsentDeliveries, restoreDurableDeliveries } from "../pi-extension/subagents/delivery.ts";
+import { RuntimeStore } from "../pi-extension/subagents/runtime-store.ts";
 import { createLifecycle } from "../pi-extension/subagents/lifecycle.ts";
 import extension, { enqueueSubagentCompletion, enqueueSubagentError, observeSubagentCompletion } from "../pi-extension/subagents/index.ts";
 
@@ -202,6 +203,202 @@ describe("spawn/resume watcher dispatch regressions", () => {
     `;
     const check = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
       cwd: new URL("..", import.meta.url), encoding: "utf8",
+    });
+    assert.equal(check.status, 0, check.stdout + check.stderr);
+  });
+});
+
+describe("explicit recovery of proven-unsent results", () => {
+  function fixture() {
+    const dir = mkdtempSync(join(tmpdir(), "pi-unsent-delivery-"));
+    const store = new RuntimeStore(dir, { sessionFile: "parent.jsonl", headerId: "parent", branchToken: "branch", checkpoint: "checkpoint" });
+    store.prepare({ id: "run", sessionFile: "child.jsonl", name: "child", task: "work", startTime: 1 });
+    const state = createDeliveryState();
+    state.store = store;
+    return { dir, store, state, close() { pauseDeliveries(state); store.close(); rmSync(dir, { recursive: true, force: true }); } };
+  }
+
+  for (const code of ["EIO", "ENOSPC", "EACCES"]) {
+    it(`${code}: explicitly retries the same immutable second completion once, without another child turn`, () => {
+      const f = fixture();
+      const { state, store } = f;
+      try {
+        const owner = { id: "run", lifecycle: createLifecycle(1) };
+        const sent: any[] = [];
+        let callbacks = 0;
+        state.api = { sendMessage(payload) { sent.push(payload); } };
+        const persist = store.delivery.bind(store);
+        store.delivery = () => { throw Object.assign(new Error(code), { code }); };
+        enqueueDelivery(state, owner, message, () => { callbacks++; }, "turn-2");
+        const [id, entry] = [...state.pending][0];
+        const envelope = entry.envelope;
+        assert.equal(sent.length, 0);
+        assert.equal(store.getEvent(id)?.status, "pending");
+        assert.equal(state.timer, undefined, "storage faults cannot cause a retry spin");
+        assert.match(deliveryDiagnostics(state)[0], new RegExp(`before-send.*${code}`));
+        store.delivery = persist;
+        flushDeliveries(state);
+        restoreDurableDeliveries(state, store, new Set());
+        flushDeliveries(state);
+        assert.equal(sent.length, 0, "ordinary flush/restoration cannot unpark faults");
+        assert.equal(reconcileUnsentDeliveries(state), 1);
+        flushDeliveries(state);
+        assert.equal(sent.length, 1);
+        assert.equal(sent[0], envelope.message);
+        assert.ok(Object.isFrozen(envelope.message.details));
+        assert.equal(sent[0].content, message.content);
+        assert.equal(store.getEvent(id)?.status, "handedOff");
+        assert.equal(owner.lifecycle.delivery, "delivered");
+        assert.equal(callbacks, 1);
+        assert.deepEqual(deliveryDiagnostics(state), []);
+        assert.equal(reconcileUnsentDeliveries(state), 0);
+        restoreDurableDeliveries(state, store, new Set());
+        flushDeliveries(state);
+        assert.equal(sent.length, 1, "no duplicate wakeup");
+      } finally { f.close(); }
+    });
+  }
+
+  for (const stage of ["dispatching-committed", "after-send", "after-send-committed", "retry-reset"]) {
+    it(`never replays ambiguous ${stage} persistence failure`, () => {
+      const f = fixture();
+      const { state, store } = f;
+      try {
+        let sent = 0;
+        const persist = store.delivery.bind(store);
+        state.api = { sendMessage() { sent++; if (stage === "retry-reset") throw new Error("sync rejection"); } };
+        store.delivery = (id, status) => {
+          if (stage === "dispatching-committed" && status === "dispatching") { persist(id, status); throw new Error(stage); }
+          if ((stage === "after-send" || stage === "after-send-committed") && status === "handedOff") {
+            if (stage === "after-send-committed") persist(id, status);
+            throw new Error(stage);
+          }
+          if (stage === "retry-reset" && status === "pending") throw new Error(stage);
+          persist(id, status);
+        };
+        enqueueDelivery(state, { id: "run", lifecycle: createLifecycle(1) }, message, () => assert.fail("ambiguous callback"));
+        const id = [...state.pending.keys()][0];
+        const count = sent;
+        assert.equal(count, stage === "dispatching-committed" ? 0 : 1);
+        store.delivery = persist;
+        assert.equal(reconcileUnsentDeliveries(state), 0);
+        flushDeliveries(state);
+        assert.equal(sent, count);
+        assert.equal(store.getEvent(id)?.status, stage === "after-send-committed" ? "handedOff" : "dispatching");
+        assert.equal(state.pending.get(id)?.parked, true);
+        assert.equal(state.timer, undefined);
+        const restored = createDeliveryState(); restored.store = store; restored.api = state.api;
+        restoreDurableDeliveries(restored, store, new Set());
+        assert.equal(reconcileUnsentDeliveries(restored), 0);
+        flushDeliveries(restored); pauseDeliveries(restored);
+        assert.equal(sent, count, "fresh state cannot replay UNKNOWN either");
+      } finally { f.close(); }
+    });
+  }
+
+  it("validates active branch, writer/content custody, store identity, payload and suppression before unpark", () => {
+    const f = fixture();
+    const { state, store, dir } = f;
+    try {
+      state.api = { sendMessage() { assert.fail("validation never sends"); } };
+      const persist = store.delivery.bind(store);
+      store.delivery = () => { throw new Error("before-send"); };
+      const owner = { id: "run", lifecycle: createLifecycle(1) };
+      enqueueDelivery(state, owner, message, () => {});
+      store.delivery = persist;
+      const [id, entry] = [...state.pending][0];
+      store.isCurrent = () => false;
+      assert.throws(() => reconcileUnsentDeliveries(state), /branch lost custody/);
+      store.isCurrent = () => true;
+      const file = join(dir, "manifest.json");
+      const original = readFileSync(file, "utf8");
+      const changed = JSON.parse(original); changed.outbox[id].envelope.message.content = "changed";
+      writeFileSync(file, JSON.stringify(changed));
+      assert.throws(() => reconcileUnsentDeliveries(state), /changed without revision/);
+      writeFileSync(file, original);
+      const writer = join(dir, "writer", "owner.json");
+      const originalWriter = readFileSync(writer, "utf8");
+      writeFileSync(writer, JSON.stringify({ generation: "foreign" }));
+      assert.throws(() => reconcileUnsentDeliveries(state), /writer lost custody/);
+      writeFileSync(writer, originalWriter);
+      const envelope = entry.envelope;
+      state.pending.set(id, { ...entry, envelope: { ...envelope, message: { ...envelope.message, content: "replacement" } } });
+      assert.equal(reconcileUnsentDeliveries(state), 0);
+      state.pending.set(id, { ...entry, store: undefined });
+      assert.equal(reconcileUnsentDeliveries(state), 0);
+      state.pending.set(id, entry);
+      owner.lifecycle = { ...owner.lifecycle, delivery: "suppressed" };
+      assert.equal(reconcileUnsentDeliveries(state), 0);
+      owner.lifecycle = createLifecycle(1);
+      store.pauseCustody("explicit decision required");
+      assert.throws(() => reconcileUnsentDeliveries(state), /unpaused branch custody/);
+      assert.equal(entry.parked, true);
+    } finally { f.close(); }
+  });
+
+  it("bounds each explicit recovery and retains every event's failure diagnostic", () => {
+    const f = fixture();
+    const { state, store } = f;
+    try {
+      let sends = 0;
+      state.api = { sendMessage() { sends++; } };
+      const persist = store.delivery.bind(store);
+      store.delivery = id => { throw new Error(`fault-${id}`); };
+      for (let i = 0; i < 3; i++) enqueueDelivery(state, { id: "run", lifecycle: createLifecycle(1) }, message, () => {}, String(i));
+      assert.equal(deliveryDiagnostics(state).length, 3);
+      store.delivery = persist;
+      for (let i = 1; i <= 3; i++) {
+        assert.equal(reconcileUnsentDeliveries(state, 1), 1);
+        flushDeliveries(state);
+        assert.equal(sends, i);
+        assert.equal(deliveryDiagnostics(state).length, 3 - i);
+      }
+      assert.throws(() => reconcileUnsentDeliveries(state, 0), /limit/);
+    } finally { f.close(); }
+  });
+
+  it("public /subagents-reconcile exposes pre-send errors and recovers once without child work", () => {
+    const script = `
+      import assert from 'node:assert/strict';
+      import fs from 'node:fs'; import os from 'node:os'; import path from 'node:path';
+      import extension from './pi-extension/subagents/index.ts';
+      import {RuntimeStore} from './pi-extension/subagents/runtime-store.ts';
+      import {canonicalSessionPath} from './pi-extension/subagents/ownership.ts';
+      import {enqueueDelivery} from './pi-extension/subagents/delivery.ts';
+      import {createLifecycle} from './pi-extension/subagents/lifecycle.ts';
+      const dir=fs.mkdtempSync(path.join(os.tmpdir(),'public-unsent-'));
+      const commands=new Map(),tools=new Map(),sent=[];
+      extension({on(){},registerTool(t){tools.set(t.name,t)},registerCommand(n,c){commands.set(n,c)},
+        registerShortcut(){},registerMessageRenderer(){},getAllTools(){return []},sendMessage(m){sent.push(m)}});
+      const runtime=globalThis[Symbol.for('pi-subagents/runtime')];
+      const parent={sessionFile:canonicalSessionPath(path.join(dir,'parent.jsonl')),headerId:'parent',branchToken:'branch',checkpoint:'checkpoint'};
+      const store=new RuntimeStore(path.join(dir,'runtime'),parent);
+      const branch=[{id:'checkpoint',type:'custom',customType:'subagent-custody',data:{branchToken:'branch'}}];
+      const ctx={hasUI:false,sessionManager:{getHeader:()=>({id:'parent'}),getSessionFile:()=>parent.sessionFile,getBranch:()=>branch}};
+      runtime.latestCtx=ctx;runtime.store=store;runtime.delivery.store=store;
+      runtime.stopRecovery=Object.assign(()=>{}, {reconcile(){},status(){return {errors:[]}}});
+      store.isCurrent=()=>branch.length===1;
+      store.prepare({id:'run',sessionFile:path.join(dir,'child.jsonl'),name:'child',task:'work',startTime:1});
+      runtime.delivery.api={sendMessage(){assert.fail('pre-send failure cannot send')}};
+      const persist=store.delivery.bind(store);
+      store.delivery=()=>{throw new Error('TEST_EIO')};
+      enqueueDelivery(runtime.delivery,{id:'run',lifecycle:createLifecycle(1)},
+        {customType:'subagent_result',content:'immutable result',details:{}},()=>{},'second');
+      store.delivery=persist;
+      try {
+        const report=await tools.get('subagents_recovery').execute('report',{},undefined,undefined,ctx);
+        assert.match(report.content[0].text,/before-send.*TEST_EIO/);
+        const reconcile=()=>commands.get('subagents-reconcile').handler('',ctx);
+        branch.length=0;await assert.rejects(reconcile(),/branch custody/);assert.equal(sent.length,0);
+        branch.push({id:'checkpoint',type:'custom',customType:'subagent-custody',data:{branchToken:'branch'}});
+        await reconcile();await reconcile();
+        assert.equal(sent.length,1);assert.equal(sent[0].content,'immutable result');
+        assert.equal(store.getEvent(sent[0].details.eventId).status,'handedOff');
+        assert.equal(runtime.runningSubagents.size,0,'no child launched, resumed or polled');
+      } finally {store.close();fs.rmSync(dir,{recursive:true,force:true})}
+    `;
+    const check = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+      cwd: new URL("..", import.meta.url), encoding: "utf8", timeout: 30000,
     });
     assert.equal(check.status, 0, check.stdout + check.stderr);
   });

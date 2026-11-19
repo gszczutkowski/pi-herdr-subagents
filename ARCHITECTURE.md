@@ -106,6 +106,24 @@ The Pi host UI/transport boundary is mocked; no live terminal/model is claimed.
 Installed Pi references: `docs/extensions.md`, `docs/session-format.md` and
 `examples/extensions/widget-placement.ts` (read before this boundary work).
 
+## Bounded plan reads and historical detach validation
+
+`plan-read.ts` preserves the small overview/task response shape. Large reads
+return navigation; explicit collection pages are byte/line-budgeted before
+serialization and include revision-pinned next cursors. Results/runs are iterated
+across attempts with provenance, not assembled into an unbounded flattened array.
+An individual oversized record falls back to bounded `jsonText` fragments of the
+complete selected view, without skipping records or duplicating full snapshots
+in tool details. JSON cursors also hash the exact document, fencing diagnostic
+changes at an unchanged snapshot revision. Partial reads never emit whole-plan
+publication receipts.
+
+`PlanPersistence.historical()` exempts only validated detached alternatives from
+rollback detection. Missing or malformed source authority and other invalid
+fields leave the valid selected snapshot visible, historical/read-only, rather
+than throwing through `read()` and hiding that snapshot. Off-branch snapshot
+contents are never restored into the active plan.
+
 ## Parent context protection
 
 `context-policy.ts` owns shared configuration and model-sized reserve/retention
@@ -116,6 +134,11 @@ native compaction draft through Pi's actionable `turn_end` boundary. Calling
 length/overflow recovery is not replaced. Failed/non-shrinking summaries preserve
 history; abort signals and generation/leaf checks fence stale work. Boundary drafts
 do not emit native compaction notification hooks or invoke custom native summarizers.
+Budgets and minimum-savings checks use `getContextUsage().contextWindow`, not a
+virtual selection's potentially unknown/stale declared window. Summary requests
+use public `modelRegistry.streamSimple(...).result()` so virtual models route
+with reason `direct`; their unknown output limit never becomes a zero-token
+request, and the host caps the positive budget to the dispatched model's limit.
 
 `context-checkpoint.ts` independently owns bounded advisory working-state notes
 and a fresh derived plan pointer/summary in native custom branch entries. Working
@@ -144,10 +167,12 @@ herdr-terminal end-to-end protection claim is made.
 
 ## Current repair verification
 
-See `BACKLOG.md` and `test/integration/HC-WORKFLOW-VERIFICATION.md` for current
-status: 734/734 integrated automated tests and seven named authenticated HC TUI
-journeys pass, with explicit extra-live-path limitations. `test/REPAIR-VERIFICATION.md`
-and counts below describe historical milestones, not the current tree. Provider payload diagnostics are
+See `BACKLOG.md` and `test/M4-M5-M6-VERIFICATION.md` for current automated
+status: 747/747 integrated tests pass after the document-cursor review fix.
+`test/integration/HC-WORKFLOW-VERIFICATION.md` retains seven historical named
+authenticated HC TUI journeys, not rerun for these repairs, with explicit extra-live-path
+limitations. `test/REPAIR-VERIFICATION.md` and counts below describe historical
+milestones, not the current tree. Provider payload diagnostics are
 advisory UTF-8 JSON measurements at one hook position, not final-wire enforcement.
 Pending result imports run before native publication; only emergency
 post-compaction restoration retains a context-phase import retry.
