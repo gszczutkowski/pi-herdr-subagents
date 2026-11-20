@@ -4,10 +4,15 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { it } from "node:test";
-import { integrationSelection, integrationTestArgs } from "./run.ts";
+import { integrationSelection as selectIntegration, integrationTestArgs } from "./run.ts";
+
 import { getAvailableBackends } from "./harness.ts";
 import { findBashExecutable } from "../../pi-extension/subagents/hc.ts";
 import { localPiCli, localPiShellCommand } from "./local-pi.ts";
+
+// Selection unit tests model the supported integration runtime, independently
+// of the Node version running the deterministic suite (which also supports 22).
+const integrationSelection: typeof selectIntegration = (args, env, version = "24.0.0") => selectIntegration(args, env, version);
 
 const hc = { HC_TERMINAL_ID: "t-test", HC_TERMINAL_SOCKET: "synthetic", PI_TEST_MODEL: "test/exact-model" };
 const legacy = { HERDR_ENV: "1", HERDR_WORKSPACE_ID: "synthetic", PI_TEST_MODEL: "test/exact-model" };
@@ -66,7 +71,9 @@ it("integration CLI exits nonzero instead of reporting all-skipped success outsi
     encoding: "utf8", env: { ...process.env, HC_TERMINAL_ID: "", HC_TERMINAL_SOCKET: "", HERDR_ENV: "", HERDR_WORKSPACE_ID: "" }, timeout: 10_000,
   });
   assert.equal(result.status, 1);
-  assert.match(result.stderr, /Integration preflight failed: No supported terminal/);
+  assert.match(result.stderr, Number(process.versions.node.split(".")[0]) < 24
+    ? /Integration preflight failed: Integration tests require Node.js 24\+/
+    : /Integration preflight failed: No supported terminal/);
   assert.doesNotMatch(result.stdout, /tests 0|# pass/);
 });
 it("integration subprocess fails with no matching cases or only skipped cases", () => {

@@ -280,9 +280,12 @@ test("real Pi RPC UI cannot prove editor safety and rejects CLOSE without a mode
     assert.ok(identity); assert.equal(identity.process.pid, child.pid);
     const snapshot = enumerateProcesses();
     assert.ok(snapshot.rows.some(row => row.pid === child.pid));
-    // Scope the OS enumeration fixture to this test's owned process. Unrelated host
-    // processes can legitimately make a global Windows audit uncertain (unknown cwd).
-    const audit = () => auditSession(session, { rows: snapshot.rows.filter(row => row.pid === child.pid), verified: snapshot.verified });
+    // This test targets RPC UI/draft safety, not OS argv recovery. Linux Pi
+    // overwrites its cmdline via process.title; session-audit tests cover that
+    // fail-closed limitation. Supply only the direct child's known launch argv
+    // so this protocol test can reach the child's UI capability rejection.
+    const audit = () => auditSession(session, { rows: [{ pid: child.pid!, parentPid: process.pid,
+      argv: child.spawnargs, cwd: dir }], verified: true });
     assert.equal(audit().status, "single");
     const before = readFileSync(session, "utf8");
     const closing = closeOwnedChild({ runId: "rpc-run", dispatched: true }, { id: "rpc-run", cli: "pi", sessionFile: session, activityFile }, { validate: () => {}, audit, timeoutMs: 10000,
