@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { it } from "node:test";
-import { createSubagentPane, createSubagentSurface, closePane, inspectPane, runScriptInPane, shellQuote } from "../../pi-extension/subagents/terminal.ts";
+import { createSubagentPane, createSubagentSurface, closePane, inspectPane, runInPane, runScriptInPane, shellQuote } from "../../pi-extension/subagents/terminal.ts";
+import { setTimeout as delay } from "node:timers/promises";
+import { probeProcess, sameProcess } from "../../pi-extension/subagents/process-identity.ts";
 import { trackTransportSurface, until } from "./hc-tui-harness.ts";
 
 // Real transport only: never starts a Pi conversation or an AI provider.
@@ -56,6 +58,41 @@ it("live HC transport isolates concurrent scripts with Unicode, quotes, and long
     console.log(`HC transport evidence: ${evidence}`);
     assert.ok(allMissing, "Every owned transport terminal must be verified missing");
   }
+});
+
+it("closing an idle HC terminal releases its Bash process and working directory", {
+  skip: process.env.PI_TEST_HC_LIVE !== "1" || !["linux", "win32"].includes(process.platform), timeout: 60_000,
+}, async () => {
+  const scratch = mkdtempSync(join(tmpdir(), "hc-idle-shell-"));
+  const surface = createSubagentPane(`Idle shell ${randomUUID()}`);
+  trackTransportSurface([], surface); // Guard the parent terminal before sending or closing anything.
+  const marker = join(scratch, "shell.pid");
+  let nativePid: number;
+  let original: ReturnType<typeof probeProcess>;
+  try {
+    // Run in the persistent interactive shell, not a child script. $$ is an MSYS PID on Git Bash.
+    const pid = process.platform === "win32" ? '$(/usr/bin/cat /proc/$$/winpid)' : '$$';
+    runInPane(surface, `cd ${shellQuote(scratch)} && printf '%s\\n' "${pid}" > shell.pid`);
+    nativePid = await until(scratch, () => {
+      const value = existsSync(marker) && readFileSync(marker, "utf8").trim();
+      return value && /^\d+$/.test(value) ? Number(value) : undefined;
+    }, "interactive Bash reached its test cwd", 15_000);
+    original = probeProcess(nativePid);
+    assert.equal(original.kind, "present", "Must identify the live shell before closing its terminal");
+  } finally {
+    closePane(surface);
+  }
+  assert.equal((await inspectPane(surface)).kind, "missing");
+  const deadline = Date.now() + 10_000;
+  for (;;) {
+    const now = probeProcess(nativePid);
+    if (now.kind === "absent" || (now.kind === "present" && !sameProcess(original.identity, now.identity))) break;
+    assert.ok(Date.now() < deadline, `Original Bash ${nativePid} not verified gone (${now.kind}); scratch: ${scratch}`);
+    await delay(100);
+  }
+  // On Windows, a lingering cwd can prevent rename even after the HC address disappears.
+  renameSync(scratch, `${scratch}-released`);
+  rmSync(`${scratch}-released`, { recursive: true });
 });
 
 it("live HC layout requests use isolated terminals, never a legacy layout command", {

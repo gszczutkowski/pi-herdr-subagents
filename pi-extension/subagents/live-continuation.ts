@@ -108,7 +108,7 @@ export function registerLiveContinuation(pi: ExtensionAPI): void {
   }
   pi.registerCommand(CONTINUE_COMMAND, {
     description: "Private run-bound continuation transport (manual compatibility)",
-    handler: receive,
+    handler: async (requestId, ctx) => receive(requestId, ctx),
   });
 }
 
@@ -156,7 +156,7 @@ export async function continueLiveChild(owner: SessionOwner, child: LiveChild | 
     const previous = reconcileContinuation(owner, child, transport.settled);
     if (!previous) throw new Error(`Continuation ${owner.continuationRequestId} is in flight or uncertain; do not retry.`);
     if (previous.status === "rejected") throw new Error(`Child rejected continuation: ${previous.reason}`);
-    return previous; // A recheck never dispatches the newly supplied message.
+    return previous as { requestId: string; status: "accepted" }; // A recheck never dispatches the newly supplied message.
   }
   if (!child || child.id !== owner.runId || child.cli !== "pi" || !child.activityFile ||
       child.lifecycle.process.kind !== "running" || !["interrupted", "waiting", "active", "starting"].includes(child.lifecycle.turn.kind)) {

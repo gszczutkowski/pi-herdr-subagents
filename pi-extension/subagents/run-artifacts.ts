@@ -2,7 +2,7 @@ import { existsSync, linkSync, mkdirSync, readFileSync, rmSync, writeFileSync } 
 import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { findLastAssistantMessage, type SessionEntry } from "./session.ts";
+import { findLastAssistantMessage } from "./session.ts";
 import { canonicalSessionPath } from "./ownership.ts";
 
 let completionSequence = 0;
@@ -74,7 +74,7 @@ export function prepareRunCompletion(payload: object, context?: CompletionSessio
   // Active branch at settlement, restricted to entries emitted since this task
   // started. Neither /tree nor a resumed history can resurrect an old summary.
   const entries = context?.getBranch().filter(entry => !priorEntryIds.has(entry.id)) ?? [];
-  const summary = findLastAssistantMessage(entries as SessionEntry[])
+  const summary = findLastAssistantMessage(entries)
     ?? "No assistant text was produced for this supervised task.";
   return { target, identity, serialized: JSON.stringify({ ...payload, ...(runId ? { runId, eventId, summary } : {}) }) };
 }

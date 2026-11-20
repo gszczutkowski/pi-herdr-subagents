@@ -38,7 +38,10 @@ export function registerPayloadDiagnostics(pi: ExtensionAPI, config: ContextProt
     lastBytes = undefined; lastBudget = undefined; lastStatus = undefined; warningActive = false;
     if (ctx.hasUI) ctx.ui.setStatus?.(STATUS, undefined);
   };
-  for (const event of ["session_start", "session_tree", "model_select", "session_shutdown"] as const) pi.on(event, reset);
+  pi.on("session_start", reset);
+  pi.on("session_tree", reset);
+  pi.on("model_select", reset);
+  pi.on("session_shutdown", reset);
 
   pi.on("before_provider_request", (event, ctx) => {
     lastBytes = providerPayloadBytes(event.payload);

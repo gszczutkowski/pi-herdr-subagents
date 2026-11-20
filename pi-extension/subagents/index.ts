@@ -500,7 +500,7 @@ const runtime: SubagentRuntime =
 const runningSubagents = runtime.runningSubagents;
 
 /** Lazily establish branch custody before any child dispatch. */
-function durableStoreFor(ctx: ExtensionContext): RuntimeStore | undefined {
+function durableStoreFor(ctx: Pick<ExtensionContext, "sessionManager">): RuntimeStore | undefined {
   // Legacy host/test adapters cannot claim durable recovery support.
   if (typeof ctx.sessionManager.getHeader !== "function" || typeof ctx.sessionManager.getBranch !== "function") return undefined;
   if (runtime.recoveryError) throw new Error(runtime.recoveryError);
@@ -689,7 +689,7 @@ export function enqueueSubagentCompletion(running: RunningSubagent, result: Suba
   }
   recordHistory(running.lineage, running.id, result.ping ? "ping" : result.errorMessage ? "failure" : "result",
     result.ping?.message ?? result.errorMessage ?? result.summary ?? "Result available",
-    result.eventId ?? `${result.sessionFile}:${result.elapsed}`, [result.sessionFile]);
+    result.eventId ?? `${result.sessionFile}:${result.elapsed}`, result.sessionFile ? [result.sessionFile] : []);
   if (result.ping) {
     const sessionRef = `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`;
     enqueueCompletion(running, {
@@ -1209,7 +1209,7 @@ function startWidgetRefresh() {
 async function launchSubagent(
   params: typeof SubagentParams.static,
   ctx: {
-    sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string };
+    sessionManager: ExtensionContext["sessionManager"];
     cwd: string;
     isProjectTrusted?: () => boolean;
     model?: { provider: string; id: string };
@@ -1242,7 +1242,8 @@ async function launchSubagent(
     { model: params.model, thinking: params.thinking },
     {
       model: resolveModelDefault(params.agent, agentDefs?.model, config.models),
-      thinking: agentDefs?.thinking,
+      // Frontmatter is free text; resolveRuntimePlan rejects invalid levels.
+      thinking: agentDefs?.thinking as ThinkingLevel | undefined,
     },
     { provider: ctx.model.provider, modelId: ctx.model.id, thinking: parentThinking },
     wrapPiModelRegistry(ctx.modelRegistry),
@@ -1396,7 +1397,7 @@ async function launchSubagent(
   store?.phase(id, "supervised");
   recordHistory(lineage, id, "assignment", params.task, id, [subagentSessionFile, launchScriptFile]);
   const running = registerLaunchedRun(runningSubagents, store, preparedRun, {
-    agent: params.agent, hasActivitySnapshots: driver.hasActivitySnapshots, runtimePlan,
+    agent: params.agent, hasActivitySnapshots: driver.hasActivitySnapshots === true, runtimePlan,
   });
   return running;
   } catch (error) {
@@ -2034,7 +2035,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Fallback (shouldn't happen)
-        const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+        const first = result.content[0] as { text?: unknown } | undefined;
+        const text = typeof first?.text === "string" ? first.text : "";
         return new Text(theme.fg("dim", text), 0, 0);
       },
     });
@@ -2085,7 +2087,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           );
         }
 
-        const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+        const first = result.content[0] as { text?: unknown } | undefined;
+        const text = typeof first?.text === "string" ? first.text : "";
         return new Text(theme.fg("dim", text), 0, 0);
       },
     });
@@ -2312,7 +2315,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Fallback
-        const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+        const first = result.content[0] as { text?: unknown } | undefined;
+        const text = typeof first?.text === "string" ? first.text : "";
         return new Text(theme.fg("dim", text), 0, 0);
       },
 
@@ -2650,6 +2654,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     if (lines.length === 0 && overflow === 0) return undefined;
 
     return {
+      invalidate() {},
       render(width: number): string[] {
         const lineWidth = Math.max(0, width - 6);
         const contentLines = [
@@ -2677,6 +2682,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     if (!details) return undefined;
 
     return {
+      invalidate() {},
       render(width: number): string[] {
         const name = details.name ?? "subagent";
         const agentTag = details.agent ? theme.fg("dim", ` (${details.agent})`) : "";

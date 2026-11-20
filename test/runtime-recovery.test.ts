@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { once } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -272,6 +273,26 @@ test("fresh parent resumes an exited recovered session only after fresh process 
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+// Only for a direct test fixture we spawned. An earlier exit is not replayed to late listeners.
+async function stopFixture(child: ChildProcess) {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const exited = once(child, "exit", { signal: AbortSignal.timeout(5000) });
+  child.kill();
+  await exited;
+}
+
+test("recovery teardown does not hang when the child exits before publishing its identity", { timeout: 15000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "recovery-early-exit-"));
+  const child = spawn(process.execPath, ["-e", "process.exitCode = 7"], { cwd: dir, stdio: "ignore" });
+  try {
+    const [code] = await once(child, "close", { signal: AbortSignal.timeout(10000) });
+    assert.equal(code, 7);
+  } finally {
+    await stopFixture(child); // The exit event has already been delivered.
+    rmSync(dir, { recursive: true });
+  }
+});
+
 test("real child process answers fresh generation challenges; stale nonce/PID and custody loss fail closed", { skip: !processSupported }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "runtime-child-"));
   const session = canonicalSessionPath(join(dir, "child.jsonl"));
@@ -327,7 +348,7 @@ test("real child process answers fresh generation challenges; stale nonce/PID an
     assert.equal(Object.keys(store.snapshot().outbox).length, 3, "same-run reservation resumes authenticated artifact supervision");
     resumed(); store.close(); releaseSession(session, "run");
   } finally {
-    child.kill(); await new Promise((r) => child.once("exit", r));
+    await stopFixture(child);
     releaseSession(session, "run"); rmSync(dir, { recursive: true, force: true });
   }
 });

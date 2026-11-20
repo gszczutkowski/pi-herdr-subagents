@@ -2,7 +2,7 @@
 
 ## Status i zakres
 
-Dokument zapisuje ustalenia przeglądu bieżącego drzewa roboczego, obejmującego również istniejące niezacommitowane zmiany. **Implementacja w toku na gałęzi `fix/subagent-repair-sequence`.** Stan zaznaczonych punktów odnosi się do testów lokalnych; testy rzeczywistych terminali herdr pozostają niewykonane (brak herdr w bieżącym środowisku). Bieżący zbiorczy status i zależności: [BACKLOG.md](BACKLOG.md); końcowe dowody: `test/REPAIR-VERIFICATION.md`.
+Dokument zapisuje ustalenia przeglądu bieżącego drzewa roboczego, obejmującego również istniejące niezacommitowane zmiany. **Implementacja w toku na gałęzi `fix/subagent-repair-sequence`.** Stan zaznaczonych punktów odnosi się do testów lokalnych; testy rzeczywistych terminali herdr pozostają niewykonane (brak herdr w bieżącym środowisku). Bieżący zbiorczy status i zależności: [BACKLOG.md](../../BACKLOG.md); końcowe dowody: `test/REPAIR-VERIFICATION.md`.
 
 Zakres: przekazywanie kontekstu, instrukcji i wyników; uruchamianie i kończenie pracy; przerywanie, wznawianie oraz zgodność z planem rodzica. To lista usterek i kryteriów naprawy, nie zapis stanu uruchomionych agentów ani zamiennik istniejącego planu rozwoju.
 

@@ -118,7 +118,7 @@ export function findObservedSessionRuntime(entries: SessionEntry[]): ObservedSes
   return observed;
 }
 
-export function findLastAssistantMessage(entries: SessionEntry[]): string | null {
+export function findLastAssistantMessage(entries: readonly { type: string }[]): string | null {
   for (let i = entries.length - 1; i >= 0; i--) {
     const entry = entries[i];
     if (entry.type !== "message") continue;

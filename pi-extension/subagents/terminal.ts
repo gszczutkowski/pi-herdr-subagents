@@ -156,7 +156,7 @@ export type { PaneInspection, HerdrAgentStatus } from "./lifecycle.ts";
 export async function inspectPane(paneId: PaneId): Promise<import("./lifecycle.ts").PaneInspection> {
   const result = await inspectHerdrPane(paneId);
   if (result.kind === "present") {
-    return { kind: "present", observedAt: Date.now(), ...result };
+    return { observedAt: Date.now(), ...result };
   }
   return result;
 }

@@ -15,7 +15,7 @@ In PowerShell set `$env:PI_TEST_MODEL = 'openai-codex/gpt-6.1-sol'` first. Choos
 
 | Scope | HC (herdr-core) | Legacy herdr |
 | --- | --- | --- |
-| `transport` | `test/hc-live.test.ts`, `hc-transport.test.ts`: actual script/Pi PATH execution, inspection/reads/removal; concurrent exact-address scripts with Unicode/quotes/long payloads; tab/right/down requests as distinct terminals | `mux-surface.test.ts`: existing pane/tab transport suite |
+| `transport` | `test/hc-live.test.ts`, `hc-transport.test.ts`: actual script/Pi PATH execution, inspection/reads/removal; concurrent exact-address scripts with Unicode/quotes/long payloads; tab/right/down requests as distinct terminals; on Windows/Linux, closing an idle terminal must end its original Bash process (PID + birth) and release its working directory | `mux-surface.test.ts`: existing pane/tab transport suite |
 | `plugin` | `hc-plugin.test.ts`: four public Pi journeys below | `subagent-lifecycle.test.ts`: existing seven public/lifecycle scenarios |
 | `pi` | `plugin` plus `hc-tui.test.ts`: existing ten lifecycle/recovery/control journeys | lifecycle plus `claude-completion.test.ts` (synthetic Claude adapter boundary, not a real Claude service) |
 | `all` (default) | transport + plugin + lifecycle | transport + both Pi fixtures |

@@ -2,7 +2,7 @@
 
 Async subagents for [pi](https://github.com/earendil-works/pi) running exclusively in [herdr](https://herdr.dev). Spawn, orchestrate, and manage sub-agent sessions in dedicated herdr tabs or panes. **Fully non-blocking** — the main agent keeps working while subagents run in the background.
 
-Current repair status and external dependencies: [BACKLOG.md](BACKLOG.md).
+Current repair status and external dependencies: [BACKLOG.md](BACKLOG.md). Historical handoffs and repair plans live in [docs/history](docs/history); a worked example of the subagent workflow (in Polish) is in [docs/SUBAGENT-WORKFLOW-PL.md](docs/SUBAGENT-WORKFLOW-PL.md).
 
 ## How It Works
 
@@ -303,11 +303,12 @@ reads only persisted task state, independently of the runtime process registry.
 
 ## Development
 
-Run unit tests and lint locally:
+Run unit tests, lint and the type check locally (CI runs the same on Ubuntu and Windows for every pull request):
 
 ```bash
 npm test
 npm run lint
+npm run typecheck
 ```
 
 Run integration tests **inside the terminal backend being verified**:
@@ -1157,6 +1158,7 @@ Every sub-agent session displays a compact tools widget showing available and de
 
 ## Requirements
 
+- Node.js 22.19 or newer (the version Pi itself requires)
 - [pi](https://github.com/earendil-works/pi) 1.5.2 or a compatible 1.5.x patch. The audit repairs were also verified offline on 1.3.0, but that host pins vulnerable dependencies and is no longer the recommended/supported install. Updating this repository's local dependencies does not update your global Pi executable.
 - [herdr](https://herdr.dev) — the required terminal workspace
 

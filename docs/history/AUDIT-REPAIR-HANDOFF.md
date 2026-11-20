@@ -2,17 +2,17 @@
 
 ## 1. Status i przeznaczenie dokumentu
 
-**Aktualizacja naprawcza 2026-11-16:** po osobnym zleceniu użytkownika wdrożono R1–R6 oraz M9–M11. Końcowe testy offline na lokalnym Pi 1.5.2: **712/712**, bez pominięć; lint i `npm audit` (0 podatności) przechodzą. Szczegóły, zmiany kontraktów i ograniczenia: [test/AUDIT-REPAIR-VERIFICATION.md](test/AUDIT-REPAIR-VERIFICATION.md). Globalnej instalacji Pi nie zaktualizowano; live herdr/provider e2e pozostaje niewykonane.
+**Aktualizacja naprawcza 2026-11-16:** po osobnym zleceniu użytkownika wdrożono R1–R6 oraz M9–M11. Końcowe testy offline na lokalnym Pi 1.5.2: **712/712**, bez pominięć; lint i `npm audit` (0 podatności) przechodzą. Szczegóły, zmiany kontraktów i ograniczenia: [test/AUDIT-REPAIR-VERIFICATION.md](../../test/AUDIT-REPAIR-VERIFICATION.md). Globalnej instalacji Pi nie zaktualizowano; live herdr/provider e2e pozostaje niewykonane.
 
 **Historyczny status sesji audytu:** ustalenia zostały zweryfikowane, ale wówczas nie implementowano napraw — zlecono tylko zapis raportu. Poniższe reprodukcje i checklisty opisują punkt wyjścia oraz kryteria; bieżącym dowodem wykonania jest raport weryfikacji powyżej. Dokument nadal nie jest zgodą na uruchamianie procesów z historycznych sesji ani dowodem ich aktualnej aktywności.
 
 Audyt dotyczył całego ówczesnego drzewa roboczego, również zmian niezacommitowanych, przy HEAD `d226f33bbe8b7c4f429cb959898259a5e064485c`. Numery linii są orientacyjne; przy implementacji wyszukiwać również wskazane funkcje. Jeżeli kod się zmienił, najpierw ponownie potwierdzić problem.
 
 Dokument jest **uzupełnieniem**, nie zastępstwem:
-- [BACKLOG.md](BACKLOG.md) — wcześniejszy zbiorczy status;
+- [BACKLOG.md](../../BACKLOG.md) — wcześniejszy zbiorczy status;
 - [SUBAGENT-REPAIR-PLAN.md](SUBAGENT-REPAIR-PLAN.md) — wcześniejsze naprawy, częściowo już oznaczone jako wykonane;
 - [SUBAGENT-CONTEXT-OPTIMIZATION-PLAN.md](SUBAGENT-CONTEXT-OPTIMIZATION-PLAN.md) — osobny zakres optymalizacji;
-- [test/REPAIR-VERIFICATION.md](test/REPAIR-VERIFICATION.md) — wcześniejsze dowody i ograniczenia.
+- [test/REPAIR-VERIFICATION.md](../../test/REPAIR-VERIFICATION.md) — wcześniejsze dowody i ograniczenia.
 
 Nie otwierać ponownie wszystkich historycznych punktów tylko dlatego, że ich opisy przypominają poniższe usterki. Przykładowo `terminate: true` w `caller_ping` już istnieje; osobnym problemem jest **moment publikacji wyniku względem pozostałych narzędzi batcha**.
 

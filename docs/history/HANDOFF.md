@@ -1,8 +1,8 @@
 # Handoff: session audit and verified subagent close
 
 > Historical milestone, not the current backlog. Subsequent lifecycle/context
-> repairs are tracked in [BACKLOG.md](BACKLOG.md) and
-> [test/REPAIR-VERIFICATION.md](test/REPAIR-VERIFICATION.md). Their current
+> repairs are tracked in [BACKLOG.md](../../BACKLOG.md) and
+> [test/REPAIR-VERIFICATION.md](../../test/REPAIR-VERIFICATION.md). Their current
 > integrated automated suite passes 626/626; host/API and live-verification
 > dependencies remain explicit. The legacy cleanup below must not be repeated.
 

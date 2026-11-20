@@ -4,7 +4,7 @@
 
 **Status: implementacja lokalna i niezależny przegląd zakończone dla napraw cyklu życia, krótkich odpowiedzi i zwykłej publikacji kontekstu; całość NIE jest odebrana jako w pełni naprawiona.**
 
-Bieżący backlog: [BACKLOG.md](BACKLOG.md). Dowody i granice: [test/REPAIR-VERIFICATION.md](test/REPAIR-VERIFICATION.md).
+Bieżący backlog: [BACKLOG.md](../../BACKLOG.md). Dowody i granice: [test/REPAIR-VERIFICATION.md](../../test/REPAIR-VERIFICATION.md).
 
 | Etap | Stan |
 |---|---|
@@ -17,7 +17,7 @@ Bieżący backlog: [BACKLOG.md](BACKLOG.md). Dowody i granice: [test/REPAIR-VERI
 | 6 | Ograniczone wskazówki zbędnego odczytu i zwykłe projekcje; lazy loading katalogów/schematów oraz eksperyment billing A/B nie zostały wykonane |
 | 7 | Główne `npm test`: 626/626 bez pominięć; live herdr zablokowane brakiem wymaganego środowiska |
 
-Podstawa: [audyt API i tokenów](test/API-TOKEN-AUDIT.md) z 2026-11-15. Dokument uzupełnia [dotychczasowy plan napraw](SUBAGENT-REPAIR-PLAN.md), nie zastępuje jego otwartych punktów.
+Podstawa: [audyt API i tokenów](../../test/API-TOKEN-AUDIT.md) z 2026-11-15. Dokument uzupełnia [dotychczasowy plan napraw](SUBAGENT-REPAIR-PLAN.md), nie zastępuje jego otwartych punktów.
 
 Zakres obejmuje trzy oddzielne obszary odpowiedzialności:
 
