@@ -1,5 +1,6 @@
 import { existsSync, realpathSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
+import { globalStateSlot } from "./global-state.ts";
 
 export interface SessionOwner {
   runId: string;
@@ -11,9 +12,7 @@ export interface SessionOwner {
 
 // Deliberately scoped to this parent process, not a cross-process file lock.
 // Symbol.for preserves reservations even while extension modules reload.
-const KEY = Symbol.for("pi-subagents/session-owners/v1");
-export const sessionOwners: Map<string, SessionOwner> =
-  (globalThis as any)[KEY] ?? ((globalThis as any)[KEY] = new Map());
+export const sessionOwners = globalStateSlot<Map<string, SessionOwner>>("pi-subagents/session-owners/v1").value ??= new Map();
 
 export function canonicalSessionPath(path: string, cwd = process.cwd()): string {
   let ancestor = resolve(cwd, path);

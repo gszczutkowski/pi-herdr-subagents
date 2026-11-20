@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { canonicalSessionPath } from "./ownership.ts";
 import { runCompletionFile } from "./run-artifacts.ts";
 import { atomicRuntimeWrite } from "./runtime-store.ts";
+import { globalStateSlot } from "./global-state.ts";
 import { probeProcess, sameProcess, type ProcessIdentity } from "./process-identity.ts";
 
 interface ChildIdentity {
@@ -28,8 +29,7 @@ export function registerRecoveryIdentity(pi: ExtensionAPI): void {
   const runId = process.env.PI_SUBAGENT_ID;
   const session = process.env.PI_SUBAGENT_SESSION;
   if (!runId || !session) return;
-  const key = Symbol.for("pi-subagents/process-nonce/v1");
-  const nonce: string = (globalThis as any)[key] ??= randomUUID();
+  const nonce = globalStateSlot<string>("pi-subagents/process-nonce/v1").value ??= randomUUID();
   let timer: ReturnType<typeof setInterval> | undefined;
   const stop = () => { if (timer) clearInterval(timer); timer = undefined; };
   pi.on("session_start", (_event, ctx) => {

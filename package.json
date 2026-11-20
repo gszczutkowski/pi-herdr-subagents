@@ -18,7 +18,9 @@
   "files": [
     "pi-extension",
     "agents",
-    "config.json.example"
+    "config.json.example",
+    "docs/REFERENCE.md",
+    "CONTRACTS.md"
   ],
   "scripts": {
     "lint": "oxlint pi-extension test",
