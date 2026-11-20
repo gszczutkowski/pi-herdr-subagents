@@ -16,6 +16,7 @@ import { registerRecoveryIdentity } from "./recovery-identity.ts";
 import { registerCloseControl } from "./close-control.ts";
 import { registerInterruptControl } from "./interrupt-control.ts";
 import { registerInitialSkills } from "./initial-skills.ts";
+import { globalStateSlot } from "./global-state.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -113,8 +114,8 @@ export default function (pi: ExtensionAPI) {
   const deniedToolsValue = process.env.PI_DENY_TOOLS;
   const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1";
   // Keeping a child open opts the session into collaboration, not just one turn.
-  const keepOpenKey = Symbol.for(`pi-subagents/keep-open/${process.env.PI_SUBAGENT_ID ?? "legacy"}`);
-  let keepOpenSession = (globalThis as any)[keepOpenKey] ?? (!autoExit || !getBehaviorConfig().closeOnDone);
+  const keepOpenSlot = globalStateSlot<boolean>(`pi-subagents/keep-open/${process.env.PI_SUBAGENT_ID ?? "legacy"}`);
+  let keepOpenSession = keepOpenSlot.value ?? (!autoExit || !getBehaviorConfig().closeOnDone);
   const recorder = createSubagentActivityRecorder({
     runningChildId: process.env.PI_SUBAGENT_ID,
     activityFile: process.env.PI_SUBAGENT_ACTIVITY_FILE,
@@ -180,8 +181,9 @@ export default function (pi: ExtensionAPI) {
   let toolBatch = 0;
   let turnFailures: string[] = [];
   interface Pending { completion: PreparedRunCompletion; intent: Intent; attempts: number }
-  const pendingKey = Symbol.for(`pi-subagents/pending-completion/v1/${process.env.PI_SUBAGENT_ID ?? "legacy"}/${process.env.PI_SUBAGENT_SESSION ?? ""}`);
-  const pending: Pending[] = (globalThis as any)[pendingKey] ??= [];
+  const pending = globalStateSlot<Pending[]>(
+    `pi-subagents/pending-completion/v1/${process.env.PI_SUBAGENT_ID ?? "legacy"}/${process.env.PI_SUBAGENT_SESSION ?? ""}`,
+  ).value ??= [];
   let currentCompletion: Pending | undefined;
   let retryTimer: ReturnType<typeof setTimeout> | undefined;
   const retryDelays = [100, 500, 1000];
@@ -293,7 +295,7 @@ export default function (pi: ExtensionAPI) {
       const selected = event.aborted ? { ...requested, type: "done" as const, keepOpen: true } : requested;
       if (selected.type === "done" && !event.aborted) {
         keepOpenSession = selected.keepOpen;
-        (globalThis as any)[keepOpenKey] = keepOpenSession;
+        keepOpenSlot.value = keepOpenSession;
       }
       const providerError = findLatestAssistantError(latestAgentMessages)?.errorMessage;
       const failure = [event.aborted ? "Supervised turn aborted before settlement." : "", ...(intent?.failures ?? turnFailures), providerError].filter(Boolean).join("\n");

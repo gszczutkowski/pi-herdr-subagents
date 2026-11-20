@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { findLastAssistantMessage } from "./session.ts";
 import { canonicalSessionPath } from "./ownership.ts";
+import { globalStateSlot } from "./global-state.ts";
 
 let completionSequence = 0;
 let turnEventId = randomUUID();
@@ -12,8 +13,7 @@ type CompletionSession = Pick<ExtensionContext["sessionManager"], "getEntries" |
 interface SessionIdentity { sessionFile: string; headerId: string }
 // Process-scoped, not branch state: /reload must retain the original task's
 // identity, while /new, /resume and /fork remain unrestricted but detached.
-const identityKey = Symbol.for("pi-subagents/completion-identities/v1");
-const identities: Map<string, SessionIdentity> = (globalThis as any)[identityKey] ??= new Map();
+const identities = globalStateSlot<Map<string, SessionIdentity>>("pi-subagents/completion-identities/v1").value ??= new Map();
 let completionSessionFile: string | null | undefined;
 let completionHeaderId: string | undefined;
 

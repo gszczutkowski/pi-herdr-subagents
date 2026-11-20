@@ -6,6 +6,7 @@ import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, mock } from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 import { Type } from "@sinclair/typebox";
 import { INTERRUPT_CAPABILITY, interruptDir, interruptOwnedChild, registerInterruptControl } from "../pi-extension/subagents/interrupt-control.ts";
 import { canonicalSessionPath } from "../pi-extension/subagents/ownership.ts";
@@ -307,12 +308,30 @@ test(`real offline Pi ctx.abort preserves settlement semantics (staged close=${s
           await new Promise<void>(resolve => { if (signal.aborted) resolve(); else signal.addEventListener("abort", () => resolve(), { once: true }); });
           return { content: [{ type: "text", text: "gate aborted" }], details: {} };
         } })] }, async ({ session, requests, shutdowns }) => {
-      const running = session.prompt("Hold the active tool gate");
-      await started;
       const runId = process.env.PI_SUBAGENT_ID!, activityFile = process.env.PI_SUBAGENT_ACTIVITY_FILE!;
-      const result = await interruptOwnedChild({ runId, dispatched: true }, { id: runId, cli: "pi", sessionFile, activityFile }, { validate: () => {}, timeoutMs: 2000 });
-      assert.equal(result.status, "requested");
-      await running;
+      const owner = { runId, dispatched: true };
+      const child = { id: runId, cli: "pi" as const, sessionFile, activityFile };
+      const controller = new AbortController();
+      let phase = "tool gate entry";
+      const running = session.prompt("Hold the active tool gate");
+      // The production watcher and ack poll are unref'ed by design. This
+      // fixture owns a referenced deadline so it cannot exit mid-interrupt.
+      const watchdog = delay(5000, undefined, { signal: controller.signal }).then(() => {
+        throw new Error(`offline Pi interrupt timed out waiting for ${phase}`);
+      });
+      const interrupt = async () => {
+        await Promise.race([started, running.then(() => assert.fail("prompt settled before the gate opened"))]);
+        phase = "interrupt acknowledgement";
+        const result = await interruptOwnedChild(owner, child, { validate: () => {}, timeoutMs: 2000, signal: controller.signal });
+        assert.equal(result.status, "requested");
+        phase = "prompt settlement";
+        await running;
+        return result;
+      };
+      const result = await Promise.race([interrupt(), watchdog]).catch(async (error) => {
+        await session.abort(); // Fixture cleanup only, never the tested abort path.
+        throw error;
+      }).finally(() => controller.abort());
       const control = interruptDir(activityFile);
       assert.equal(read(join(control, `${result.requestId}.settled.json`)).status, "aborted");
       assert.equal(existsSync(join(control, "current.json")), false);
@@ -328,7 +347,7 @@ test(`real offline Pi ctx.abort preserves settlement semantics (staged close=${s
       }
       assert.equal(shutdowns(), 0, "abort preserves the supervised process");
       assert.equal(canonicalSessionPath(session.sessionFile!), canonicalSessionPath(sessionFile));
-      await assert.rejects(interruptOwnedChild({ runId, dispatched: true }, { id: runId, cli: "pi", sessionFile, activityFile }, { validate: () => {}, timeoutMs: 0 }), /no fresh active/);
+      await assert.rejects(interruptOwnedChild(owner, child, { validate: () => {}, timeoutMs: 0 }), /no fresh active/);
     });
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

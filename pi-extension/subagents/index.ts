@@ -85,6 +85,7 @@ import {
   type SubagentActivityState,
 } from "./activity.ts";
 import { registerSubagentAssignmentRenderer } from "./assignment.ts";
+import { globalStateSlot } from "./global-state.ts";
 import { registerPlanTools } from "./plan-tools.ts";
 import type { PlanPersistence } from "./plan-persistence.ts";
 import { AssignmentContractSchema, resolveAssignmentContract, contractTask, normalizeStructuredResult, type StructuredResult } from "./contracts.ts";
@@ -113,23 +114,18 @@ const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
 // Survive /reload: replace presentation timers while keeping active completion
 // watchers and their registry alive. Old module closures continue watching the
 // children; the reloaded module adopts the shared registry for status/interrupts.
-const WIDGET_INTERVAL_KEY = Symbol.for("pi-subagents/widget-interval");
-const STATUS_INTERVAL_KEY = Symbol.for("pi-subagents/status-interval");
-const RUNTIME_KEY = Symbol.for("pi-subagents/runtime");
-const CLOSED_KEY = Symbol.for("pi-subagents/closed-process-receipts/v1");
-const closedProcessReceipts: Map<string, { id: string; name: string; result: CloseResult }> =
-  (globalThis as any)[CLOSED_KEY] ??= new Map();
+type IntervalSlot = ReturnType<typeof setInterval> | null;
+const widgetIntervalSlot = globalStateSlot<IntervalSlot>("pi-subagents/widget-interval");
+const statusIntervalSlot = globalStateSlot<IntervalSlot>("pi-subagents/status-interval");
+const closedProcessReceipts = globalStateSlot<Map<string, { id: string; name: string; result: CloseResult }>>(
+  "pi-subagents/closed-process-receipts/v1",
+).value ??= new Map();
 
-{
-  const prevInterval = (globalThis as any)[WIDGET_INTERVAL_KEY];
-  if (prevInterval) {
-    clearInterval(prevInterval);
-    (globalThis as any)[WIDGET_INTERVAL_KEY] = null;
-  }
-  const prevStatusInterval = (globalThis as any)[STATUS_INTERVAL_KEY];
-  if (prevStatusInterval) {
-    clearInterval(prevStatusInterval);
-    (globalThis as any)[STATUS_INTERVAL_KEY] = null;
+for (const slot of [widgetIntervalSlot, statusIntervalSlot]) {
+  const interval = slot.value;
+  if (interval) {
+    clearInterval(interval);
+    slot.value = null;
   }
 }
 
@@ -494,9 +490,7 @@ function createSubagentRuntime(): SubagentRuntime {
 }
 
 /** Runtime state preserved across /reload. */
-const runtime: SubagentRuntime =
-  (globalThis as any)[RUNTIME_KEY] ??
-  ((globalThis as any)[RUNTIME_KEY] = createSubagentRuntime());
+const runtime = globalStateSlot<SubagentRuntime>("pi-subagents/runtime").value ??= createSubagentRuntime();
 const runningSubagents = runtime.runningSubagents;
 
 /** Lazily establish branch custody before any child dispatch. */
@@ -882,7 +876,7 @@ function updateWidget() {
     if (widgetInterval) {
       clearInterval(widgetInterval);
       widgetInterval = null;
-      (globalThis as any)[WIDGET_INTERVAL_KEY] = null;
+      widgetIntervalSlot.value = null;
     }
     return;
   }
@@ -1148,7 +1142,7 @@ function startStatusRefresh(_pi: ExtensionAPI) {
       if (statusInterval) {
         clearInterval(statusInterval);
         statusInterval = null;
-        (globalThis as any)[STATUS_INTERVAL_KEY] = null;
+        statusIntervalSlot.value = null;
       }
       return;
     }
@@ -1157,7 +1151,7 @@ function startStatusRefresh(_pi: ExtensionAPI) {
 
   }, 1000);
 
-  (globalThis as any)[STATUS_INTERVAL_KEY] = statusInterval;
+  statusIntervalSlot.value = statusInterval;
 }
 
 function resolveResumeLaunchBehavior(params: { autoExit?: boolean }): { autoExit: boolean; interactive: boolean } {
@@ -1197,7 +1191,7 @@ function startWidgetRefresh() {
   widgetInterval = setInterval(() => {
     updateWidget();
   }, 1000);
-  (globalThis as any)[WIDGET_INTERVAL_KEY] = widgetInterval;
+  widgetIntervalSlot.value = widgetInterval;
 }
 
 /**
@@ -1833,12 +1827,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     if (widgetInterval) {
       clearInterval(widgetInterval);
       widgetInterval = null;
-      (globalThis as any)[WIDGET_INTERVAL_KEY] = null;
+      widgetIntervalSlot.value = null;
     }
     if (statusInterval) {
       clearInterval(statusInterval);
       statusInterval = null;
-      (globalThis as any)[STATUS_INTERVAL_KEY] = null;
+      statusIntervalSlot.value = null;
     }
 
     if (!shouldPreserveSubagentsOnShutdown((event as any).reason)) detachRuntimeWatchers();
