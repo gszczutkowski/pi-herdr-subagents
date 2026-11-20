@@ -17,6 +17,7 @@ Run the checks before starting:
 ```bash
 npm ci
 npm run lint
+npm run typecheck
 npm test
 npm pack --dry-run
 ```

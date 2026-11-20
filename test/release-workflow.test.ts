@@ -9,6 +9,7 @@ function assertReleaseWorkflow(source: string): void {
   assert.match(workflow, /branches:\n\s+- main/);
   assert.match(workflow, /paths:\n\s+- package\.json/);
   assert.match(workflow, /npm run lint/);
+  assert.match(workflow, /npm run typecheck/);
   assert.match(workflow, /npm test/);
   assert.match(workflow, /git tag -a "\$TAG"/);
   assert.match(workflow, /npm publish --access public --provenance/);

@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { once } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -201,7 +202,18 @@ test("fresh parent resumes an exited recovered session only after fresh process 
         headerId:'child',nonce:'original-process',process:probeProcess(process.pid).identity}));`);
     execute(`import cp from 'node:child_process';import {syncBuiltinESMExports} from 'node:module';
       import {promisify} from 'node:util';import fs from 'node:fs';import assert from 'node:assert/strict';
-      let surfaces=0,dispatches=0,auditSnapshots=0;const inspections=[];
+      let surfaces=0,dispatches=0,auditSnapshots=0,enumerationDenied=false;const inspections=[];
+      const originalReaddir=fs.readdirSync;
+      // Only global enumeration is synthetic: /proc/PID/stat identity probes
+      // must still observe the real exited parent and live replacement below.
+      fs.readdirSync=(path,...args)=>{
+        if(String(path)==='/proc'){
+          auditSnapshots++;
+          if(enumerationDenied)throw Object.assign(Error('enumeration denied'),{code:'EACCES'});
+          return [];
+        }
+        return originalReaddir(path,...args);
+      };
       const original=cp.execFileSync;
       cp.execSync=()=> 'herdr';
       cp.execFileSync=(command,args,...options)=>{
@@ -211,7 +223,9 @@ test("fresh parent resumes an exited recovered session only after fresh process 
           // real PID/birth probes for the recovered identity below. Audit parser,
           // duplicate/uncertain writer cases have dedicated session-audit tests.
           if(args.some(arg=>typeof arg==='string'&&arg.includes('ForEach-Object { @{pid=$_.ProcessId;parentPid='))){
-            auditSnapshots++;return '[]';
+            auditSnapshots++;
+            if(enumerationDenied)throw Error('enumeration denied');
+            return '[]';
           }
           return original(command,args,...options);
         }
@@ -257,10 +271,17 @@ test("fresh parent resumes an exited recovered session only after fresh process 
       // Custody loss must not release the reservation, even with a dead child.
       branch.length=0;await assert.rejects(resume(),/branch/);assert.equal(sessionOwners.get(session),owner);
       branch.push({id:'checkpoint',type:'custom',customType:'subagent-custody',data:{branchToken:'token'}});
+      if(['linux','win32'].includes(process.platform)){
+        enumerationDenied=true;
+        await assert.rejects(resume(),/Session process audit is uncertain/);
+        assert.equal(sessionOwners.get(session),owner,'denied audit retains recovered custody');
+        assert.equal(surfaces,0);assert.equal(dispatches,0);
+        enumerationDenied=false;
+      }
       const attempts=await Promise.allSettled([resume(),resume()]);
       assert.equal(attempts.filter(r=>r.status==='fulfilled').length,1);
       assert.match(String(attempts.find(r=>r.status==='rejected').reason),/already owned/);
-      if(process.platform==='win32')assert.ok(auditSnapshots>0,'verified enumeration fixture must run');
+      if(['linux','win32'].includes(process.platform))assert.ok(auditSnapshots>0,'verified enumeration fixture must run');
       const result=attempts.find(r=>r.status==='fulfilled').value;
       assert.equal(result.details.status,'started');assert.notEqual(result.details.id,'run');
       assert.equal(sessionOwners.get(session).runId,result.details.id);
@@ -270,6 +291,26 @@ test("fresh parent resumes an exited recovered session only after fresh process 
       assert.ok(inspections.every(pane=>pane==='new-1'));
       handlers.get('session_shutdown')({reason:'quit'},ctx);`, 120000);
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// Only for a direct test fixture we spawned. An earlier exit is not replayed to late listeners.
+async function stopFixture(child: ChildProcess) {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const exited = once(child, "exit", { signal: AbortSignal.timeout(5000) });
+  child.kill();
+  await exited;
+}
+
+test("recovery teardown does not hang when the child exits before publishing its identity", { timeout: 15000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "recovery-early-exit-"));
+  const child = spawn(process.execPath, ["-e", "process.exitCode = 7"], { cwd: dir, stdio: "ignore" });
+  try {
+    const [code] = await once(child, "close", { signal: AbortSignal.timeout(10000) });
+    assert.equal(code, 7);
+  } finally {
+    await stopFixture(child); // The exit event has already been delivered.
+    rmSync(dir, { recursive: true });
+  }
 });
 
 test("real child process answers fresh generation challenges; stale nonce/PID and custody loss fail closed", { skip: !processSupported }, async () => {
@@ -327,7 +368,7 @@ test("real child process answers fresh generation challenges; stale nonce/PID an
     assert.equal(Object.keys(store.snapshot().outbox).length, 3, "same-run reservation resumes authenticated artifact supervision");
     resumed(); store.close(); releaseSession(session, "run");
   } finally {
-    child.kill(); await new Promise((r) => child.once("exit", r));
+    await stopFixture(child);
     releaseSession(session, "run"); rmSync(dir, { recursive: true, force: true });
   }
 });

@@ -17,6 +17,12 @@ test("spawn and closed-session resume durably record intent before terminal disp
   let manifestFile = "";
   let dispatches = 0;
   let closes = 0;
+  const originalReaddir = fs.readdirSync;
+  // Isolate the global Linux process snapshot just like the Windows mock below.
+  mock.method(fs, "readdirSync", (path: any, ...args: any[]) => {
+    if (String(path) === "/proc") return [];
+    return (originalReaddir as any)(path, ...args);
+  });
   mock.method(childProcess, "execSync", () => "herdr");
   mock.method(childProcess, "execFileSync", (_command: any, args: string[]) => {
     if (_command === "powershell.exe") return "[]";

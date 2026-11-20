@@ -124,5 +124,5 @@ Parent integration preflight: `HERDR_ENV` unset, `herdr` missing, `hc` available
 Per `.pi/skills/run-integration-tests/SKILL.md`, the integration suite is blocked
 until Pi runs inside herdr; skipped tests would not be acceptance. No fresh real
 terminal Escape round trip, authenticated provider test, Linux live behavior,
-Codex→Kiro switch or token/billing A/B is claimed. Earlier `HANDOFF.md` live
+Codex→Kiro switch or token/billing A/B is claimed. Earlier `docs/history/HANDOFF.md` live
 close/audit evidence applies to its recorded milestone only, not these changes.

@@ -126,7 +126,7 @@ export interface HarnessDriver {
   readonly supportsTrackedKeepOpen?: boolean;
 
   /** Format the model reference for this CLI */
-  formatModel(runtimePlan: Pick<ResolvedRuntimePlan, "model" | "modelId" | "provider">): string;
+  formatModel(runtimePlan: Pick<ResolvedRuntimePlan, "model" | "modelId">): string;
 
   /** Optional validation of runtime plan before launch (e.g. thinking overrides) */
   validateRuntimePlan?(runtimePlan: ResolvedRuntimePlan, parentThinking: ThinkingLevel): void;

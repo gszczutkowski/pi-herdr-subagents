@@ -201,9 +201,9 @@ test("generated resume command runs with saved cwd, CLI flags and isolated envir
   const script = join(dir, "capture.cjs");
   writeFileSync(script, `require('fs').writeFileSync(${JSON.stringify(capture)}, JSON.stringify({cwd:process.cwd(),args:process.argv.slice(2),deny:process.env.PI_DENY_TOOLS,agent:process.env.PI_CODING_AGENT_DIR,autoExit:process.env.PI_SUBAGENT_AUTO_EXIT,id:process.env.PI_SUBAGENT_ID}));`);
   const { command } = driver.buildCommand(reopen(dir, context, "actual-run", "NEW_MESSAGE"));
-  execFileSync("bash", ["-c", `pi() { node ${quote(script)} "$@"; }; ${command}`], { stdio: "pipe" });
+  execFileSync("bash", ["-c", `pi() { ${quote(process.execPath.replaceAll("\\", "/"))} ${quote(script)} "$@"; }; ${command}`], { stdio: "pipe" });
   const captured = JSON.parse(readFileSync(capture, "utf8"));
-  assert.equal(captured.cwd.replaceAll("\\", "/").toLowerCase(), dir.replaceAll("\\", "/").toLowerCase());
+  assert.equal(canonicalSessionPath(captured.cwd), canonicalSessionPath(dir), "Compare physical cwd, including Windows short-path aliases");
   assert.equal(captured.agent, context.localAgentDir);
   assert.equal(captured.autoExit, "0");
   assert.equal(captured.id, "actual-run");

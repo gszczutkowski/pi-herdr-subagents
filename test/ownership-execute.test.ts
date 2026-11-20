@@ -10,6 +10,7 @@ import { after, test, mock } from "node:test";
 
 // Exercise actual tool/terminal code, replacing only OS boundaries (no live herdr).
 let powershellResponder: ((command: string) => string) | undefined;
+let processEnumerationFails = false;
 let prepareFails = false;
 let sendFails = false;
 let serial = 0;
@@ -21,6 +22,16 @@ const escapes: string[] = [];
 const childShutdowns: Array<() => void> = [];
 const originalWrite = fs.writeFileSync;
 const originalRead = fs.readFileSync;
+const originalReaddir = fs.readdirSync;
+// Match the empty Windows process snapshot below: never audit the host's live
+// processes (including inaccessible /proc entries) in these dispatch fixtures.
+mock.method(fs, "readdirSync", (path: any, ...args: any[]) => {
+  if (String(path) === "/proc") {
+    if (processEnumerationFails) throw Object.assign(new Error("enumeration denied"), { code: "EACCES" });
+    return [];
+  }
+  return (originalReaddir as any)(path, ...args);
+});
 let readFailureFile: string | undefined;
 let readFailureCode = "EACCES";
 mock.method(fs, "readFileSync", (path: any, ...args: any[]) => {
@@ -35,7 +46,10 @@ mock.method(fs, "writeFileSync", (path: any, ...args: any[]) => {
 });
 mock.method(childProcess, "execSync", () => "herdr");
 mock.method(childProcess, "execFileSync", (_command: any, args: any) => {
-  if (_command === "powershell.exe") return powershellResponder?.(args.at(-1)) ?? "[]";
+  if (_command === "powershell.exe") {
+    if (processEnumerationFails && args.at(-1).includes("Where-Object")) throw new Error("enumeration denied");
+    return powershellResponder?.(args.at(-1)) ?? "[]";
+  }
   if (args[0] === "tab" && args[1] === "create") {
     return JSON.stringify({ result: { root_pane: { pane_id: `child-${++serial}` } } });
   }
@@ -120,6 +134,7 @@ async function fixture(run: (f: any) => Promise<void>) {
     prepareFails = false;
     readFailureFile = undefined;
     powershellResponder = undefined;
+    processEnumerationFails = false;
     sendFails = false;
     onRun = () => {};
     inspect = async () => JSON.stringify({ error: { code: "pane_not_found" } });
@@ -135,6 +150,26 @@ async function until(predicate: () => boolean) {
   const deadline = Date.now() + 4000;
   while (!predicate()) { assert.ok(Date.now() < deadline, "condition timed out"); await pause(); }
 }
+
+test("isolated process enumeration is clear, but denied enumeration blocks resume before dispatch", { skip: !["linux", "win32"].includes(process.platform) }, async () => fixture(async ({ session, resume }: any) => {
+  const { auditSession } = await import("../pi-extension/subagents/session-audit.ts");
+  assert.equal(auditSession(session).status, "clear");
+  const surfacesBefore = serial;
+  const sendsBefore = sent.length;
+  processEnumerationFails = true;
+  const audit = auditSession(session);
+  assert.equal(audit.status, "uncertain");
+  assert.equal(audit.ownerCount, 0);
+  assert.equal(audit.uncertainCount, 1);
+  await assert.rejects(resume(), /Session process audit is uncertain/);
+  assert.equal(serial, surfacesBefore, "no pane created on uncertain enumeration");
+  assert.equal(sent.length, sendsBefore, "no terminal writes on uncertain enumeration");
+  assert.equal(sessionOwners.has(session), false, "no ownership retained before dispatch");
+  processEnumerationFails = false;
+  assert.equal(auditSession(session).status, "clear");
+  const started = await resume();
+  assert.ok(__test__.runningSubagents.has(started.details.id));
+}));
 
 test("Windows missing launcher ancestry needs independent strict birth ordering, never PID-only permission", { skip: process.platform !== "win32" }, async () => fixture(async () => {
   const { isProtectedProcess } = await import("../pi-extension/subagents/process-identity.ts");

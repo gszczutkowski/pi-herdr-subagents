@@ -176,7 +176,7 @@ export function buildAvailableAgentCatalog(
   return lines.join("\n");
 }
 
-export function loadAgentDefaults(agentName: string, options: DiscoveryOptions = {}): AgentDefaults | null {
+export function loadAgentDefaults(agentName: string, options: DiscoveryOptions = {}): ListedAgentDefinition | null {
   // The advertised frontmatter name, not the filename, is the lookup key.
   return discoverAgentDefinitions(options).find((agent) => agent.name === agentName) ?? null;
 }

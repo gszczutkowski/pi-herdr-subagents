@@ -17,13 +17,20 @@ import { registerLiveContinuation } from "../pi-extension/subagents/live-continu
 import { contractTask, resolveAssignmentContract } from "../pi-extension/subagents/contracts.ts";
 
 // Real native persistence, registered execute, launch builder, completion adapter
-// and durable outbox. Only the Pi API host and terminal transport are mocked.
+// and durable outbox. The Pi API host, terminal transport and global process
+// enumeration are mocked; per-PID recovery identity probes remain real.
 test("registered task-bound spawn, live/closed resume, failure isolation and restored canonical imports", async () => {
   const dir = fs.mkdtempSync(join(tmpdir(), "plan-runtime-"));
   const savedEnv = { ...process.env };
   const originalExec = childProcess.execFile;
   let serial = 0; let dispatches = 0; let failAppend = false; let failSend = false;
   let liveSends = 0; let failPrepare = false;
+  const originalReaddir = fs.readdirSync;
+  // Match the empty Windows snapshot without hiding /proc/PID identity probes.
+  mock.method(fs, "readdirSync", (path: any, ...args: any[]) => {
+    if (String(path) === "/proc") return [];
+    return (originalReaddir as any)(path, ...args);
+  });
   const originalWrite = fs.writeFileSync;
   mock.method(fs, "writeFileSync", (path: any, ...args: any[]) => {
     if (failPrepare && String(path).endsWith(".sh")) {

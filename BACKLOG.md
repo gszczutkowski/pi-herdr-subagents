@@ -1,6 +1,6 @@
 # Current repair backlog
 
-This is the current scope/status entry point. `HANDOFF.md` records an earlier,
+This is the current scope/status entry point. `docs/history/HANDOFF.md` records an earlier,
 completed close/audit milestone; its completion is not completion of subsequent
 repair or context-optimization plans.
 
@@ -78,7 +78,7 @@ repair or context-optimization plans.
 
 ## Audit repairs integrated (2026-11-16)
 
-- R1–R6 and M9–M11 from `AUDIT-REPAIR-HANDOFF.md` are implemented, including
+- R1–R6 and M9–M11 from `docs/history/AUDIT-REPAIR-HANDOFF.md` are implemented, including
   settled/session-bound completion, observable I/O pause/retry, literal shell/CLI
   delivery, explicit project-source approvals and bounded historical processing.
 - Final local Pi **1.5.2** suite: **712/712 pass**, zero skips/cancellations;
@@ -95,7 +95,7 @@ repair or context-optimization plans.
 
 ## Earlier implementation/review milestone
 
-- Lifecycle repairs 6–10 in `SUBAGENT-REPAIR-PLAN.md`: interrupted continuation,
+- Lifecycle repairs 6–10 in `docs/history/SUBAGENT-REPAIR-PLAN.md`: interrupted continuation,
   current-task/active-branch summaries, role delivery, live-message validation,
   and pending-result import ordering.
 - Compact plan/checkpoint receipts and stable ordinary context publication;
@@ -142,7 +142,7 @@ no historical private session was replayed.
 ## Detailed scope and evidence
 
 - `SUBAGENT-REPAIR-PLAN.md`: correctness defects and acceptance criteria.
-- `SUBAGENT-CONTEXT-OPTIMIZATION-PLAN.md`: staged optimization and external scope.
+- `docs/history/SUBAGENT-CONTEXT-OPTIMIZATION-PLAN.md`: staged optimization and external scope.
 - `test/API-TOKEN-AUDIT.md`: incident findings, not implementation acceptance.
 - `test/REPAIR-VERIFICATION.md`: final checks and remaining limits (written after review).
 

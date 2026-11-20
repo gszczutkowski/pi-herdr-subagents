@@ -2,7 +2,7 @@
 
 Date: 2026-11-16. Base: merged `main` at `75a355c`.
 Implementation branch: `fix/plan-read-detach-virtual-models`.
-Scope: the three optional audit items in `AUDIT-REPAIR-HANDOFF.md`, not the
+Scope: the three optional audit items in `docs/history/AUDIT-REPAIR-HANDOFF.md`, not the
 remaining context-optimization backlog or a global installation/deployment.
 
 ## Changes and regression evidence

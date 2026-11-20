@@ -1,7 +1,7 @@
 # Audit repair verification
 
 Date: 2026-11-16. Branch: `fix/subagent-repair-sequence`; base HEAD `d226f33`.
-This records the repair of `AUDIT-REPAIR-HANDOFF.md`, not a new audit of every
+This records the repair of `docs/history/AUDIT-REPAIR-HANDOFF.md`, not a new audit of every
 optional backlog item. Existing uncommitted work was preserved; no commit/reset
 or global Pi installation change was performed.
 

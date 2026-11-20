@@ -2,7 +2,7 @@
 
 Async subagents for [pi](https://github.com/earendil-works/pi) running exclusively in [herdr](https://herdr.dev). Spawn, orchestrate, and manage sub-agent sessions in dedicated herdr tabs or panes. **Fully non-blocking** — the main agent keeps working while subagents run in the background.
 
-Current repair status and external dependencies: [BACKLOG.md](BACKLOG.md).
+Current repair status and external dependencies: [BACKLOG.md](BACKLOG.md). Historical handoffs and repair plans live in [docs/history](docs/history); a worked example of the subagent workflow (in Polish) is in [docs/SUBAGENT-WORKFLOW-PL.md](docs/SUBAGENT-WORKFLOW-PL.md).
 
 ## How It Works
 
@@ -303,11 +303,12 @@ reads only persisted task state, independently of the runtime process registry.
 
 ## Development
 
-Run unit tests and lint locally:
+Run unit tests, lint and the type check locally (CI runs the same on Ubuntu and Windows for every pull request):
 
 ```bash
 npm test
 npm run lint
+npm run typecheck
 ```
 
 Run integration tests **inside the terminal backend being verified**:
@@ -638,6 +639,8 @@ A durable claim, separate from the immutable acceptance/rejection acknowledgemen
 ### Read-only session process audit
 
 `subagent_audit({sessionPath: "/absolute/path/child.jsonl"})` reports OS-visible Pi CLI owners of the canonical file, including symlink aliases. Alternatively supply an owned `id` or exact `name` (not both selectors). Output is bounded to 32 PID + process-birth identities; command lines and credentials are never returned. Multiple owners report `duplicate`; denied enumeration, unresolved relative paths/UUID selectors and unsupported platforms report uncertainty, never an empty safe result. Windows and Linux are supported. This is a point-in-time CLI audit, not a global lock: manual session switches inside Pi and writers that do not explicitly select `--session` are outside its coverage.
+
+On Linux, native Pi sets `process.title`, which overwrites the original OS-visible command line and removes its `--session` selector. Such Node/Pi processes report `uncertain`, not known owners or `duplicate`; guarded resume and close remain blocked. An audit with zero known owners is **not** clearance when uncertainty is present. Readable complete command lines without a session selector are excluded before accessing potentially denied `/proc/<pid>/exe` links; denied or title-overwritten candidate evidence still fails closed.
 
 Node entrypoints are resolved through real paths and the owning Pi package's declared `pi` bin (including bundled `dist/bundle/cli.js` and its exact shipped `dist/cli.js` companion), not filename substrings. Unrelated scripts with unknown Node VM flags do not contaminate the audit; ambiguous/denied script arguments still fail closed. Pi 1.5 does not parse `--session=path`; that spelling is reported uncertain, not clear.
 
@@ -1157,6 +1160,7 @@ Every sub-agent session displays a compact tools widget showing available and de
 
 ## Requirements
 
+- Node.js 22.19 or newer (the version Pi itself requires)
 - [pi](https://github.com/earendil-works/pi) 1.5.2 or a compatible 1.5.x patch. The audit repairs were also verified offline on 1.3.0, but that host pins vulnerable dependencies and is no longer the recommended/supported install. Updating this repository's local dependencies does not update your global Pi executable.
 - [herdr](https://herdr.dev) — the required terminal workspace
 

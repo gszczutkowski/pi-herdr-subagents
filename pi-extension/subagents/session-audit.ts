@@ -56,11 +56,24 @@ export function enumerateProcesses(): ProcessSnapshot {
       for (const entry of readdirSync("/proc")) {
         if (!/^\d+$/.test(entry)) continue;
         try {
+          let argv: string[] | undefined;
+          try { argv = readFileSync(`/proc/${entry}/cmdline`, "utf8").split("\0").filter(Boolean); }
+          catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") throw error;
+            // Still try exe: a denied command line on a known non-Node process
+            // is irrelevant, but missing argv for a genuine candidate is not.
+          }
+          // cmdline is normally world-readable even when exe is ptrace-denied
+          // (e.g. root-owned system services). This audit only covers explicit
+          // --session selectors. Never use comm: Node can change process.title.
+          // A single argv entry may be process.title replacing the original
+          // argv region (Pi does this on Linux). It is not a complete CLI.
+          if (argv && argv.length > 1 && !argv.some(arg => arg === "--session" || arg.startsWith("--session="))) continue;
           const executable = readlinkSync(`/proc/${entry}/exe`);
-          if (!/^(node|nodejs|pi)$/.test(basename(executable))) continue;
+          if (!/^(node|nodejs|pi)$/.test(basename(executable.replace(/ \(deleted\)$/, "")))) continue;
+          if (argv?.length === 1) argv = undefined;
           const stat = readFileSync(`/proc/${entry}/stat`, "utf8");
           const parentPid = Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[1]);
-          const argv = readFileSync(`/proc/${entry}/cmdline`, "utf8").split("\0").filter(Boolean);
           let cwd: string | undefined;
           try { cwd = readlinkSync(`/proc/${entry}/cwd`); } catch { /* relative paths unverified */ }
           rows.push({ pid: Number(entry), parentPid, argv, cwd });

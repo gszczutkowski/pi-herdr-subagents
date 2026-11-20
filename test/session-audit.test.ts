@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, symlinkSync } from "node:fs";
+import fs, { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, symlinkSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
-import { auditSession, assertSessionWriters, piSessionArgument, windowsArgv } from "../pi-extension/subagents/session-audit.ts";
+import { auditSession, assertSessionWriters, enumerateProcesses, piSessionArgument, windowsArgv } from "../pi-extension/subagents/session-audit.ts";
 import { probeProcess } from "../pi-extension/subagents/process-identity.ts";
 
 const cli = join(dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"))), "cli.js");
@@ -61,15 +62,29 @@ test(`real ${label} Pi RPC processes sharing one file are audited, including can
       child.stdin.write(JSON.stringify({ type: "get_state", id: "ready" }) + "\n"); await ready;
     }
     const audit = auditSession(session);
-    assert.equal(audit.ownerCount, 2);
-    assert.equal(audit.status, "duplicate");
-    for (const child of children) assert.ok(audit.owners.some(owner => owner.pid === child.pid));
+    if (process.platform === "linux") {
+      // Native Pi sets process.title, overwriting Linux's original argv region.
+      // OS evidence cannot recover --session, so never claim known owners.
+      assert.equal(audit.ownerCount, 0);
+      assert.equal(audit.status, "uncertain");
+      assert.ok(audit.uncertainCount >= 2);
+      assert.throws(() => assertSessionWriters(audit), /audit is uncertain/);
+    } else {
+      assert.equal(audit.ownerCount, 2);
+      assert.equal(audit.status, "duplicate");
+      for (const child of children) assert.ok(audit.owners.some(owner => owner.pid === child.pid));
+    }
     const original = probeProcess(children[0].pid!);
     assert.equal(original.kind, "present");
     const firstExit = new Promise(resolveExit => children[0].once("exit", resolveExit));
     children[0].stdin.end(); await firstExit; // RPC EOF invokes graceful runtime shutdown.
     assert.equal(probeProcess(children[0].pid!).kind, "absent");
-    assert.equal(auditSession(session).ownerCount, 1);
+    const remaining = auditSession(session);
+    if (process.platform === "linux") {
+      assert.equal(remaining.ownerCount, 0);
+      assert.equal(remaining.status, "uncertain");
+      assert.throws(() => assertSessionWriters(remaining), /audit is uncertain/);
+    } else assert.equal(remaining.ownerCount, 1);
   } finally {
     await Promise.all(children.map(child => child.exitCode !== null || child.signalCode !== null ? undefined : new Promise<void>(resolveExit => { child.once("exit", () => resolveExit()); child.stdin.end(); })));
     rmSync(aliasDirectory, { recursive: true, force: true });
@@ -77,6 +92,76 @@ test(`real ${label} Pi RPC processes sharing one file are audited, including can
   }
 });
 }
+
+test("Linux proc boundary excludes irrelevant denied exe links but fails closed for genuine/unknown candidates", (t) => {
+  const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+  const originalRead = fs.readFileSync;
+  const originalLink = fs.readlinkSync;
+  const originalReaddir = fs.readdirSync;
+  const session = resolve("audit-proc-test.jsonl");
+  const denied = Object.assign(new Error("denied"), { code: "EACCES" });
+  const gone = Object.assign(new Error("gone"), { code: "ENOENT" });
+  type Fixture = { cmdline: string | Error; exe: string | Error; stat?: Error; cwd?: Error };
+  const candidate: Fixture = { cmdline: [process.execPath, cli, "--session", session, ""].join("\0"), exe: "/usr/bin/node" };
+  let fixture: Fixture = candidate;
+  let directoryError: Error | undefined;
+  let exeReads = 0;
+  const value = (input: string | Error) => { if (input instanceof Error) throw input; return input; };
+  try {
+    Object.defineProperty(process, "platform", { ...platform, value: "linux" });
+    t.mock.method(fs, "readdirSync", ((path: any, ...args: any[]) => {
+      if (path === "/proc") { if (directoryError) throw directoryError; return ["self", "123"]; }
+      return (originalReaddir as any)(path, ...args);
+    }) as typeof fs.readdirSync);
+    t.mock.method(fs, "readFileSync", ((path: any, ...args: any[]) => {
+      if (path === "/proc/123/cmdline") return value(fixture.cmdline);
+      if (path === "/proc/123/stat") return value(fixture.stat ?? "123 (arbitrary renamed title) S 1 0");
+      return (originalRead as any)(path, ...args);
+    }) as typeof fs.readFileSync);
+    t.mock.method(fs, "readlinkSync", ((path: any, ...args: any[]) => {
+      if (path === "/proc/123/exe") { exeReads++; return value(fixture.exe); }
+      if (path === "/proc/123/cwd") return value(fixture.cwd ?? process.cwd());
+      return (originalLink as any)(path, ...args);
+    }) as typeof fs.readlinkSync);
+    syncBuiltinESMExports();
+    const cases: { label: string; row: Fixture; status: string; owners?: number; noExe?: boolean }[] = [
+      { label: "readable explicit owner despite renamed comm", row: candidate, status: "single", owners: 1 },
+      { label: "system service without selector and denied exe", row: { cmdline: "/usr/sbin/service\0--foreground\0", exe: denied }, status: "clear", noExe: true },
+      { label: "node without selector and denied exe", row: { cmdline: "node\0server.js\0", exe: denied }, status: "clear", noExe: true },
+      { label: "denied argv but verified unrelated exe", row: { cmdline: denied, exe: "/usr/bin/python3" }, status: "clear" },
+      { label: "denied node argv", row: { ...candidate, cmdline: denied }, status: "uncertain" },
+      { label: "empty node argv is not evidence of irrelevance", row: { ...candidate, cmdline: "" }, status: "uncertain" },
+      { label: "Pi process.title erases original selectors on Linux", row: { ...candidate, cmdline: "pi\0\0\0" }, status: "uncertain" },
+      { label: "arbitrary renamed Node title is not complete argv", row: { ...candidate, cmdline: "custom worker title\0" }, status: "uncertain" },
+      { label: "denied candidate exe", row: { ...candidate, exe: denied }, status: "uncertain" },
+      { label: "denied unknown argv and exe", row: { cmdline: denied, exe: denied }, status: "uncertain" },
+      { label: "empty unknown argv and denied exe", row: { cmdline: "", exe: denied }, status: "uncertain" },
+      { label: "equals selector remains uncertain", row: { ...candidate, cmdline: `node\0${cli}\0--session=${session}\0` }, status: "uncertain" },
+      { label: "denied parent stat", row: { ...candidate, stat: denied }, status: "uncertain" },
+      { label: "deleted executable remains a candidate", row: { ...candidate, exe: "/usr/bin/node (deleted)" }, status: "single", owners: 1 },
+      { label: "absolute owner does not require cwd", row: { ...candidate, cwd: denied }, status: "single", owners: 1 },
+      { label: "relative selector requires readable cwd", row: { ...candidate, cmdline: `node\0${cli}\0--session\0relative.jsonl\0`, cwd: denied }, status: "uncertain" },
+      { label: "process exits before cmdline read", row: { ...candidate, cmdline: gone }, status: "clear", noExe: true },
+      { label: "process exits before exe read", row: { ...candidate, exe: gone }, status: "clear" },
+      { label: "process exits before stat read", row: { ...candidate, stat: gone }, status: "clear" },
+    ];
+    for (const { label, row, status, owners = 0, noExe } of cases) {
+      fixture = row; exeReads = 0;
+      const snapshot = enumerateProcesses();
+      const audit = auditSession(session, snapshot, probe);
+      assert.equal(audit.status, status, label);
+      assert.equal(audit.ownerCount, owners, label);
+      if (status === "uncertain") assert.throws(() => assertSessionWriters(audit, identity), /unverified/, label);
+      if (noExe) assert.equal(exeReads, 0, `${label}: avoid privileged exe read`);
+    }
+    directoryError = denied;
+    assert.equal(auditSession(session, enumerateProcesses(), probe).status, "uncertain", "denied proc listing is not clear");
+  } finally {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+    Object.defineProperty(process, "platform", platform);
+  }
+});
 
 test("owning package bin verification supports bundles/aliases, rejects same-package decoys and scopes unknown VM flags", () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-bin-audit-"));

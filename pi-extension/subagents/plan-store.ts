@@ -140,7 +140,7 @@ function validate(plan: PlanSnapshot): void {
       uuid(evidence.evidenceId); uuid(evidence.criterionId); text(evidence.ref);
       requireValue(!evidenceIds.has(evidence.evidenceId), "Duplicate evidence"); evidenceIds.add(evidence.evidenceId);
       if (evidence.artifactId !== undefined) requireValue(artifacts.has(evidence.artifactId), "Unknown artifact");
-      if (evidence.resultEventId !== undefined) requireValue(task.attempts.some(a => a.results.some(r => r.eventId === evidence.resultEventId)), "Unknown result reference");
+      if (evidence.resultEventId !== undefined) requireValue(task.attempts.some((a: Attempt) => a.results.some((r: ResultReference) => r.eventId === evidence.resultEventId)), "Unknown result reference");
     }
     let previousDecisionRevision = -1;
     for (const decision of task.decisions) {
@@ -149,7 +149,7 @@ function validate(plan: PlanSnapshot): void {
       text(decision.reason);
       requireValue(["accept", "invalidate"].includes(decision.kind) && Number.isSafeInteger(decision.revision) && decision.revision >= 0 && decision.revision <= plan.revision && decision.revision > previousDecisionRevision, "Invalid decision");
       previousDecisionRevision = decision.revision;
-      const index = task.statusHistory.findIndex(change => change.revision === decision.revision);
+      const index = task.statusHistory.findIndex((change: StatusChange) => change.revision === decision.revision);
       const change = task.statusHistory[index];
       const before = task.statusHistory[index - 1];
       requireValue(change && before && change.reason === decision.reason && (decision.kind === "accept"
@@ -158,14 +158,14 @@ function validate(plan: PlanSnapshot): void {
       if (decision.kind === "accept") requireValue(Object.keys(decision.criteria).length > 0, "Empty acceptance decision");
       for (const [criterionId, refs] of Object.entries(decision.criteria)) {
         uuid(criterionId);
-        requireValue(Array.isArray(refs) && refs.length > 0 && refs.length <= 1000 && refs.every(id => evidenceIds.has(id) && task.evidence.some(e => e.evidenceId === id && e.criterionId === criterionId)), "Unknown decision evidence");
+        requireValue(Array.isArray(refs) && refs.length > 0 && refs.length <= 1000 && refs.every(id => evidenceIds.has(id) && task.evidence.some((e: Evidence) => e.evidenceId === id && e.criterionId === criterionId)), "Unknown decision evidence");
       }
     }
     for (let i = 1; i < task.statusHistory.length; i++) {
       const change = task.statusHistory[i];
       const before = task.statusHistory[i - 1];
       if (change.status === "accepted" || before.status === "accepted") {
-        requireValue(task.decisions.some(d => d.revision === change.revision && d.kind === (change.status === "accepted" ? "accept" : "invalidate")), "Missing lifecycle decision");
+        requireValue(task.decisions.some((d: Decision) => d.revision === change.revision && d.kind === (change.status === "accepted" ? "accept" : "invalidate")), "Missing lifecycle decision");
       }
     }
     if (task.status === "accepted") {
@@ -177,7 +177,7 @@ function validate(plan: PlanSnapshot): void {
     requireValue(Array.isArray(task.attempts) && task.attempts.length <= 1000, "Invalid attempts");
     // Only start/retry enter in_progress, each appending one attempt. Detach
     // preserves both histories, including attempts no longer supervised here.
-    requireValue(task.attempts.length === task.statusHistory.filter(change => change.status === "in_progress").length, "Attempt history mismatch");
+    requireValue(task.attempts.length === task.statusHistory.filter((change: StatusChange) => change.status === "in_progress").length, "Attempt history mismatch");
     for (const attempt of task.attempts) {
       keys(attempt, ["attemptId", "runIds", "childSession", "results", "origin"]);
       if (attempt.origin !== undefined) {
