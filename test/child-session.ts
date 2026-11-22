@@ -13,6 +13,8 @@ export async function withChildSession<T>(options: {
   extensions?: Array<(pi: any) => void>;
   liveContinuation?: boolean;
   autoExit?: boolean;
+  completionMode?: "explicit";
+  tools?: string[];
   systemPrompt?: string;
   appendSystemPrompt?: string;
   setup?: (manager: SessionManager) => void;
@@ -21,7 +23,7 @@ export async function withChildSession<T>(options: {
 }, run: (fixture: { session: AgentSession; dir: string; requests: any[]; shutdowns: () => number }) => Promise<T>): Promise<T> {
   const dir = mkdtempSync(join(tmpdir(), "child-session-"));
   const envNames = ["PI_CODING_AGENT_DIR", "PI_SUBAGENT_ID", "PI_SUBAGENT_SESSION", "PI_SUBAGENT_AUTO_EXIT",
-    "PI_SUBAGENT_INITIAL_SKILLS", "PI_SUBAGENT_ASSIGNMENT_FILE", "PI_SUBAGENT_ACTIVITY_FILE", "PI_DENY_TOOLS"];
+    "PI_SUBAGENT_INITIAL_SKILLS", "PI_SUBAGENT_ASSIGNMENT_FILE", "PI_SUBAGENT_ACTIVITY_FILE", "PI_DENY_TOOLS", "PI_SUBAGENT_COMPLETION_MODE"];
   const previous = envNames.map((name) => process.env[name]);
   let session: AgentSession | undefined;
   const errors: unknown[] = [];
@@ -33,6 +35,7 @@ export async function withChildSession<T>(options: {
     process.env.PI_CODING_AGENT_DIR = agentDir;
     process.env.PI_SUBAGENT_ID = `test-${basename(dir)}`;
     process.env.PI_SUBAGENT_AUTO_EXIT = options.autoExit === false ? "0" : "1";
+    if (options.completionMode) process.env.PI_SUBAGENT_COMPLETION_MODE = options.completionMode;
     process.env.PI_SUBAGENT_INITIAL_SKILLS = options.skills ?? "";
     const manager = options.sessionFile ? SessionManager.open(options.sessionFile) : SessionManager.create(dir, dir);
     process.env.PI_SUBAGENT_SESSION = manager.getSessionFile();
@@ -70,7 +73,7 @@ export async function withChildSession<T>(options: {
           } });
       }, childExtension, ...(options.extensions ?? [])] });
     await loader.reload();
-    ({ session } = await createAgentSession({ cwd: dir, agentDir, resourceLoader: loader, settingsManager, sessionManager: manager }));
+    ({ session } = await createAgentSession({ cwd: dir, agentDir, resourceLoader: loader, settingsManager, sessionManager: manager, tools: options.tools }));
     const model = session.extensionRunner!.getModelRegistry().find("child-test", "model");
     assert.ok(model);
     await session.setModel(model);

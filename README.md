@@ -23,7 +23,7 @@ Run async subagents for [Pi](https://github.com/earendil-works/pi) in dedicated 
    /subagent scout Map this repository and summarize the main entry points.
    ```
 
-The scout opens in its own terminal without stealing focus. The subagents widget shows its status, and the result returns to the parent session. You can also ask Pi to start several independent subagents in parallel, or use `/plan` for a planning workflow. Bundled roles include `scout`, `planner`, `worker`, `reviewer`, and `visual-tester`.
+The scout opens in its own terminal without stealing focus. The subagents widget shows its status, and the result returns to the parent session. You can also ask Pi to start several independent subagents in parallel, or use `/plan` for a planning workflow. Bundled roles include `scout`, `planner`, `worker`, `reviewer`, and `visual-tester`. For opt-in per-feature delegation, see the [Pi-only feature coordinator](docs/REFERENCE.md#opt-in-one-coordinator-per-feature-pi-only).
 
 ## Documentation
 

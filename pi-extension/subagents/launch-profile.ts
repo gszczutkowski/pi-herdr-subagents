@@ -32,6 +32,8 @@ export interface LaunchProfile {
   taskDelivery: "direct" | "artifact";
   runtimePlan: ResolvedRuntimePlan;
   autoExit: boolean;
+  /** Omitted in legacy/default profiles: ordinary Pi stop still reports. */
+  completionMode?: "explicit";
   interactive: boolean;
   lineage?: Lineage;
 }
@@ -60,6 +62,7 @@ export function resolveLaunchProfile(context: SubagentLaunchContext, harness: st
     runtimePlan: { provider: plan.provider, modelId: plan.modelId, model: plan.model, thinking: plan.thinking,
       modelSource: plan.modelSource, thinkingSource: plan.thinkingSource },
     autoExit: context.effectiveAutoExit, interactive: context.effectiveInteractive,
+    ...(context.agentDefs?.completionMode === "explicit" ? { completionMode: "explicit" as const } : {}),
   };
 }
 
@@ -94,6 +97,7 @@ export function readPiLaunchProfile(sessionFile: string): LaunchProfile {
     ![null, "append", "replace"].includes(p.systemPromptMode) ||
     !Array.isArray(p.denyTools) || !p.denyTools.every((tool: unknown) => typeof tool === "string") ||
     typeof p.identityInSystemPrompt !== "boolean" || typeof p.autoExit !== "boolean" || typeof p.interactive !== "boolean" ||
+    (p.completionMode !== undefined && p.completionMode !== "explicit") ||
     !["direct", "artifact"].includes(p.taskDelivery) ||
     !plan || ![plan.provider, plan.modelId, plan.model, plan.modelSource, plan.thinkingSource].every((v) => typeof v === "string" && v.length > 0) ||
     !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(plan.thinking)) {

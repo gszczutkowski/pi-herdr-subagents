@@ -30,6 +30,7 @@ interface PendingDelivery {
 
 export interface DeliveryState {
   onEnvelope?: (runId: string, envelope: DeliveryEnvelope) => void;
+  onPark?: (store: PendingDelivery["store"], error: string) => void;
   api?: Pick<ExtensionAPI, "sendMessage">;
   store?: import("./runtime-store.ts").RuntimeStore;
   persistenceError?: string;
@@ -104,6 +105,7 @@ function parkDelivery(state: DeliveryState, id: string, entry: PendingDelivery,
   entry.parked = true;
   entry.failure = { stage, error: `Delivery ${id} paused at ${stage}: ${String(error)}` };
   state.persistenceError = entry.failure.error;
+  try { state.onPark?.(entry.store, entry.failure.error); } catch { /* Diagnostics cannot interrupt delivery bookkeeping. */ }
 }
 
 /** Per-event errors survive later failures so recovery reports retain the actual stage. */

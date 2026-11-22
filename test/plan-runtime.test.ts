@@ -274,6 +274,8 @@ test("registered task-bound spawn, live/closed resume, failure isolation and res
     assert.equal(read().tasks[0].status, "accepted");
     enqueueSubagentCompletion(child, { ...result(child, "late-ping"), keepOpen: true, ping: { name: child.name, message: "Stale blocker" } });
     assert.equal(read().tasks[0].status, "accepted", "late ping cannot reopen an accepted task");
+    assert.equal(sent.at(-1).details.keepOpen, true);
+    assert.doesNotMatch(sent.at(-1).content, /Resume: pi --session/, "never direct the parent to open another writer for a live ping");
     const binding = child.planTask!;
     const originalLeaf = sm.getLeafId()!;
     const sourcePlan = read();

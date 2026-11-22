@@ -54,6 +54,7 @@ export function interpretExitSidecar(data: unknown): CompletionResult {
     return {
       reason: "ping",
       exitCode: 0,
+      ...(payload.keepOpen === true ? { keepOpen: true } : {}),
       ping: {
         name: typeof payload.name === "string" ? payload.name : "subagent",
         message: typeof payload.message === "string" ? payload.message : "",

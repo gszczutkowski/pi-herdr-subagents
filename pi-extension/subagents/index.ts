@@ -10,7 +10,7 @@ import { resolveSubagentCwd } from "./paths.ts";
 import { resolveRoleInstructions } from "./role-instructions.ts";
 import { shellComment } from "./shell.ts";
 import { persistLaunchProfile, persistProfileBinding, readPiLaunchProfile, resolveLaunchProfile, resumeLaunchContext } from "./launch-profile.ts";
-import { continueLiveChild } from "./live-continuation.ts";
+import { continueLiveChild, hasAcceptedContinuation } from "./live-continuation.ts";
 import { auditSession, assertSessionWriters } from "./session-audit.ts";
 import { readChildIdentity } from "./recovery-identity.ts";
 import { closeOwnedChild, type CloseResult } from "./close-control.ts";
@@ -43,7 +43,7 @@ import {
   setPaneTask,
 } from "./terminal.ts";
 import { waitForCompletion, RetainedCompletionIndex } from "./completion.ts";
-import { canonicalSessionPath, reserveSession, releaseSession, sessionOwners } from "./ownership.ts";
+import { canonicalSessionPath, reserveSession, releaseSession, sessionOwners, type SessionOwner } from "./ownership.ts";
 import {
   buildAuthenticatedModelCatalog,
   resolveRuntimePlan,
@@ -66,6 +66,7 @@ import { registerPayloadDiagnostics } from "./payload-diagnostics.ts";
 import { registerCheckpointContext, registerContextCheckpoint } from "./context-checkpoint.ts";
 import { registerPlanContext } from "./plan-context.ts";
 import { getAgentConfigDir, loadAgentDefaults, discoverAgentDefinitions, buildAvailableAgentCatalog, type AgentDefaults, type SubagentSessionMode } from "./discovery.ts";
+import { DELEGATION_PAUSED, DELEGATION_WAIT_QUERY, type DelegationPause, type DelegationWaitQuery } from "./delegation-wait.ts";
 import { approveProjectAgentDirectory, assertProjectApprovalPermitted, authorizedDiscovery, sourceAuthorized, assertAgentDirectoryAuthorized, assertDefinitionAuthorized, type TrustContext } from "./project-trust.ts";
 
 import {
@@ -447,6 +448,8 @@ interface RunningSubagent {
   sentinelFile?: string;
   completionRunId?: string;
   hasTurnResult?: boolean;
+  /** A locally published follow-up, independent of the historical keepOpen result. */
+  delegatedContinuation?: { requestId: string; owner: SessionOwner };
   completionIndex?: RetainedCompletionIndex;
   observationError?: string;
   retryObservation?: () => void;
@@ -590,6 +593,9 @@ async function recoverParentRuntime(ctx: ExtensionContext): Promise<void> {
     }
     runtime.stopRecovery?.();
     const stopRecovery = await reconcileRuntime(store, (run, evidence) => {
+      // Recovery may commit this event before the preserved live watcher polls.
+      const live = runningSubagents.get(run.id);
+      if (live?.durableStore === store) live.delegatedContinuation = undefined;
       const running: RunningSubagent = { ...run, durableStore: store, surface: "", interactive: false,
         lifecycle: createLifecycle(run.startTime), runtimePlan: undefined, terminalActionsAllowed: false };
       enqueueSubagentCompletion(running, { ...evidence, name: run.name, task: run.task,
@@ -599,7 +605,9 @@ async function recoverParentRuntime(ctx: ExtensionContext): Promise<void> {
       maxEventsPerPass: 100,
       onError: failure => {
         const current = runtime.latestCtx;
-        if (current?.hasUI) current.ui.notify(`Subagent supervision paused${failure.runId ? ` (${failure.runId})` : ""}: ${failure.error}. Use /subagents-reconcile after fixing storage.`, "warning");
+        const message = `Subagent supervision paused${failure.runId ? ` (${failure.runId})` : ""}: ${failure.error}. Use /subagents-reconcile after fixing storage.`;
+        reportDelegationPause(store, message);
+        if (current?.hasUI) current.ui.notify(message, "warning");
       },
     });
     if (runtime.store !== store || !ownsActiveBranch(runtime.latestCtx, manifest.parent)) { stopRecovery(); return; }
@@ -626,6 +634,28 @@ function detachRuntimeWatchers(): void {
 
 const delivery = runtime.delivery ??= createDeliveryState();
 delivery.handedOff ??= new Set();
+
+function reportDelegationPause(store: RuntimeStore | undefined, reason: string): void {
+  if (process.env.PI_SUBAGENT_COMPLETION_MODE !== "explicit" || !store || runtime.store !== store) return;
+  const ctx = runtime.latestCtx;
+  try {
+    if (ctx && ownsActiveBranch(ctx, store.snapshot().parent)) {
+      runtime.pi?.events?.emit(DELEGATION_PAUSED, { sessionManager: ctx.sessionManager, reason } satisfies DelegationPause);
+    }
+  } catch { /* Reporting cannot interrupt the original supervision path. */ }
+}
+
+function hasSupervisedContinuation(child: RunningSubagent): boolean {
+  const followUp = child.delegatedContinuation;
+  if (!followUp) return false;
+  const { owner, requestId } = followUp;
+  try {
+    // A reservation/claim is not acceptance. Read the same run-bound receipt
+    // as reconciliation, including late acknowledgements, without clearing a fence.
+    return owner.dispatched && owner.runId === child.id && owner.surface === child.surface && !owner.closeRequestId &&
+      sessionOwners.get(canonicalSessionPath(child.sessionFile)) === owner && hasAcceptedContinuation(child, requestId);
+  } catch { return false; }
+}
 
 function enqueueCompletion(running: RunningSubagent, message: Parameters<ExtensionAPI["sendMessage"]>[0], result?: SubagentResult) {
   // Independent event lifecycles preserve failed handoffs across later turns.
@@ -685,13 +715,17 @@ export function enqueueSubagentCompletion(running: RunningSubagent, result: Suba
     result.ping?.message ?? result.errorMessage ?? result.summary ?? "Result available",
     result.eventId ?? `${result.sessionFile}:${result.elapsed}`, result.sessionFile ? [result.sessionFile] : []);
   if (result.ping) {
-    const sessionRef = `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`;
+    const followUp = result.keepOpen
+      ? "Still supervising delegated work. Use subagent_resume with a response in the existing session; do not launch another writer."
+      : `Resume: pi --session ${result.sessionFile}`;
+    const sessionRef = `\n\nSession: ${result.sessionFile}\n${followUp}`;
     enqueueCompletion(running, {
       customType: "subagent_ping",
       content: `Sub-agent "${result.ping.name}" needs help (${formatElapsed(result.elapsed)}):\n\n${result.ping.message}${sessionRef}`,
       display: true,
       details: {
         name: result.ping.name, message: result.ping.message,
+        ...(result.keepOpen ? { keepOpen: true } : {}),
         agent: running.agent, sessionFile: result.sessionFile, lineage: running.lineage,
       },
     }, result);
@@ -745,7 +779,10 @@ export function observeSubagentCompletion(
 ): Promise<void> {
   const reportError = (error: unknown) => {
     try { enqueueSubagentError(running, error, !!resume); }
-    catch (failure) { delivery.persistenceError = String(failure); }
+    catch (failure) {
+      delivery.persistenceError = String(failure);
+      reportDelegationPause(running.durableStore, `Subagent result publication paused: ${String(failure)}`);
+    }
   };
   return completion.then(
     (result) => {
@@ -1114,6 +1151,8 @@ async function handleSubagentInterrupt(
     };
   }
   // This remains a LOCAL request marker, not evidence of aborted settlement.
+  // Once interrupt is requested this follow-up is no longer a promised wakeup.
+  running.delegatedContinuation = undefined;
   running.lifecycle = markInterruptRequested(ensureLifecycle(running), Date.now());
   updateWidget();
 
@@ -1249,6 +1288,9 @@ async function launchSubagent(
   const driver = getHarnessDriver(agentDefs?.cli ?? "pi");
   const launchBehavior = resolveLaunchBehavior(params, agentDefs);
   validateHarnessLaunch(driver, launchBehavior.sessionMode, params.resumeSessionId);
+  if (agentDefs?.completionMode === "explicit" && driver.id !== "pi") {
+    throw new Error("completion-mode: explicit requires a Pi-backed subagent.");
+  }
   driver.validateRuntimePlan?.(runtimePlan, parentThinking);
 
   const sessionFile = ctx.sessionManager.getSessionFile();
@@ -1430,6 +1472,7 @@ async function waitForObservedCompletion(running: RunningSubagent, signal: Abort
     } catch (error) {
       if (signal.aborted) throw error;
       running.observationError = `Completion observation paused/uncertain: ${String(error)}. Use /subagents-reconcile after fixing storage.`;
+      reportDelegationPause(running.durableStore, running.observationError);
       try { if (runtime.latestCtx?.hasUI) runtime.latestCtx.ui.notify(`${running.name}: ${running.observationError}`, "warning"); } catch { /* Diagnostic observers cannot end supervision. */ }
       // Preserve the child, ownership and exact retained evidence. A failed read
       // is neither child completion nor permission to close its terminal.
@@ -1476,12 +1519,19 @@ async function watchSubagent(
       },
     });
 
+    const supervisionEnded = running.hasTurnResult && !result.eventId &&
+      (result.reason === "sentinel" || running.lifecycle.pane.kind === "missing");
+    const followUpEndedWithoutResult = supervisionEnded && hasSupervisedContinuation(running);
+    // Retire on observation, before handoff or acknowledgement. A fast result
+    // must not leave a stale wake source when the receipt is read later.
+    running.delegatedContinuation = undefined;
     // Only a shell trailer proves process exit; completion delivery alone does not.
     if ((result.reason === "sentinel" && !running.sentinelFile) || running.lifecycle.pane.kind === "missing") {
       releaseSession(sessionFile, running.id);
     }
-    const supervisionEnded = running.hasTurnResult && !result.eventId &&
-      (result.reason === "sentinel" || running.lifecycle.pane.kind === "missing");
+    if (followUpEndedWithoutResult) {
+      reportDelegationPause(running.durableStore, `Subagent "${name}" exited without a retained continuation result.`);
+    }
     if (result.keepOpen) running.hasTurnResult = true;
     const detectedAt = Date.now();
     if (!result.keepOpen) running.lifecycle = markCompletionDetected(running.lifecycle, result, detectedAt);
@@ -1588,6 +1638,7 @@ async function watchSubagent(
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
     };
   } catch (err: any) {
+    running.delegatedContinuation = undefined;
     try {
       safeClose();
     } catch {}
@@ -1622,6 +1673,28 @@ async function watchSubagent(
 }
 
 export default function subagentsExtension(pi: ExtensionAPI) {
+  const explicitCompletion = process.env.PI_SUBAGENT_COMPLETION_MODE === "explicit";
+  delivery.onPark = explicitCompletion ? reportDelegationPause : undefined;
+  const stopDelegationWaitQuery = explicitCompletion
+    ? pi.events?.on(DELEGATION_WAIT_QUERY, (data) => {
+      const query = data as DelegationWaitQuery;
+      const ctx = runtime.latestCtx;
+      const store = runtime.store;
+      if (!ctx || query?.sessionManager !== ctx.sessionManager || runtime.pi !== pi || delivery.api !== pi ||
+          !store || runtime.recoveryError || runtime.treeSuspension) return;
+      try { store.assertCustody(); } catch { return; }
+      // A parked or already delivered result is not a future wakeup. An idle
+      // keepOpen process only qualifies for a freshly accepted continuation.
+      const pending = [...delivery.pending.values()].some(entry => entry.store === store && !entry.parked &&
+        entry.envelope.options.triggerTurn && entry.owner.lifecycle.delivery === "pending" &&
+        entry.owner.source?.lifecycle.delivery !== "suppressed");
+      const supervised = [...runningSubagents.values()].some(child => child.durableStore === store &&
+        child.abortController && !child.abortController.signal.aborted && !child.observationError &&
+        child.terminalActionsAllowed !== false && child.lifecycle.delivery === "pending" &&
+        (child.lifecycle.process.kind === "starting" || child.lifecycle.process.kind === "running") &&
+        (child.hasTurnResult ? hasSupervisedContinuation(child) : child.lifecycle.turn.kind !== "interrupted"));
+      if (pending || supervised) query.confirm();
+    }) : undefined;
   registerSubagentAssignmentRenderer(pi);
   runtime.plans = registerPlanTools(pi, { publish: false });
   const checkpoints = registerContextCheckpoint(pi, runtime.plans, { publish: false });
@@ -1817,6 +1890,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
   // Clean up on session shutdown
   pi.on("session_shutdown", (event, _ctx) => {
+    stopDelegationWaitQuery?.();
+    if (explicitCompletion) delivery.onPark = undefined;
     stopPlanHistory();
     // Invalidate session-bound API immediately, including the shutdown/factory gap.
     pauseDeliveries(delivery);
@@ -2355,27 +2430,38 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           const continuationContract = resolveResumeContract(runtime.plans!, ctx, profile.assignmentContract,
             params.planTask, child.planTask ?? profile.planTask);
           const continuationParams = { ...params, message: contractTask(params.message, continuationContract) };
-          const result = await continueLiveChild(liveOwner, child, continuationParams, { inspect: inspectPane,
-            settled: (requestId) => {
-              if (runtime.treeSuspension || child.terminalActionsAllowed === false
-                || sessionOwners.get(params.sessionPath) !== liveOwner) throw new Error("Continuation custody changed");
-              child.durableStore?.settleContinuation(child.id, requestId);
-            }, beforeSend: () => {
-            if (runtime.treeSuspension || child.terminalActionsAllowed === false) throw new Error("Terminal custody was detached during continuation");
-            child.durableStore?.assertCustody();
-            _signal?.throwIfAborted();
-            validateProfileSources();
-            assertResumeWriters(params.sessionPath);
-            // Validate after async inspection, immediately before dispatch.
-            resolveResumeContract(runtime.plans!, ctx, continuationContract, params.planTask, child.planTask ?? profile.planTask);
-            child.planTask = bindPlanRun(runtime.plans!, ctx, child.id, params.planTask, child.planTask);
-            if (child.planTask) {
-              if (!child.durableStore) throw new Error("Task-bound continuation requires durable custody");
-              child.durableStore.bindRun(child.id, child.planTask, continuationContract);
-              persistProfileBinding(child.sessionFile, child.planTask, continuationContract);
+          const validateContinuationCustody = () => {
+            if (runtime.treeSuspension || child.terminalActionsAllowed === false || child.durableStore !== runtime.store ||
+                sessionOwners.get(params.sessionPath) !== liveOwner || liveOwner.runId !== child.id ||
+                liveOwner.surface !== child.surface || !liveOwner.dispatched) {
+              throw new Error("Continuation custody changed");
             }
-            if (liveOwner.continuationRequestId) child.durableStore?.continuation(child.id, liveOwner.continuationRequestId);
-          } });
+            child.durableStore?.assertCustody();
+          };
+          const result = await continueLiveChild(liveOwner, child, continuationParams, {
+            inspect: inspectPane,
+            settled: (requestId) => {
+              validateContinuationCustody();
+              child.durableStore?.settleContinuation(child.id, requestId);
+            },
+            beforeSend: (requestId) => {
+              validateContinuationCustody();
+              if (runningSubagents.get(child.id) !== child) throw new Error("Continuation child is no longer tracked");
+              _signal?.throwIfAborted();
+              validateProfileSources();
+              assertResumeWriters(params.sessionPath);
+              // Validate after async inspection, immediately before dispatch.
+              resolveResumeContract(runtime.plans!, ctx, continuationContract, params.planTask, child.planTask ?? profile.planTask);
+              child.planTask = bindPlanRun(runtime.plans!, ctx, child.id, params.planTask, child.planTask);
+              if (child.planTask) {
+                if (!child.durableStore) throw new Error("Task-bound continuation requires durable custody");
+                child.durableStore.bindRun(child.id, child.planTask, continuationContract);
+                persistProfileBinding(child.sessionFile, child.planTask, continuationContract);
+              }
+              child.durableStore?.continuation(child.id, requestId);
+              if (explicitCompletion && child.hasTurnResult) child.delegatedContinuation = { requestId, owner: liveOwner };
+            },
+          });
           recordHistory(child.lineage, child.id, "continuation", `Parent continuation (${result.status}): ${params.message ?? ""}`,
             result.requestId, [child.sessionFile]);
           return {

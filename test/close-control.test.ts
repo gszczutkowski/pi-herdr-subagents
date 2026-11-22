@@ -179,15 +179,18 @@ test("child validates wrong run/process, busy state, immutable claims and replay
   if (own.kind !== "present") return;
   const identity = { ...f.identity, process: own.identity };
   put(`${runCompletionFile(f.child.sessionFile, "run")}.identity.json`, identity);
-  let shutdowns = 0, idle = true, draft = "";
+  let shutdowns = 0, idle = true, draft = "", delegated = true;
   const ctx = { hasUI: true, mode: "tui", ui: { getEditorText: () => draft },  sessionManager: { getHeader: () => ({ id: "header" }), getSessionFile: () => f.child.sessionFile },
     isIdle: () => idle, hasPendingMessages: () => false, shutdown: () => { shutdowns++; } };
   try {
     Object.assign(process.env, env);
-    registerCloseControl({ on: (name: string, fn: Function) => handlers.set(name, fn) } as any);
+    registerCloseControl({ on: (name: string, fn: Function) => handlers.set(name, fn) } as any, () => delegated);
     rmSync(f.control, { recursive: true });
     assert.equal(existsSync(f.control), false);
     handlers.get("session_start")!({}, ctx);
+    handlers.get("agent_settled")!({}, ctx);
+    assert.equal(existsSync(join(f.control, "current.json")), false, "local idle is not CLOSE authority during delegation");
+    delegated = false;
     handlers.get("agent_settled")!({}, ctx);
     const pointer = read(join(f.control, "current.json"));
     const state = read(join(f.control, pointer.file));
@@ -199,6 +202,11 @@ test("child validates wrong run/process, busy state, immutable claims and replay
     };
     assert.equal((await request({ runId: "wrong" })).ack.status, "rejected");
     assert.equal((await request({ process: { ...own.identity, birth: "wrong" } })).ack.status, "rejected");
+    delegated = true;
+    const waiting = await request();
+    assert.equal(waiting.ack.status, "rejected", "recheck delegation even after an idle token was issued");
+    assert.equal(existsSync(join(f.control, `${waiting.requestId}.claim.json`)), false);
+    delegated = false;
     idle = false;
     assert.equal((await request()).ack.status, "rejected");
     assert.equal(shutdowns, 0);

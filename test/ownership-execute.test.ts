@@ -7,6 +7,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { after, test, mock } from "node:test";
+import { randomUUID } from "node:crypto";
+import { canWaitForDelegation, DELEGATION_PAUSED } from "../pi-extension/subagents/delegation-wait.ts";
 
 // Exercise actual tool/terminal code, replacing only OS boundaries (no live herdr).
 let powershellResponder: ((command: string) => string) | undefined;
@@ -72,7 +74,7 @@ const { canonicalSessionPath, reserveSession, releaseSession, sessionOwners } = 
 const { persistLaunchProfile, resolveLaunchProfile } = await import("../pi-extension/subagents/launch-profile.ts");
 const { runCompletionFile } = await import("../pi-extension/subagents/run-artifacts.ts");
 const { runInPane, runScriptInPane } = await import("../pi-extension/subagents/terminal.ts");
-const { CONTINUE_COMMAND, continuationCommand, registerLiveContinuation } = await import("../pi-extension/subagents/live-continuation.ts");
+const { CONTINUE_COMMAND, CONTINUATION_TRANSPORT, continuationCommand, continuationDir, registerLiveContinuation } = await import("../pi-extension/subagents/live-continuation.ts");
 const { registerInterruptControl } = await import("../pi-extension/subagents/interrupt-control.ts");
 const keys = ["HERDR_ENV", "HERDR_WORKSPACE_ID", "HC_TERMINAL_ID", "HC_TERMINAL_SOCKET", "PI_SUBAGENT_SHELL_READY_DELAY_MS", "PI_DENY_TOOLS", "PI_SUBAGENT_LAYOUT"];
 const saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
@@ -89,7 +91,7 @@ after(() => {
   }
 });
 
-async function fixture(run: (f: any) => Promise<void>) {
+async function fixture(run: (f: any) => Promise<void>, explicit = false) {
   const dir = fs.mkdtempSync(join(tmpdir(), "ownership-execute-"));
   const agentDir = join(dir, ".pi", "agent");
   fs.mkdirSync(agentDir, { recursive: true });
@@ -110,13 +112,21 @@ async function fixture(run: (f: any) => Promise<void>) {
   const commands = new Map<string, any>();
   const branch: any[] = [];
   const handlers = new Map<string, any>();
-  const api: any = new Proxy({}, { get: (_target, key) => key === "registerTool" ? (tool: any) => tools.set(tool.name, tool)
+  const subscribers = new Map<string, (data: unknown) => void>();
+  const events = {
+    on: (event: string, fn: (data: unknown) => void) => { subscribers.set(event, fn); return () => subscribers.delete(event); },
+    emit: (event: string, data: unknown) => subscribers.get(event)?.(data),
+  };
+  const api: any = new Proxy({}, { get: (_target, key) => key === "events" ? events
+    : key === "registerTool" ? (tool: any) => tools.set(tool.name, tool)
     : key === "on" ? (event: string, handler: any) => handlers.set(event, handler)
     : key === "registerCommand" ? (name: string, command: any) => commands.set(name, command)
     : key === "getAllTools" ? () => []
     : key === "appendEntry" ? (customType: string, data: any) => branch.push({ id: "fixture-custody", type: "custom", customType, data })
     : key === "sendMessage" ? (message: any) => { if (failNotifications) throw new Error("offline"); handoffs.push(message); }
     : key === "getThinkingLevel" ? () => "off" : () => {} });
+  const oldMode = process.env.PI_SUBAGENT_COMPLETION_MODE;
+  if (explicit) process.env.PI_SUBAGENT_COMPLETION_MODE = "explicit";
   extension(api);
   const ctx = {
     hasUI: false, scopedModels: [], cwd: dir, isProjectTrusted: () => true, model: { provider: "test", id: "model" },
@@ -125,7 +135,8 @@ async function fixture(run: (f: any) => Promise<void>) {
   };
   const resume = (params = {}) => tools.get("subagent_resume").execute("call", { sessionPath: session, ...params }, undefined, undefined, ctx);
   const interrupt = (id: string) => tools.get("subagent_interrupt").execute("interrupt", { id }, undefined, undefined, ctx);
-  try { await run({ dir, session, ctx, branch, tools, commands, resume, interrupt, handoffs,
+  try { await run({ dir, session, ctx, branch, tools, commands, resume, interrupt, handoffs, events,
+    canWait: () => canWaitForDelegation(api, ctx),
     start: () => handlers.get("session_start")({ reason: "reload" }, ctx),
     shutdown: () => handlers.get("session_shutdown")({ reason: "reload" }, ctx),
     reload: () => { extension(api); handlers.get("session_start")({ reason: "reload" }, ctx); },
@@ -141,6 +152,7 @@ async function fixture(run: (f: any) => Promise<void>) {
     handlers.get("session_shutdown")({ reason: "exit" }, ctx);
     for (const [path, owner] of sessionOwners) if (!existingOwners.has(path)) releaseSession(path, owner.runId);
     if (oldAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = oldAgentDir;
+    if (oldMode === undefined) delete process.env.PI_SUBAGENT_COMPLETION_MODE; else process.env.PI_SUBAGENT_COMPLETION_MODE = oldMode;
     fs.rmSync(dir, { recursive: true, force: true });
   }
 }
@@ -740,3 +752,91 @@ test("keepOpen first result retains watcher and owner; parent follow-up and manu
   assert.equal(sessionOwners.has(session), false);
   assert.equal(handoffs.length, 3);
 }));
+
+test("explicit wait tracks accepted keepOpen follow-ups, not old results, rejected requests or replay", { timeout: 15_000 }, async () => fixture(async (f: any) => {
+  const { session, resume, handoffs, canWait, ctx, branch, events } = f;
+  ctx.sessionManager.getHeader = () => ({ id: "coordinator" });
+  ctx.sessionManager.getBranch = () => branch;
+  inspect = async pane => JSON.stringify({ result: { pane: { pane_id: pane, agent_status: "idle" } } });
+  await f.start();
+  const started = await resume();
+  const child = __test__.runningSubagents.get(started.details.id)!;
+  const owner = sessionOwners.get(session)!;
+  const dir = continuationDir(child.activityFile!);
+  const pauses: any[] = [];
+  events.on(DELEGATION_PAUSED, (entry: unknown) => pauses.push(entry));
+  fs.mkdirSync(dir);
+  const artifacts = `${runCompletionFile(session, child.id)}.events`;
+  fs.mkdirSync(artifacts);
+  const result = async (eventId: string) => {
+    const prior = handoffs.length;
+    fs.writeFileSync(join(artifacts, `${eventId}.json`), JSON.stringify({ type: "done", runId: child.id, eventId, summary: eventId, keepOpen: true }));
+    await until(() => handoffs.length > prior);
+    assert.equal(handoffs.length, prior + 1);
+    assert.equal(handoffs.at(-1).details.response, eventId);
+  };
+  const begin = async (message: string) => {
+    fs.writeFileSync(join(dir, "state.json"), JSON.stringify({ runId: child.id, sessionFile: session,
+      idleToken: randomUUID(), transport: CONTINUATION_TRANSPORT, state: "settled-idle" }));
+    const pending = resume({ message });
+    // Attach immediately: tests below deliberately exercise negative receipts.
+    void pending.catch(() => {});
+    const artifact = (ext: string) => join(dir, `${owner.continuationRequestId}.${ext}.json`);
+    await until(() => !!owner.continuationRequestId && fs.existsSync(artifact("request")));
+    const request = JSON.parse(fs.readFileSync(artifact("request"), "utf8"));
+    const receiptPath = artifact("result");
+    const claimPath = artifact("claim");
+    return { pending, requestId: request.requestId,
+      receipt: (status: string) => fs.writeFileSync(receiptPath, JSON.stringify({ ...request, status })),
+      claim: () => fs.writeFileSync(claimPath, JSON.stringify({ runId: child.id, requestId: request.requestId, status: "dispatching" })) };
+  };
+
+  assert.equal(canWait(), true, "initial launch is still a wake source");
+  await result("first");
+  assert.equal(canWait(), false, "an idle keepOpen pane is not delegated work");
+
+  const rejected = await begin("rejected");
+  assert.equal(canWait(), false, "a published request without receipt is uncertain");
+  rejected.receipt("rejected");
+  await assert.rejects(rejected.pending, /Child rejected/);
+  assert.equal(canWait(), false);
+  assert.equal(owner.continuationRequestId, undefined);
+
+  const accepted = await begin("accepted");
+  accepted.receipt("accepted");
+  assert.equal(canWait(), false, "acceptance without the durable claim is not proof");
+  accepted.claim();
+  assert.equal(canWait(), true, "the read-only query can use an authenticated receipt");
+  assert.equal(owner.continuationRequestId, accepted.requestId, "query never consumes the ownership fence");
+  assert.equal((await accepted.pending).details.status, "continued");
+  assert.equal(canWait(), true, "a confirmed follow-up remains a wake source after reconciliation");
+  assert.equal(child.hasTurnResult, true, "historical keepOpen evidence is preserved");
+  sessionOwners.set(session, { ...owner });
+  try { assert.equal(canWait(), false, "a replacement owner cannot inherit the wake source"); }
+  finally { sessionOwners.set(session, owner); }
+  await result("second");
+  assert.equal(canWait(), false, "a handed-off continuation result retires the wake source");
+
+  const fast = await begin("fast result, delayed receipt");
+  fast.claim();
+  await result("fast");
+  fast.receipt("accepted");
+  assert.equal((await fast.pending).details.status, "continued");
+  assert.equal(canWait(), false, "a late acknowledgement cannot resurrect a delivered follow-up");
+
+  const late = await begin("late acceptance");
+  assert.equal((await late.pending).details.status, "pending");
+  assert.equal(owner.continuationRequestId, late.requestId);
+  assert.equal(canWait(), false, "a timed-out request is not a wake source");
+  late.claim();
+  late.receipt("accepted");
+  assert.equal((await resume({ message: "recheck only, never send" })).details.requestId, late.requestId);
+  assert.equal(fs.readdirSync(dir).filter(name => name.endsWith(".request.json")).length, 4);
+  assert.equal(canWait(), true, "reconciliation can confirm the original outstanding request");
+  inspect = async () => JSON.stringify({ error: { code: "pane_not_found" } });
+  await until(() => !__test__.runningSubagents.has(child.id));
+  assert.equal(canWait(), false);
+  assert.equal(handoffs.length, 3, "do not re-send the last result as a process-exit result");
+  assert.equal(pauses.length, 1);
+  assert.match(pauses[0].reason, /exited without a retained continuation result/);
+}, true));

@@ -117,13 +117,11 @@ interface LiveChild {
   activityFile?: string; lifecycle: SubagentLifecycle; hasTurnResult?: boolean;
 }
 
-/** Reconcile an existing request only. No transport, replay, or new request is possible here. */
-export function reconcileContinuation(owner: SessionOwner,
-  child: { id: string; sessionFile: string; activityFile?: string },
-  persist?: (requestId: string) => void,
-): { requestId: string; status: "accepted" | "rejected"; reason?: string } | undefined {
-  const requestId = owner.continuationRequestId;
-  if (!requestId || !uuid.test(requestId) || owner.runId !== child.id || !child.activityFile) return;
+type ContinuationChild = Pick<LiveChild, "id" | "sessionFile" | "activityFile">;
+
+function readContinuationReceipt(child: ContinuationChild, requestId: string):
+  { requestId: string; status: "accepted" | "rejected"; reason?: string } | undefined {
+  if (!uuid.test(requestId) || !child.activityFile) return;
   const dir = continuationDir(child.activityFile);
   const request = read(join(dir, `${requestId}.request.json`));
   const result = read(join(dir, `${requestId}.result.json`));
@@ -136,19 +134,33 @@ export function reconcileContinuation(owner: SessionOwner,
     const claim = read(join(dir, `${requestId}.claim.json`));
     if (claim?.runId !== child.id || claim?.requestId !== requestId || claim?.status !== "dispatching") return;
   }
+  return { requestId, status: result.status, ...(typeof result.reason === "string" ? { reason: result.reason } : {}) };
+}
+
+/** Read-only acceptance evidence; never consumes the ownership reservation. */
+export function hasAcceptedContinuation(child: ContinuationChild, requestId: string): boolean {
+  return readContinuationReceipt(child, requestId)?.status === "accepted";
+}
+
+/** Reconcile an existing request only. No transport, replay, or new request is possible here. */
+export function reconcileContinuation(owner: SessionOwner, child: ContinuationChild, persist?: (requestId: string) => void) {
+  const requestId = owner.continuationRequestId;
+  if (!requestId || owner.runId !== child.id) return;
+  const receipt = readContinuationReceipt(child, requestId);
+  if (!receipt) return;
   // Persist resolution before dropping the in-memory fence. A failed durable
   // write leaves the original reservation intact for an explicit recheck.
   persist?.(requestId);
   if (owner.continuationRequestId !== requestId) throw new Error("Continuation ownership changed during reconciliation");
   delete owner.continuationRequestId;
-  return { requestId, status: result.status, ...(typeof result.reason === "string" ? { reason: result.reason } : {}) };
+  return receipt;
 }
 
 /** Reserve synchronously before inspection/transport awaits; never launch a replacement on failure. */
 export async function continueLiveChild(owner: SessionOwner, child: LiveChild | undefined,
   params: { message?: string; name?: string },
   transport: { inspect: (surface: string) => Promise<PaneInspection>; send?: (surface: string, text: string) => void;
-    beforeSend?: () => void; settled?: (requestId: string) => void; timeoutMs?: number },
+    beforeSend?: (requestId: string) => void; settled?: (requestId: string) => void; timeoutMs?: number },
 ): Promise<{ requestId: string; status: "accepted" | "pending" }> {
   if (owner.closeRequestId) throw new Error(`Close ${owner.closeRequestId} is pending/retained; do not continue or relaunch this process.`);
   if (owner.continuationRequestId) {
@@ -198,13 +210,17 @@ export async function continueLiveChild(owner: SessionOwner, child: LiveChild | 
     if (state.transport !== CONTINUATION_TRANSPORT) {
       throw new Error("Child lacks artifact continuation support. Update/reload the child and complete a turn before continuing; no terminal fallback was attempted.");
     }
-    transport.beforeSend?.(); // Validate binding/custody BEFORE making a request observable.
+    if (owner.continuationRequestId !== requestId) throw new Error("Continuation ownership changed during inspection");
+    transport.beforeSend?.(requestId); // Validate binding/custody BEFORE making a request observable.
     dispatched = true; // A failed publication/acknowledgement is conservatively uncertain.
     publish(join(dir, `${requestId}.request.json`), {
       runId: child.id, requestId, sessionFile: state.sessionFile, idleToken: state.idleToken, message: params.message,
     });
     const deadline = Date.now() + (transport.timeoutMs ?? 3000);
     do {
+      // A concurrent recheck can settle this request. This waiter must never
+      // consume a different reservation established in the meantime.
+      if (owner.continuationRequestId !== requestId) break;
       const result = reconcileContinuation(owner, child, transport.settled);
       if (result?.status === "accepted") return { requestId, status: "accepted" };
       if (result?.status === "rejected") throw new Error(`Child rejected continuation: ${result.reason}`);
@@ -213,6 +229,6 @@ export async function continueLiveChild(owner: SessionOwner, child: LiveChild | 
     } while (Date.now() <= deadline);
     return { requestId, status: "pending" };
   } finally {
-    if (!dispatched) delete owner.continuationRequestId;
+    if (!dispatched && owner.continuationRequestId === requestId) delete owner.continuationRequestId;
   }
 }

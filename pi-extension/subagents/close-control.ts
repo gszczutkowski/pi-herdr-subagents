@@ -33,7 +33,7 @@ function editorSafe(ctx: ExtensionContext): boolean {
 }
 
 /** A distinct non-model CLOSE capability. Never terminal input, Escape, or force kill. */
-export function registerCloseControl(pi: ExtensionAPI): void {
+export function registerCloseControl(pi: ExtensionAPI, delegationPending: (ctx: ExtensionContext) => boolean = () => false): void {
   const runId = process.env.PI_SUBAGENT_ID;
   const session = process.env.PI_SUBAGENT_SESSION;
   const activity = process.env.PI_SUBAGENT_ACTIVITY_FILE;
@@ -64,9 +64,9 @@ export function registerCloseControl(pi: ExtensionAPI): void {
       const valid = request?.capability === CLOSE_CAPABILITY && request.requestId === requestId && matches(request, identity) &&
         canonicalSessionPath(ctx.sessionManager.getSessionFile() ?? "") === identity!.sessionFile &&
         ctx.sessionManager.getHeader()?.id === identity!.headerId;
-      if (!valid || !idleToken || request.idleToken !== idleToken || !ctx.isIdle() || ctx.hasPendingMessages() || !editorSafe(ctx)) {
+      if (!valid || !idleToken || request.idleToken !== idleToken || !ctx.isIdle() || ctx.hasPendingMessages() || delegationPending(ctx) || !editorSafe(ctx)) {
         publish(ack, { ...identity, capability: CLOSE_CAPABILITY, idleToken: request?.idleToken,
-          runId, requestId, status: "rejected", dispatched: false, reason: valid ? "Child is busy, has a draft/unverifiable editor, or idle proof expired" : "Wrong run/session/process identity" });
+          runId, requestId, status: "rejected", dispatched: false, reason: valid ? "Child is busy, awaiting delegated work, has a draft/unverifiable editor, or idle proof expired" : "Wrong run/session/process identity" });
         return;
       }
       publish(claim, { runId, requestId, status: "requested" });
@@ -87,7 +87,7 @@ export function registerCloseControl(pi: ExtensionAPI): void {
   pi.on("agent_start", busy);
   pi.on("agent_settled", (_event, ctx) => {
     busy();
-    if (!watcher || !identity || !ctx.isIdle() || ctx.hasPendingMessages()) return;
+    if (!watcher || !identity || !ctx.isIdle() || ctx.hasPendingMessages() || delegationPending(ctx)) return;
     idleToken = randomUUID();
     // State is per-settlement immutable; a small pointer chooses the newest proof.
     const file = `${idleToken}.idle.json`;

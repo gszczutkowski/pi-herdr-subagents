@@ -327,6 +327,35 @@ test("reservation happens before asynchronous inspection; concurrent resumes can
   } finally { f.cleanup(); }
 });
 
+test("a stale acknowledgement waiter cannot settle a replacement reservation", async () => {
+  const f = fixture();
+  try {
+    f.settle();
+    const dir = continuationDir(f.activityFile);
+    const state = JSON.parse(readFileSync(join(dir, "state.json"), "utf8"));
+    let published!: (requestId: string) => void;
+    const started = new Promise<string>(resolve => { published = resolve; });
+    const waiter = continueLiveChild(f.owner, f.child, { message: "old request" }, {
+      ...f.transport,
+      beforeSend: (requestId) => {
+        // Keep the real child from acknowledging the old request in this fixture.
+        writeFileSync(join(dir, `${requestId}.claim.json`), "{}");
+        published(requestId);
+      },
+      settled: () => assert.fail("The old waiter must not reconcile a different request"),
+    });
+    const originalId = await started;
+    const requestId = randomUUID();
+    const request = { runId: f.runId, requestId, sessionFile: state.sessionFile, idleToken: state.idleToken, message: "new request" };
+    writeFileSync(join(dir, `${requestId}.claim.json`), JSON.stringify({ runId: f.runId, requestId, status: "dispatching" }));
+    writeFileSync(join(dir, `${requestId}.request.json`), JSON.stringify(request));
+    writeFileSync(join(dir, `${requestId}.result.json`), JSON.stringify({ ...request, status: "accepted" }));
+    f.owner.continuationRequestId = requestId;
+    assert.deepEqual(await waiter, { requestId: originalId, status: "pending" });
+    assert.equal(f.owner.continuationRequestId, requestId);
+  } finally { f.cleanup(); }
+});
+
 test("starting, active without aborted proof, finalizing, unknown and non-Pi owners reject without dispatch", async () => {
   const f = fixture();
   try {
