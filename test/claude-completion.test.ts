@@ -231,13 +231,22 @@ printf '%s\\n' '${candidate}' "$@" > interpreter.txt
 `, { mode: 0o755 });
         }
         if (hasStoreRedirector) {
-          // Model the link target Git Bash reports, without requiring Windows symlink privileges.
+          // Model the link target without requiring Windows symlink privileges.
+          // MSYS may pass the resolved executable as a native backslash path;
+          // match the candidate name rather than assuming POSIX separators.
           writeFileSync(join(bin, "readlink"), `#!/bin/bash
 case "$2" in
-  */python3) printf '%s\\n' '/c/Program Files/WindowsApps/Microsoft.DesktopAppInstaller_test/AppInstallerPythonRedirector.exe' ;;
+  *python3) printf '%s\\n' '/c/Program Files/WindowsApps/Microsoft.DesktopAppInstaller_test/AppInstallerPythonRedirector.exe' ;;
   *) exit 1 ;;
 esac
 `, { mode: 0o755 });
+          const bash = findBashExecutable(); assert.ok(bash);
+          for (const executable of ["/fixture/bin/python3", "C:\\fixture\\bin\\python3"]) {
+            const probe = spawnSync(bash, [join(bin, "readlink"), "--", executable], { encoding: "utf8", timeout: 5_000, windowsHide: true });
+            assert.equal(probe.error, undefined);
+            assert.equal(probe.status, 0, probe.stderr);
+            assert.match(probe.stdout.trim(), /\/AppInstallerPythonRedirector\.exe$/);
+          }
         }
         const result = spawnHook('{"last_assistant_message":"done"}\n', { PI_CLAUDE_SENTINEL: "unused" }, dir, bin);
         assert.equal(existsSync(join(dir, "redirector-invoked")), false);
