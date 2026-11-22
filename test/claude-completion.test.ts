@@ -24,15 +24,19 @@ function fixture(entries: unknown[], run: (paths: { dir: string; sentinel: strin
   }
 }
 
-function spawnHook(input: string | undefined, overrides: NodeJS.ProcessEnv, cwd?: string, fixtureBin?: string) {
-  const bash = findBashExecutable();
+function spawnHook(input: string | undefined, overrides: NodeJS.ProcessEnv, cwd?: string, fixtureBin?: string, bash = findBashExecutable()) {
   assert.ok(bash, "Bash is required to run the Claude hook");
   const env = { ...process.env, ...overrides };
   const pathKey = Object.keys(env).find(key => key.toLowerCase() === "path") ?? "PATH";
   const gitTools = join(dirname(bash), "..", "usr", "bin");
   const tools = process.platform === "win32" && existsSync(gitTools) ? gitTools : dirname(bash);
-  env[pathKey] = [fixtureBin, tools, env[pathKey]].filter(Boolean).join(delimiter);
-  const result = spawnSync(bash, [hook], { cwd, input, env, encoding: "utf8", timeout: 5_000, windowsHide: true });
+  env[pathKey] = [tools, env[pathKey]].filter(Boolean).join(delimiter);
+  // Git for Windows's bin/bash.exe prepends its usr/bin before Bash starts.
+  // Put the fixture first inside Bash so the launcher cannot shadow its readlink.
+  const args = fixtureBin
+    ? ["-c", 'bin=$(cd -- "$1" && pwd) || exit; PATH="$bin:$PATH" exec "$BASH" "$2"', "claude-hook-test", fixtureBin, hook]
+    : [hook];
+  const result = spawnSync(bash, args, { cwd, input, env, encoding: "utf8", timeout: 5_000, windowsHide: true });
   assert.equal(result.error, undefined);
   return result;
 }
@@ -232,24 +236,20 @@ printf '%s\\n' '${candidate}' "$@" > interpreter.txt
         }
         if (hasStoreRedirector) {
           // Model the link target without requiring Windows symlink privileges.
-          // MSYS may pass the resolved executable as a native backslash path;
-          // match the candidate name rather than assuming POSIX separators.
+          // Match the candidate name regardless of the path separators.
           writeFileSync(join(bin, "readlink"), `#!/bin/bash
 case "$2" in
   *python3) printf '%s\\n' '/c/Program Files/WindowsApps/Microsoft.DesktopAppInstaller_test/AppInstallerPythonRedirector.exe' ;;
   *) exit 1 ;;
 esac
 `, { mode: 0o755 });
-          const bash = findBashExecutable(); assert.ok(bash);
-          for (const executable of ["/fixture/bin/python3", "C:\\fixture\\bin\\python3"]) {
-            const probe = spawnSync(bash, [join(bin, "readlink"), "--", executable], { encoding: "utf8", timeout: 5_000, windowsHide: true });
-            assert.equal(probe.error, undefined);
-            assert.equal(probe.status, 0, probe.stderr);
-            assert.match(probe.stdout.trim(), /\/AppInstallerPythonRedirector\.exe$/);
-          }
         }
-        const result = spawnHook('{"last_assistant_message":"done"}\n', { PI_CLAUDE_SENTINEL: "unused" }, dir, bin);
-        assert.equal(existsSync(join(dir, "redirector-invoked")), false);
+        // Exercise the Git for Windows launcher even when where.exe finds usr/bin/bash.exe first.
+        const wrapper = hasStoreRedirector && process.platform === "win32" && process.env.ProgramFiles
+          ? join(process.env.ProgramFiles, "Git", "bin", "bash.exe") : undefined;
+        const bash = wrapper && existsSync(wrapper) ? wrapper : undefined;
+        const result = spawnHook('{"last_assistant_message":"done"}\n', { PI_CLAUDE_SENTINEL: "unused" }, dir, bin, bash);
+        assert.equal(existsSync(join(dir, "redirector-invoked")), false, "Store redirector must not be probed or launched");
         assert.equal(result.status, selected ? 0 : 127, result.stderr);
         if (selected) {
           const args = readFileSync(join(dir, "interpreter.txt"), "utf8").trim().split(/\r?\n/);
