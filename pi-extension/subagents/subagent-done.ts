@@ -17,6 +17,7 @@ import { registerCloseControl } from "./close-control.ts";
 import { registerInterruptControl } from "./interrupt-control.ts";
 import { registerInitialSkills } from "./initial-skills.ts";
 import { globalStateSlot } from "./global-state.ts";
+import { canWaitForDelegation, delegationWaitMarker, DELEGATION_PAUSED, type DelegationPause } from "./delegation-wait.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -102,7 +103,6 @@ export default function (pi: ExtensionAPI) {
   registerLiveContinuation(pi);
   registerRecoveryIdentity(pi);
   registerInterruptControl(pi);
-  registerCloseControl(pi);
 
   let toolNames: string[] = [];
   let denied: string[] = [];
@@ -113,6 +113,9 @@ export default function (pi: ExtensionAPI) {
   const subagentAgent = process.env.PI_SUBAGENT_AGENT ?? "";
   const deniedToolsValue = process.env.PI_DENY_TOOLS;
   const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1";
+  const explicitCompletion = process.env.PI_SUBAGENT_COMPLETION_MODE === "explicit";
+  const wait = explicitCompletion ? delegationWaitMarker() : undefined;
+  registerCloseControl(pi, ctx => !!wait && (wait.matches(ctx) || canWaitForDelegation(pi, ctx)));
   // Keeping a child open opts the session into collaboration, not just one turn.
   const keepOpenSlot = globalStateSlot<boolean>(`pi-subagents/keep-open/${process.env.PI_SUBAGENT_ID ?? "legacy"}`);
   let keepOpenSession = keepOpenSlot.value ?? (!autoExit || !getBehaviorConfig().closeOnDone);
@@ -205,7 +208,7 @@ export default function (pi: ExtensionAPI) {
         publishRunCompletion(item.completion, ctx.sessionManager);
         pending.splice(pending.indexOf(item), 1);
         if (item === currentCompletion) {
-          if (item.intent.type === "ping") recorder.callerPing();
+          if (item.intent.type === "ping") recorder.callerPing(item.intent.keepOpen);
           else recorder.agentEndDone(item.intent.keepOpen);
           if (!item.intent.keepOpen) ctx.shutdown();
         }
@@ -226,6 +229,45 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
+  const stageCompletion = (selected: Intent, payload: object, ctx: ExtensionContext) => {
+    try {
+      const completion = prepareRunCompletion({ ...payload, ...(selected.keepOpen ? { keepOpen: true } : {}) }, ctx.sessionManager);
+      if (completion) {
+        currentCompletion = { completion, intent: selected, attempts: 0 };
+        pending.push(currentCompletion);
+      }
+      completionStaged = true;
+    } catch (error) {
+      notice(ctx, `Completion not published: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
+  // If the nested outbox or watcher pauses after a silent stop, report the
+  // failure through the existing settled-result channel. Keep both sessions
+  // supervised; a pause is neither a child result nor permission to relaunch.
+  let sessionCtx: ExtensionContext | undefined;
+  const reportWaitFailure = (ctx: ExtensionContext, reason: string) => {
+    if (!wait?.matches(ctx) || !ctx.isIdle() || ctx.hasPendingMessages()) return;
+    // A pause may follow a published keep-open ping, or a reload with fresh
+    // module locals. Give it its own immutable event, bound to the current branch.
+    beginCompletionTurn(ctx.sessionManager);
+    const payload = { type: "error", errorMessage: `Delegated work could not be confirmed: ${reason}`, stopReason: "error" };
+    stageCompletion({ type: "done", payload, keepOpen: true }, payload, ctx);
+    wait.clear();
+    retryPending(ctx);
+  };
+  const stopDelegationPause = wait ? pi.events?.on(DELEGATION_PAUSED, (data) => {
+    const event = data as DelegationPause;
+    if (sessionCtx && sessionCtx.sessionManager === event?.sessionManager) reportWaitFailure(sessionCtx, event.reason);
+  }) : undefined;
+  // All session_start handlers (including outbox recovery) have finished. A
+  // pause during the factory gap may never emit another notification.
+  if (wait) pi.on("resources_discover", (event, ctx) => {
+    if (event.reason === "reload" && wait.matches(ctx) && !canWaitForDelegation(pi, ctx)) {
+      reportWaitFailure(ctx, "No confirmed delegation wakeup after reload; review supervision before resuming.");
+    }
+  });
+
   pi.registerCommand("subagent_retry_completion", {
     description: "Retry pending settled results without starting a model turn",
     handler: async (_args, ctx) => {
@@ -236,6 +278,7 @@ export default function (pi: ExtensionAPI) {
 
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
+    if (explicitCompletion) sessionCtx = ctx;
     recorder.sessionStart();
     if (process.env.PI_SUBAGENT_SESSION) {
       try { assertCompletionSession(ctx.sessionManager); retryPending(ctx); }
@@ -260,6 +303,7 @@ export default function (pi: ExtensionAPI) {
     beginCompletionTurn(ctx.sessionManager);
     stopRetry();
     completionStaged = false;
+    wait?.clear();
     currentCompletion = undefined;
     intent = undefined;
     turnFailures = [];
@@ -285,36 +329,45 @@ export default function (pi: ExtensionAPI) {
     // final boundary can overwrite it with an authoritative non-active snapshot.
     if (ctx.isIdle()) recorder.agentEndWaiting();
     const natural = !event.aborted && shouldAutoExitOnAgentEnd(userTookOver, latestAgentMessages);
-    if (!completionStaged && (intent || natural)) {
+    const providerError = findLatestAssistantError(latestAgentMessages)?.errorMessage;
+    const truncated = explicitCompletion && !event.aborted && latestAgentMessages?.findLast(m => m?.role === "assistant")?.stopReason === "length";
+    const ordinaryExplicitStop = explicitCompletion && natural && !intent && !providerError;
+    const delegated = explicitCompletion && canWaitForDelegation(pi, ctx);
+    if (delegated && !completionStaged) wait?.remember(ctx);
+    // Don't publish a premature success: the worker's result must start a new
+    // turn and the coordinator must verify it before proposing completion again.
+    // A blocker, ping or failure still reports immediately, but cannot close.
+    const status = (intent?.payload as ReturnType<typeof normalizeStructuredResult>)?.structuredResult?.status;
+    const prematureDone = delegated && intent?.type === "done" && status !== "blocked" && status !== "partial" &&
+      !event.aborted && !providerError && !truncated && !intent.failures?.length;
+    const waiting = prematureDone || (ordinaryExplicitStop && !turnFailures.length && (delegated || ctx.hasPendingMessages()));
+    if (!completionStaged && !waiting && (intent || natural || truncated)) {
       // Ping wins over done in any mixed batch, independent of execution order.
       // Done wins over auto completion. Resolve final text only here, after all
       // siblings, retries, queued messages and boundary continuations finished.
-      const requested = intent ?? { type: "done" as const, payload: buildCompletionSidecar(latestAgentMessages), keepOpen: keepOpenSession };
+      // An explicit-mode stop without a source of wakeup is an incomplete run,
+      // not success. Preserve the pane even when supervision may be uncertain.
+      const requested = intent ?? { type: "done" as const, payload: buildCompletionSidecar(latestAgentMessages), keepOpen: explicitCompletion || keepOpenSession };
       // Escape and session replacement abort outgoing work. Preserve the child:
       // even a previously staged close/ping cannot close the replacement session.
-      const selected = event.aborted ? { ...requested, type: "done" as const, keepOpen: true } : requested;
+      const selected = event.aborted ? { ...requested, type: "done" as const, keepOpen: true }
+        : delegated || truncated ? { ...requested, keepOpen: true } : requested;
       if (selected.type === "done" && !event.aborted) {
         keepOpenSession = selected.keepOpen;
         keepOpenSlot.value = keepOpenSession;
       }
-      const providerError = findLatestAssistantError(latestAgentMessages)?.errorMessage;
-      const failure = [event.aborted ? "Supervised turn aborted before settlement." : "", ...(intent?.failures ?? turnFailures), providerError].filter(Boolean).join("\n");
+      const incomplete = truncated ? "Incomplete: the provider reached its output token limit before the assignment was finished."
+        : ordinaryExplicitStop
+        ? "Incomplete: the agent stopped without calling subagent_done or caller_ping and no confirmed delegation is available to wake it. Review supervision before resuming or replacing it."
+        : undefined;
+      const failure = [event.aborted ? "Supervised turn aborted before settlement." : "", ...(intent?.failures ?? turnFailures), providerError, incomplete].filter(Boolean).join("\n");
       let payload: object = selected.payload;
       if (failure) {
         payload = selected.type === "ping"
           ? { ...payload, message: `${(payload as { message: string }).message}\nSettlement warning: ${failure}` }
           : { ...payload, type: "error", errorMessage: failure, stopReason: event.aborted ? "aborted" : "error" };
       }
-      try {
-        const completion = prepareRunCompletion({ ...payload, ...(selected.keepOpen ? { keepOpen: true } : {}) }, ctx.sessionManager);
-        if (completion) {
-          currentCompletion = { completion, intent: selected, attempts: 0 };
-          pending.push(currentCompletion);
-        }
-        completionStaged = true;
-      } catch (error) {
-        notice(ctx, `Completion not published: ${error instanceof Error ? error.message : String(error)}`);
-      }
+      stageCompletion(selected, payload, ctx);
     }
     retryPending(ctx);
     if (autoExit) userTookOver = false;
@@ -369,6 +422,9 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", (event) => {
+    stopDelegationPause?.();
+    sessionCtx = undefined;
+    if (event.reason !== "reload") wait?.clear();
     stopRetry();
     recorder.sessionShutdown((event as any).reason);
   });
@@ -386,8 +442,8 @@ export default function (pi: ExtensionAPI) {
     name: "caller_ping",
     label: "Caller Ping",
     description:
-      "Stage a help request to the parent and close after the agent settles and publication succeeds. " +
-      "The parent can resume this session with a response. Use when stuck or needing a decision. " +
+      "Stage a help request to the parent; normally close after the agent settles and publication succeeds. " +
+      "An explicit coordinator with outstanding delegation reports the ping but stays open for worker results. The parent can resume this session with a response. Use when stuck or needing a decision. " +
       "Prefer calling alone: non-terminating siblings require another model request. " +
       "In a mixed caller_ping/subagent_done batch, ping takes precedence; sibling failures are reported at settlement.",
     parameters: Type.Object({
@@ -410,7 +466,7 @@ export default function (pi: ExtensionAPI) {
       };
       if (intent?.type !== "ping") intent = { type: "ping", payload: exitData, keepOpen: false, batch: toolBatch, failures: [...turnFailures] };
       return {
-        content: [{ type: "text", text: "Ping staged. The parent is notified and shutdown requested only after settlement and successful publication." }],
+        content: [{ type: "text", text: "Ping staged for settlement. Outstanding delegation keeps an explicit coordinator open after notification." }],
         terminate: true,
         details: {},
       };

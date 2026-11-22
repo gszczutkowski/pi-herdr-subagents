@@ -71,7 +71,7 @@ export interface SubagentActivityRecorder {
   toolExecutionUpdate(toolCallId?: string, toolName?: string): void;
   toolResult(toolCallId?: string, toolName?: string): void;
   toolExecutionEnd(toolCallId?: string, toolName?: string): void;
-  callerPing(): void;
+  callerPing(keepOpen?: boolean): void;
   subagentDone(keepOpen?: boolean): void;
   sessionShutdown(reason: SubagentShutdownReason): void;
 }
@@ -506,8 +506,8 @@ export function createSubagentActivityRecorder(params: {
         refreshActiveScope(current);
       }, "immediate");
     },
-    callerPing() {
-      markDone("caller_ping");
+    callerPing(keepOpen) {
+      markDone("caller_ping", keepOpen);
     },
     subagentDone(keepOpen) {
       markDone("subagent_done", keepOpen);

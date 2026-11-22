@@ -156,7 +156,7 @@ Review with the user:
 
 ## Phase 5: Execute Todos
 
-Use coherent, verifiable units of work, not a fixed time limit. Each unit needs one meaningful outcome, explicit scope, dependencies, and acceptance evidence; keep related implementation and tests together. Spawn workers sequentially. Each worker gets the plan path and scout context:
+Use coherent, verifiable units of work, not a fixed time limit. Each unit needs one meaningful outcome, explicit scope, dependencies, and acceptance evidence; keep related implementation and tests together. In the default workflow, spawn workers sequentially. Each worker gets the plan path and scout context:
 
 ```typescript
 // Workers execute todos sequentially — one at a time
@@ -182,9 +182,39 @@ Commits require both permission under project policy and user authorization. Hon
 
 ---
 
+## Opt-in execution: one coordinator per feature (Pi only)
+
+Use this execution path only if the user explicitly requests one coordinator per feature. It does not change ordinary `/plan` or `/iterate`. In the existing parent-owned plan, record one task per feature with scope, dependencies, criteria and durable references. Execute one feature at a time by default, in dependency order. Check that the active Pi session has `plan_read`, `plan_update`, and `subagent`, and that discovery shows `feature-coordinator` and `worker` before promising this mode.
+
+Start an attempt for the ready feature, then bind a fresh coordinator to that attempt using `planTask` and the latest revision returned after starting the attempt. Give it an explicit working directory and do not set `fork: true`:
+
+```typescript
+subagent({
+  name: "Feature: CSV export",
+  agent: "feature-coordinator",
+  cwd: "/absolute/path/to/checkout",
+  task: "Coordinate the assigned CSV export feature and return a single verified result.",
+  planTask: { planId, taskId, attemptId, expectedRevision: revisionAfterAttempt },
+  assignmentContract: {
+    objective: feature.title,
+    scope: feature.scope,
+    criteria: feature.criteria,
+    dependencies: feature.dependencies,
+    inputs: feature.artifacts.map(({ ref }) => ref),
+    decisions: ["Export returns CSV text; it does not write a file."],
+    files: ["/absolute/path/to/checkout/src/export.ts"],
+    changeConstraints: ["Do not modify the settings UI."],
+  },
+});
+```
+
+Omit `assignmentContract` to derive it from the bound task. If supplementing it as above, copy the five bound fields exactly from the current task (including array order); only decisions, files, and change constraints are caller-supplied. Pass only feature-specific supplemental context; the coordinator starts without copied conversation. It delegates focused work and checks to its own children without the ancestor's `planTask`. Their results wake the coordinator, not the main session. A normal stop while supervised work can wake the coordinator does not publish an intermediate result. Expect one structured feature result from `subagent_done({ result, close: true })`, or a prompt blocker/help/error report. A stop without explicit completion and without such a wake source reports incomplete work.
+
+The main session inspects the bound result and its references, then records `evidence` with the exact `criterionId`, inspected `ref` and canonical `resultEventId`. Only the parent calls `accept`, mapping all criteria to matching evidence IDs and giving a reason. Record durable decisions and references in the plan. Start the next fresh coordinator only after its dependencies are accepted; pass only applicable decisions and accessible references from those dependencies, not whole reports or unrelated feature details. Partial, blocked, unstructured or uncertain results do not unlock dependent work. Choose independent work only as an explicit decision. After restart, read the plan and saved results/recovery records before acting; never start again blindly or replace a run whose fate is uncertain.
+
 ## Parent Execution and Acceptance Commands
 
-Before spawn, parent starts an attempt. There is no runtime plan-task adapter argument yet; explicitly attach the returned runID using `run`:
+Before spawn, parent starts an attempt. A `planTask` binding registers the run automatically. For an unbound launch, the manual registration and result commands are:
 
 ```typescript
 plan_update({ expectedRevision: revision, command: { action: "attempt", planId, taskId, mode: "start" } });
@@ -199,7 +229,7 @@ Read latest revision before each command; never reuse the sample variable withou
 
 ## Phase 6: Review
 
-After all todos are complete:
+In the default workflow, after all todos are complete:
 
 ```typescript
 subagent({
@@ -238,6 +268,6 @@ Before reporting done:
 2. ✅ Scout context was passed to the planner?
 3. ✅ All required tasks accepted by the parent after criterion evidence verification (not merely child/process completion)?
 4. ✅ Commit handling matches project policy and user authorization (including requested per-point commits), or uncommitted paths and verification evidence are reported?
-5. ✅ Reviewer has run?
-6. ✅ Reviewer findings triaged and addressed?
+5. ✅ Reviewer has run (always in the default workflow; as required by risk or criteria in opt-in execution)?
+6. ✅ Any reviewer findings triaged and addressed?
 7. ✅ Every owned idle subagent closed via `subagent_close`, retained with a concrete reason, or reported with unresolved close status?

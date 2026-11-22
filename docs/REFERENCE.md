@@ -384,6 +384,7 @@ reads only persisted task state, independently of the runtime process registry.
 | **worker**        | Config, then parent   | Implements tasks from todos — writes code, runs tests, makes polished commits            |
 | **reviewer**      | Config, then parent   | Reviews code for bugs, security issues, correctness                                      |
 | **visual-tester** | Config, then parent   | Visual QA via Chrome CDP — screenshots, responsive testing, interaction testing          |
+| **feature-coordinator** | Config, then parent | Pi-only, opt-in coordinator — delegates and verifies one feature without copying the parent's conversation |
 
 Bundled agents use model defaults from `config.json` when configured; otherwise they inherit the parent model. Thinking defaults still come from agent frontmatter or the parent level. For a named agent, callers should omit `model` and `thinking` so those configured defaults apply. Passing either field explicitly is a one-off override and takes precedence over agent frontmatter.
 
@@ -595,7 +596,7 @@ The result is still delivered to the parent as a steer message. The pane stays o
 
 ## caller_ping — Child-to-Parent Help Request
 
-The `caller_ping` tool lets a subagent request help from its parent agent. When called, the child session **exits** and the parent receives a notification with the help message. The parent can then **resume** the child session with a response using `subagent_resume`.
+The `caller_ping` tool lets a subagent request help from its parent agent. Normally the child session **exits** and the parent receives a notification with the help message. An explicit coordinator still supervising delegated work sends the notification but stays open to receive the remaining results. The parent can then **resume** the child session with a response using `subagent_resume`.
 
 **`caller_ping` parameters:**
 - `message` (required): What you need help with
@@ -651,16 +652,18 @@ checklist; it is not a new background auto-close mechanism.
 
 ### Nonclosing question/progress channel: considered and deferred
 
-A dedicated nonclosing question channel could preserve a worker's pane while the parent decides, but it is **not implemented**. `caller_ping` still exits; it must not be advertised as a pause-and-wait tool. Ordinary progress belongs in the existing panel, not a new tool or wakeup protocol.
+A dedicated nonclosing question channel could preserve a worker's pane while the parent decides, but it is **not implemented**. `caller_ping` is not a general pause-and-wait tool: it exits unless an explicit coordinator still needs to receive a delegated result. Ordinary progress belongs in the existing panel, not a new tool or wakeup protocol.
 
-The existing guarded live continuation is a prerequisite, not a complete question protocol: it requires a tracked Pi owner and run-bound settled-idle acknowledgement, reserves dispatch, deduplicates request IDs, disables prompt expansion, and fails closed on ambiguous transport or recovered artifact-only custody. A future question channel would additionally need explicit question/answer correlation, persistent blocked state, cancellation/late-answer rules, authority checks and safe handling of concurrent manual input/reload/restart. Until those semantics have dedicated tests, use exiting `caller_ping` for help and `subagent_resume` under its existing guards; use keepOpen for already-supported settled-turn collaboration. No speculative question/progress tool is registered by this policy change.
+The existing guarded live continuation is a prerequisite, not a complete question protocol: it requires a tracked Pi owner and run-bound settled-idle acknowledgement, reserves dispatch, deduplicates request IDs, disables prompt expansion, and fails closed on ambiguous transport or recovered artifact-only custody. A future question channel would additionally need explicit question/answer correlation, persistent blocked state, cancellation/late-answer rules, authority checks and safe handling of concurrent manual input/reload/restart. Until those semantics have dedicated tests, use `caller_ping` for help and `subagent_resume` under its existing guards; use keepOpen for already-supported settled-turn collaboration. No speculative question/progress tool is registered by this policy change.
 
 ### Chosen keep-open semantics
 
 `keepOpen` is defined as **tracked ongoing collaboration**, not a one-time
-terminal handoff. Each completed turn publishes a distinct result to its immediate
-parent while preserving session ownership and the watcher. Manual pane input and
-`subagent_resume` follow-ups both retain tracking. Once `close:false` opts the
+terminal handoff. By default, each completed turn publishes a distinct result to
+its immediate parent while preserving session ownership and the watcher. Pi's
+opt-in [`completion-mode: explicit`](#completion-mode) changes when normal stops
+publish. Manual pane input and `subagent_resume` follow-ups both retain tracking.
+Once `close:false` opts the
 session into collaboration, later settled turns stay open even if the initial
 `closeOnDone` default was true; use explicit `close:true` to close it. Idle children count as open,
 not active, in the widget. `subagent_done({close:true})`, `/exit`, or confirmed
@@ -693,7 +696,7 @@ Parent artifact-read/supervision failures pause without closing a working child;
 never launches children or replays uncertain dispatch. Recovery diagnostics show
 remaining errors; one recovered run's I/O failure does not disable healthy runs.
 
-**Interaction flow:**
+**Interaction flow for an ordinary worker:**
 1. Child calls `caller_ping({ message: "Not sure which schema to use" })`
 2. Child session exits (like `subagent_done`)
 3. Parent receives a steer notification: *"Sub-agent Worker needs help: Not sure which schema to use"*
@@ -732,6 +735,34 @@ Phase 5: Review           → Reviewer subagent checks all changes
 
 The parent workspace and tab names stay unchanged. Subagents are created in newly named tabs or panes for each phase.
 
+### Opt in: one coordinator per feature (Pi only)
+
+Ask the main Pi session explicitly, for example:
+
+> Use one feature coordinator per feature in the current plan. First add CSV
+> export; then add a download button that uses the export. Verify and accept
+> the export before starting the button. Keep detailed worker reports out of
+> the main session.
+
+The main session records a task per feature in its existing plan and runs one
+feature at a time in dependency order. For each ready task it starts an attempt
+and launches a fresh `feature-coordinator` with `planTask` and an explicit
+`cwd`, without `fork: true`. The coordinator delegates implementation and tests
+to a worker, and adds scouting or review when needed. Its children report to it,
+not the main session. The coordinator does not edit code or accept tasks; these
+workflow rules are not a sandbox.
+
+The coordinator returns one concise, structured proposal with criterion checks
+and durable references. The main session verifies the references, records
+criterion evidence, and explicitly accepts the task before starting a dependent
+feature. It passes only relevant dependency decisions and references forward,
+not prior conversations or full reports. Partial, blocked, unstructured or
+uncertain results do not unlock dependent work. After a restart, inspect the plan
+and recovery records rather than rerunning uncertain work. See the
+[bundled plan instructions](../pi-extension/subagents/plan-skill.md#opt-in-execution-one-coordinator-per-feature-pi-only)
+and [assignment/result contracts](../CONTRACTS.md). This requires no new command
+and does not change ordinary `/plan` or `/iterate`.
+
 ---
 
 ## The `/iterate` Workflow
@@ -743,6 +774,48 @@ For quick, focused work without polluting the main session's context.
 ```
 
 This always forks the current session into a subagent with full conversation context. It does not inherit an agent default `session-mode`. Make the fix, verify it, and exit to return. The main session gets a summary of what was done.
+
+---
+
+## Example project `AGENTS.md`
+
+Copy this block into your project's `AGENTS.md` and adapt it to your team's
+review and testing rules. These are instructions for the main Pi session, not
+extension settings or permission to bypass project trust.
+
+```markdown
+## Working with Pi subagents
+
+- Handle small, low-risk changes directly. Delegate when it saves time, keeps
+  noisy work out of the main session, or adds an independent check.
+- Choose by role: `scout` for a specific unknown, `planner` for design choices,
+  `worker` for implementation and tests, and `reviewer` for independent review.
+  Give each agent a goal, file scope, constraints, and acceptance criteria.
+  Pass only relevant context. Run independent work in parallel, but do not
+  assign concurrent edits to the same files in a shared checkout.
+- For multi-step work, use `plan_read` and `plan_update` to track tasks,
+  dependencies, and acceptance criteria. Start an attempt before delegation
+  and bind the run with `planTask`. The main session verifies the changes and
+  evidence against the version under review, records evidence for each criterion,
+  and explicitly accepts the task. A completion report is not acceptance.
+- When the user requests one coordinator per feature, start a fresh
+  `feature-coordinator` for each ready feature with `planTask` and an explicit
+  `cwd`, without `fork: true`. Let it delegate and verify the work; it returns
+  a short proposal with evidence references. Run features one at a time by
+  default. Start dependent work only after accepting its prerequisites, and
+  pass forward interface decisions and evidence references, not full reports.
+- Wait for automatic result delivery; do not poll. Surface blockers promptly.
+  For long tasks, use `context_checkpoint` for concise decisions, next steps,
+  and verification references, never credentials or raw logs. After restart,
+  read the plan and recovery records before acting; saved records do not prove
+  liveness. Do not relaunch work whose outcome is uncertain.
+- Preserve results before using `subagent_close` on owned idle sessions that
+  have no concrete follow-up. Respect its safety checks. Do not commit or push
+  without explicit user authorization.
+```
+
+See [durable task plans](#durable-task-plans-pi) and the
+[opt-in coordinator workflow](#opt-in-one-coordinator-per-feature-pi-only).
 
 ---
 
@@ -779,7 +852,8 @@ You are a specialized agent that does X...
 | `session-mode` | string | Default child-session mode: `standalone`, `lineage-only`, or `fork` |
 | `spawning`    | boolean | Set `false` to deny all subagent-spawning tools                                                                                                                                                                                                                             |
 | `deny-tools`  | string  | Comma-separated extension tool names to deny                                                                                                                                                                                                                                |
-| `auto-exit`   | boolean | Automatically complete the run after a final response — no `subagent_done` call needed. Recommended for autonomous agents (scout, worker); not for interactive ones (planner). Claude uses its Stop hook; Pi uses its settled lifecycle. Also determines the default value of `interactive` (see below). |
+| `auto-exit`   | boolean | Controls default closure on completion. Ordinary autonomous agents (scout, worker) need no `subagent_done` call after a normal final response; Pi's explicit completion mode is an exception. Claude uses its Stop hook for autonomous runs. Also determines the default value of `interactive` (see below). |
+| `completion-mode` | string | Pi-only opt-in `explicit`: ordinary stops wait silently only while supervised delegation can wake the agent; otherwise an ordinary stop without explicit intent reports incomplete work. Omit for existing behavior. |
 | `interactive` | boolean | derived        | Compatibility metadata, defaulting to the inverse of `auto-exit`. Explicit values take precedence. Observed stall/recovery never wakes the parent, regardless of this flag. |
 | `cwd`         | string  | Default working directory (absolute or relative to project root)                                                                                                                                                                                                            |
 | `disable-model-invocation` | boolean | Hide this agent from discovery surfaces like `subagents_list`. The agent still remains directly invokable by explicit name via `subagent({ agent: "name", ... })`. |
@@ -974,7 +1048,7 @@ session-mode: lineage-only
 
 ### `auto-exit`
 
-When set to `true`, the agent session shuts down automatically as soon as the agent finishes its turn — no explicit `subagent_done` call is needed.
+With the default completion behavior, `true` closes the session automatically on a normal final response; no explicit `subagent_done` call is needed. Setting `auto-exit: false` alone does not suppress completion notifications on Pi.
 
 **Behavior:**
 
@@ -993,6 +1067,35 @@ name: scout
 auto-exit: true
 ---
 ```
+
+### `completion-mode`
+
+Omit this field for the existing behavior. The bundled `feature-coordinator`
+opts in to Pi-only `completion-mode: explicit` alongside `auto-exit: false`:
+
+```yaml
+---
+name: feature-coordinator
+session-mode: lineage-only
+completion-mode: explicit
+auto-exit: false
+---
+```
+
+An ordinary stop while supervised delegation can wake the coordinator leaves it
+waiting without reporting a result to its parent. Without a wake source or
+explicit completion intent, an ordinary stop reports incomplete work. Finish
+with `subagent_done({ result, close: true })` to publish the feature proposal
+at Pi's settled turn boundary. Provider and supervision failures and explicit
+help requests are not silenced. A provider output-token limit reports incomplete
+work and leaves the coordinator open. While a worker can still report, the
+coordinator cannot be closed with `subagent_close`: a ping (or partial/blocked
+proposal) reports without closing, and a premature success is not published.
+After the last worker reports, verify the results and call `subagent_done` again.
+Reload rechecks a silent wait; it does not start another worker.
+Pi resume preserves the saved setting; workers
+spawned by the coordinator do not inherit it. This is independent of the global
+`maxReportBytes` bound.
 
 ### `interactive`
 
@@ -1079,6 +1182,7 @@ deny-tools: subagent
 | Agent      | `spawning`  | Rationale                                    |
 | ---------- | ----------- | -------------------------------------------- |
 | planner    | _(default)_ | Legitimately spawns scouts for investigation |
+| feature-coordinator | `true` | Delegates work and checks for just its assigned feature |
 | worker     | `false`     | Should implement tasks, not delegate         |
 | researcher | `false`     | Should research, not spawn                   |
 | reviewer   | `false`     | Should review, not spawn                     |

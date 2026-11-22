@@ -17,6 +17,7 @@ export interface AgentDefaults {
   denyTools?: string;
   spawning?: boolean;
   autoExit?: boolean;
+  completionMode?: "explicit";
   interactive?: boolean;
   systemPromptMode?: "append" | "replace";
   sessionMode?: SubagentSessionMode;
@@ -100,6 +101,7 @@ export function parseAgentDefinition(content: string, fallbackName: string): Age
     denyTools: getFrontmatterValue(frontmatter, "deny-tools"),
     spawning: parseOptionalBoolean(getFrontmatterValue(frontmatter, "spawning")),
     autoExit: parseOptionalBoolean(getFrontmatterValue(frontmatter, "auto-exit")),
+    ...(getFrontmatterValue(frontmatter, "completion-mode") === "explicit" ? { completionMode: "explicit" as const } : {}),
     interactive: parseOptionalBoolean(getFrontmatterValue(frontmatter, "interactive")),
     sessionMode: parseSessionMode(getFrontmatterValue(frontmatter, "session-mode")),
     cwd: getFrontmatterValue(frontmatter, "cwd"),

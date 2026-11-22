@@ -128,6 +128,25 @@ test("legacy, corrupt, incomplete and future profiles reject with migration guid
   }
 }));
 
+test("explicit completion survives closed resume; default workers and older profiles are automatic", () => fixture((dir, context) => {
+  context.agentDefs!.completionMode = "explicit";
+  const built = spawn(context);
+  assert.match(built.command, /PI_SUBAGENT_COMPLETION_MODE=explicit/);
+  assert.ok(built.command.includes(quote(join(dir, "index.ts"))));
+  assert.equal(readPiLaunchProfile(context.subagentSessionFile).completionMode, "explicit");
+  delete context.agentDefs!.completionMode;
+  const driver = new PiHarnessDriver();
+  const resume = reopen(dir, context);
+  assert.match(driver.buildCommand(resume).command, /PI_SUBAGENT_COMPLETION_MODE=explicit/);
+  const { completionMode: _explicit, ...legacy } = resume.launchProfile!;
+  writeFileSync(launchProfilePath(context.subagentSessionFile), JSON.stringify(legacy));
+  const automatic = driver.buildCommand(reopen(dir, context)).command;
+  assert.match(automatic, /PI_SUBAGENT_COMPLETION_MODE=automatic/);
+  assert.ok(!automatic.includes(quote(join(dir, "index.ts"))));
+  writeFileSync(launchProfilePath(context.subagentSessionFile), JSON.stringify({ ...legacy, completionMode: "unknown" }));
+  assert.throws(() => readPiLaunchProfile(context.subagentSessionFile), /Invalid or unsupported launch profile/);
+}));
+
 test("foreign harness resume rejects before attempting to parse foreign history", () => fixture((_dir, context) => {
   writeFileSync(context.subagentSessionFile, "NOT PI JSONL");
   for (const harness of ["claude", "codex", "generic"]) {

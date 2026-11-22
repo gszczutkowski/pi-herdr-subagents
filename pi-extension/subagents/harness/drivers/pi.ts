@@ -87,6 +87,9 @@ export class PiHarnessDriver implements HarnessDriver {
 
     const subagentDonePath = join(subagentsDir, "subagent-done.ts");
     parts.push("-e", shellQuote(subagentDonePath));
+    // The coordinator must be able to delegate even if its parent loaded this
+    // worktree explicitly instead of enabling the installed package.
+    if (profile.completionMode === "explicit") parts.push("-e", shellQuote(join(subagentsDir, "index.ts")));
 
     if (effectiveModel) {
       parts.push("--model", shellQuote(effectiveModel));
@@ -122,6 +125,8 @@ export class PiHarnessDriver implements HarnessDriver {
     envParts.push(`PI_SUBAGENT_NAME=${shellQuote(params.name)}`);
     envParts.push(`PI_SUBAGENT_AGENT=${shellQuote(profile.role ?? "")}`);
     envParts.push(`PI_SUBAGENT_AUTO_EXIT=${effectiveAutoExit ? "1" : "0"}`);
+    // Explicit default prevents a nested worker inheriting the coordinator's mode.
+    envParts.push(`PI_SUBAGENT_COMPLETION_MODE=${profile.completionMode ?? "automatic"}`);
     envParts.push(`PI_SUBAGENT_SESSION=${shellQuote(subagentSessionFile)}`);
     envParts.push(`PI_SUBAGENT_ID=${shellQuote(params.id)}`);
     const activityFile = getSubagentActivityFile(artifactDir, params.id);

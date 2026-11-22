@@ -26,6 +26,7 @@ export interface AgentDefinition {
   tools?: string;
   skills?: string;
   sessionMode?: string;
+  completionMode?: "explicit";
   systemPromptMode?: string;
   interactive?: boolean;
   cli?: string;
