@@ -1,7 +1,6 @@
 import { resolve } from "node:path";
-import { Readable } from "node:stream";
 import type { TestsStream } from "node:test";
-import { spec } from "node:test/reporters";
+import failureReporter from "../failure-reporter.ts";
 
 type Event = TestsStream extends AsyncIterable<infer T> ? T : never;
 
@@ -19,7 +18,7 @@ export default async function* report(source: AsyncIterable<Event>) {
       yield event;
     }
   }
-  yield* Readable.from(observe()).pipe(spec());
+  yield* failureReporter(observe());
   if (!executed) {
     yield "No integration test cases executed; check the name filter and test prerequisites.\n";
     process.exitCode = 1;
