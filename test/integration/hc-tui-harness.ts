@@ -10,6 +10,8 @@ import { runScriptInPane, shellQuote } from "../../pi-extension/subagents/termin
 import { isProtectedProcess, probeProcess, sameProcess } from "../../pi-extension/subagents/process-identity.ts";
 import { canonicalSessionPath } from "../../pi-extension/subagents/ownership.ts";
 import { localPiCli, localPiShellCommand } from "./local-pi.ts";
+import { sameBatchModel, type SameBatchIntent } from "./hc-same-batch-provider.ts";
+import { sendHcViewerEscape } from "./hc-viewer-escape.ts";
 
 /** Validate ownership before adding anything to the transport teardown list. */
 export function trackTransportSurface(owned: string[], surface: string, protectedTerminal = process.env.HC_TERMINAL_ID): void {
@@ -71,8 +73,11 @@ export class HcTuiRun {
   assertions: Record<string, unknown> = {};
 
   readonly journey: string;
-  constructor(journey: string) {
+  private readonly sameBatch?: SameBatchIntent;
+  constructor(journey: string, sameBatch?: SameBatchIntent) {
     this.journey = journey;
+    this.sameBatch = sameBatch;
+    const model = process.env.PI_TEST_MODEL || "openai-codex/gpt-6.1-sol";
     const gitDir = execFileSync("git", ["rev-parse", "--absolute-git-dir"], { encoding: "utf8" }).trim();
     this.evidence = join(gitDir, "verification", `${new Date().toISOString().replace(/[:.]/g, "-")}-${journey}-${this.id}`);
     mkdirSync(this.evidence, { recursive: true });
@@ -104,17 +109,22 @@ export class HcTuiRun {
         .map(path => [path.slice(this.root.length + 1).replaceAll("\\", "/"), createHash("sha256").update(readFileSync(path)).digest("hex")])),
       workingTree: execFileSync("git", ["status", "--porcelain=v1"], { encoding: "utf8" }),
       sourceRoot: this.root,
-      model: process.env.PI_TEST_MODEL || "openai-codex/gpt-6.1-sol",
+      model,
+      ...(sameBatch && { childModel: sameBatchModel, childInput: "scripted same-batch provider", sameBatch }),
       isolation: "Pinned local CLI; isolated scratch profile with exact project-role approval. Native test auth bridge resolves the original credential store without copying credentials or changing global settings. Observer never fabricates results.",
     });
     mkdirSync(join(this.scratch, ".pi", "agents"), { recursive: true });
-    writeFileSync(join(this.scratch, ".pi", "agents", "verify-worker.md"), `---\nname: verify-worker\ndescription: Disposable live verification worker\nmodel: ${process.env.PI_TEST_MODEL || "openai-codex/gpt-6.1-sol"}\nthinking: minimal\ntools: read,bash,write\nauto-exit: true\n---\nExecute the exact assigned verification task. Never delegate. Use bash for marker side effects. Call subagent_done as requested. Do not commit or edit source.\n`);
-    writeFileSync(join(this.scratch, ".pi", "agents", "verify-open.md"), readFileSync(join(this.scratch, ".pi", "agents", "verify-worker.md"), "utf8").replace("name: verify-worker", "name: verify-open").replace("auto-exit: true", "auto-exit: false"));
+    for (const name of ["verify-worker", "verify-open"]) {
+      const scripted = sameBatch && name === "verify-open";
+      writeFileSync(join(this.scratch, ".pi", "agents", `${name}.md`), `---\nname: ${name}\ndescription: Disposable live verification worker\nmodel: ${scripted ? sameBatchModel : model}\nthinking: ${scripted ? "off" : "minimal"}\ntools: read,bash,write\nauto-exit: ${name === "verify-worker"}\n---\nExecute the exact assigned verification task. Never delegate. Use bash for marker side effects. Call subagent_done as requested. Do not commit or edit source.\n`);
+    }
     // Gate work is intentionally event-driven and runs inside the child's actual bash tool.
     writeFileSync(join(this.scratch, "gate.mjs"), `import fs from 'node:fs';\nconst n=process.argv[2];fs.writeFileSync(n+'.started','STARTED');\nawait new Promise((resolve,reject)=>{let w;const t=setTimeout(()=>{w?.close();reject(Error('gate timeout'))},240000);const check=()=>{if(fs.existsSync(n+'.release')){clearTimeout(t);w?.close();resolve()}};w=fs.watch('.',check);check()});\nfs.writeFileSync(n+'.txt',n);\n`);
     const bin = join(this.scratch, "bin"); mkdirSync(bin);
     const originalProfile = getAgentConfigDir();
-    writeFileSync(join(bin, "pi"), `#!/bin/bash\nexport PI_TEST_HC_TUI=1 PI_TEST_MODEL=${shellQuote(process.env.PI_TEST_MODEL || "openai-codex/gpt-6.1-sol")} PI_TEST_HC_AUTH_DIR=${shellQuote(originalProfile)} PI_CODING_AGENT_DIR=${shellQuote(this.profile)} PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 PI_TEST_HC_EVENTS=${shellQuote(this.events)} PI_TEST_HC_SCRATCH=${shellQuote(this.scratch)}\nexec ${localPiShellCommand()} -ne -e ${shellQuote(join(this.root, "test/integration/hc-auth.ts"))} -e ${shellQuote(join(this.root, "test/integration/hc-observer.ts"))} "$@"\n`, { mode: 0o755 });
+    const fixtureEnv = sameBatch ? `export PI_TEST_HC_SAME_BATCH_INTENT=${shellQuote(sameBatch)} PI_TEST_HC_SAME_BATCH_RUN=${shellQuote(this.id)}\n` : "";
+    const fixtureExtension = sameBatch ? ` -e ${shellQuote(join(this.root, "test/integration/hc-same-batch-provider.ts"))}` : "";
+    writeFileSync(join(bin, "pi"), `#!/bin/bash\nexport PI_TEST_HC_TUI=1 PI_TEST_MODEL=${shellQuote(model)} PI_TEST_HC_AUTH_DIR=${shellQuote(originalProfile)} PI_CODING_AGENT_DIR=${shellQuote(this.profile)} PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 PI_TEST_HC_EVENTS=${shellQuote(this.events)} PI_TEST_HC_SCRATCH=${shellQuote(this.scratch)}\n${fixtureEnv}exec ${localPiShellCommand()} -ne -e ${shellQuote(join(this.root, "test/integration/hc-auth.ts"))} -e ${shellQuote(join(this.root, "test/integration/hc-observer.ts"))}${fixtureExtension} "$@"\n`, { mode: 0o755 });
     this.save("state.json", { scratch: this.scratch, evidence: this.evidence, owned: [] });
   }
   save(name: string, data: unknown) { writeFileSync(join(this.evidence, name), JSON.stringify(data, null, 2)); }
@@ -132,6 +142,11 @@ export class HcTuiRun {
     appendFileSync(join(this.evidence, "actions.jsonl"), JSON.stringify({ at: Date.now(), target, keys }) + "\n");
     execFileSync(this.hc.executable, ["keys", target, ...keys], { encoding: "utf8", timeout: 15_000 });
   }
+  async viewerEscape(target: string) {
+    assert.ok(this.owned.has(target) && target !== this.parent, "Viewer Escape requires an owned child terminal");
+    appendFileSync(join(this.evidence, "actions.jsonl"), JSON.stringify({ at: Date.now(), target, input: "ESC (0x1b)", transport: "HC viewer DATA" }) + "\n");
+    await sendHcViewerEscape(this.hc.executable, target);
+  }
   messages() { return jsonLines(this.parentSession).flatMap(e => e.type === "message" ? [e.message] : e.type === "custom_message" ? [e] : []); }
   observed() { return jsonLines(this.events); }
   results(name = "subagent") { return this.observed().filter(e => e.session === this.parentSession && e.kind === "tool_end" && e.data.toolName === name); }
@@ -143,7 +158,10 @@ export class HcTuiRun {
     this.launchCount++;
     this.save("state.json", { scratch: this.scratch, evidence: this.evidence, owned: [...this.owned] });
     const token = `VERIFY_READY_${this.id}_${this.launchCount}`;
-    const command = `cd ${shellQuote(this.scratch)} && export PATH=${shellQuote(bashPath(join(this.scratch, "bin")))}:"$PATH" PI_TEST_HC_EVENTS=${shellQuote(this.events)} PI_TEST_HC_SCRATCH=${shellQuote(this.scratch)} && pi -e ${shellQuote(join(this.root, "pi-extension/subagents/index.ts"))} --no-mcp --no-skills --no-context-files --approve --session ${shellQuote(this.parentSession)} --model ${shellQuote(process.env.PI_TEST_MODEL || "openai-codex/gpt-6.1-sol")} --thinking off ${shellQuote(`Reply exactly ${token}. Do not use tools.`)}`;
+    // Don't let an unrelated parent action (e.g. proactively closing an idle
+    // worker) race the observation of whether the child's own tools quit it.
+    const parentTools = this.sameBatch ? " --no-tools --tools subagent" : "";
+    const command = `cd ${shellQuote(this.scratch)} && export PATH=${shellQuote(bashPath(join(this.scratch, "bin")))}:"$PATH" PI_TEST_HC_EVENTS=${shellQuote(this.events)} PI_TEST_HC_SCRATCH=${shellQuote(this.scratch)} && pi -e ${shellQuote(join(this.root, "pi-extension/subagents/index.ts"))} --no-mcp --no-skills --no-context-files${parentTools} --approve --session ${shellQuote(this.parentSession)} --model ${shellQuote(process.env.PI_TEST_MODEL || "openai-codex/gpt-6.1-sol")} --thinking off ${shellQuote(`Reply exactly ${token}. Do not use tools.`)}`;
     appendFileSync(join(this.evidence, "actions.jsonl"), JSON.stringify({ at: Date.now(), target: this.parent, command }) + "\n");
     runScriptInPane(this.parent, command, { scriptPath: join(this.evidence, `launch-${this.launchCount}.sh`) });
     await until(this.evidence, () => this.messages().find(m => m.role === "assistant" && m.content?.some((c: any) => c.type === "text" && c.text.trim() === token)), "authenticated readiness exact token");
@@ -161,7 +179,7 @@ export class HcTuiRun {
     const at = Date.now();
     this.action(this.parent, `Call subagent exactly once with name ${name}, agent ${agent}, task ${JSON.stringify(task)}. End your turn immediately after the acknowledgement. Never poll. Acknowledge later completion briefly.`);
     const event = await until(this.evidence, () => this.results()[count], `${name} actual subagent result`);
-    assert.ok(!event.data.isError, `${name}: tool error`);
+    assert.ok(!event.data.isError, `${name}: ${event.data.result?.content?.[0]?.text ?? "tool error"}`);
     const details = event.data.result.details;
     assert.equal(details.status, "started");
     this.registerChild(details);

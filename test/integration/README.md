@@ -11,7 +11,7 @@ PI_TEST_MODEL="openai-codex/gpt-6.1-sol" npm run test:integration:pi
 PI_TEST_MODEL="openai-codex/gpt-6.1-sol" npm run test:integration
 ```
 
-In PowerShell set `$env:PI_TEST_MODEL = 'openai-codex/gpt-6.1-sol'` first. Choose an **exact authenticated provider/model-id** available on your host, not necessarily this example. Pi scopes make real, potentially billable model requests. The same model is applied to the parent and isolated seeded agents. No model is requested by transport scope.
+In PowerShell set `$env:PI_TEST_MODEL = 'openai-codex/gpt-6.1-sol'` first. Choose an **exact authenticated provider/model-id** available on your host, not necessarily this example. Pi scopes make real, potentially billable model requests. The selected model runs the parent and the isolated seeded agents, except for the two scripted child inputs described below. No model is requested by transport scope.
 
 | Scope | HC (herdr-core) | Legacy herdr |
 | --- | --- | --- |
@@ -48,7 +48,11 @@ HC TUI journeys print unique `.git/verification/<timestamp>-<journey>-<id>/` pat
 
 Require both `assertions.json.passed === true` and `cleanup.json.allMissing === true`. Cleanup targets only exact owned terminals, attempts every independently verifiable child even after one failure, and fails on unresolved custody. Scratch remains on failure. A no-child parent legitimately has no runtime manifest; a missing manifest after a known child launch is a custody failure. Cleanup failure cannot leave passing assertions. Early constructor/preflight failures may have only partial evidence.
 
-The existing advanced HC suite deliberately keeps its stronger assertions enabled. Earlier verification records are bounded selections, not proof of every current journey; see `HC-WORKFLOW-VERIFICATION.md`, `HC-CLOSE-VERIFICATION.md` and [the expansion run report](INTEGRATION-EXPANSION-VERIFICATION.md). Provider/model deviations fail preconditions rather than being replaced by internal calls, sequential tools, or another transport.
+The advanced HC suite keeps its stronger assertions enabled. The `staged done` and `staged ping` sibling journeys use a test-only child provider to emit both calls in one assistant message, then supply the final text only after Pi returns both successful tool results. The parent still uses the authenticated model, with only `subagent` active so it cannot independently close the child during the keep-open assertion. HC, Pi, bash, the completion tools, settlement, and delivery are real. These two journeys verify sibling settlement with controlled input, not whether an authenticated model generates that batch. Sequential calls or direct tool invocations are not substitutes.
+
+The `manual Escape live continuation` journey uses a short-lived HC viewer via `hc connect` to send the literal Escape byte to its owned child PTY. Unlike `hc keys`, viewer input does not wait for the automation quiet period. This tests the Pi TUI key path, not a physical keyboard, `hc interrupt`, or the guarded `subagent_interrupt` tool.
+
+Earlier verification records are bounded selections, not proof of every current journey; see `HC-WORKFLOW-VERIFICATION.md`, `HC-CLOSE-VERIFICATION.md` and [the expansion run report](INTEGRATION-EXPANSION-VERIFICATION.md).
 
 Direct low-level invocations still use opt-in gates:
 

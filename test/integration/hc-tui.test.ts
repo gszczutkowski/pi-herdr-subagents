@@ -7,11 +7,12 @@ import { runCompletionFile } from "../../pi-extension/subagents/run-artifacts.ts
 import { canonicalSessionPath } from "../../pi-extension/subagents/ownership.ts";
 import { probeProcess } from "../../pi-extension/subagents/process-identity.ts";
 import { closeDir } from "../../pi-extension/subagents/close-control.ts";
+import { sameBatchModel, sameBatchScenario, type SameBatchIntent } from "./hc-same-batch-provider.ts";
 
 const options = { skip: process.env.PI_TEST_HC_TUI !== "1", timeout: 600_000 };
-function journey(name: string, verify: (run: HcTuiRun) => Promise<void>) {
+function journey(name: string, verify: (run: HcTuiRun) => Promise<void>, sameBatch?: SameBatchIntent) {
   it(`real HC Pi TUI: ${name}`, options, async () => {
-    const run = new HcTuiRun(name.replace(/[^a-z]+/gi, "-"));
+    const run = new HcTuiRun(name.replace(/[^a-z]+/gi, "-"), sameBatch);
     let failure: unknown;
     try { await run.launch(); await verify(run); }
     catch (error) { failure = error; throw error; }
@@ -195,8 +196,8 @@ journey("manual Escape live continuation", async run => {
   await assertNoChildPublication(run, child);
   await run.capture("before-manual-escape");
   const at = Date.now();
-  run.keys(owned.surface, "escape"); // Literal Escape in our child, not subagent_interrupt or Ctrl+C.
-  const aborted = await until(run.evidence, () => run.observed().find(e => e.kind === "settled" && e.session === child.sessionFile && e.pid === start.pid && e.at >= at && e.data.aborted === true), "manual Escape aborted child settlement");
+  await run.viewerEscape(owned.surface); // Literal Escape in our child, not subagent_interrupt or Ctrl+C.
+  const aborted = await until(run.evidence, () => run.observed().find(e => e.kind === "settled" && e.session === child.sessionFile && e.pid === start.pid && e.at >= at && e.data.aborted === true), "manual Escape aborted child settlement", 15_000);
   assert.equal(run.results("subagent_interrupt").length, 0);
   assert.equal(existsSync(join(run.scratch, "manual-escape.release")), false);
   assert.equal(existsSync(join(run.scratch, "manual-escape.txt")), false);
@@ -280,20 +281,17 @@ journey("literal new after guarded abort detaches original supervision", async r
 
 for (const intent of ["done", "ping"] as const) {
   journey(`staged ${intent} waits for same batch bash sibling`, async run => {
-    const gateName = `staged-${intent}`, command = `node gate.mjs ${gateName}`;
-    const toolName = intent === "done" ? "subagent_done" : "caller_ping";
-    const finalText = `FINAL_AFTER_${intent.toUpperCase()}_SIBLING`;
-    const pingMessage = `HC_PING_AFTER_SIBLING_${run.id}`;
-    const args = intent === "done" ? { close: false } : { message: pingMessage };
-    const child = await run.spawn(`Batch${intent}`, `This task specifically requires an actual two-tool-call assistant response. In your FIRST assistant response issue ${toolName} with arguments ${JSON.stringify(args)} AND bash with arguments ${JSON.stringify({ command, timeout: 300 })} in the SAME assistant message/tool batch, with ${toolName} first. Do not call them in separate messages, simulate tool results, use a wrapper tool, or release the gate yourself. The harness releases the bash gate. Once both tools really finish, reply exactly ${finalText} without further tool calls. This is an intentional sibling-settlement verification, despite the usual preference to call completion tools alone.`, "verify-open");
+    const { gateName, command, toolName, finalText, pingMessage, args } = sameBatchScenario(intent, run.id);
+    const child = await run.spawn(`Batch${intent}`, `Exercise ${toolName} and gated bash in one assistant message, then reply ${finalText}.`, "verify-open");
     const owned = metadata(run, child);
     const attempt = await until(run.evidence, () => {
       const batch = jsonLines(child.sessionFile).find(e => e.message?.role === "assistant" && e.message.content?.some((c: any) => c.type === "toolCall" && c.name === "bash" && c.arguments?.command === command));
       const settled = run.observed().find(e => e.kind === "settled" && e.session === child.sessionFile);
       return batch || settled ? { batch, settled } : undefined;
-    }, `Unmet precondition: model must generate ${toolName} and gated bash in the same assistant tool batch`);
-    run.assertions.sameBatchPrecondition = { toolName, attempt };
+    }, `Unmet precondition: scripted input must supply ${toolName} and gated bash in the same assistant tool batch`);
+    run.assertions.sameBatchPrecondition = { toolName, childModel: sameBatchModel, attempt };
     assert.ok(attempt.batch, `Unmet precondition: child settled without the required ${toolName} + bash assistant batch; no sequential substitute is allowed`);
+    assert.equal(`${attempt.batch.message.provider}/${attempt.batch.message.model}`, sameBatchModel);
     const calls = attempt.batch.message.content.filter((c: any) => c.type === "toolCall");
     assert.equal(calls.length, 2, "Unmet precondition: exactly the two requested real sibling calls are required");
     assert.equal(calls[0].name, toolName, "Unmet precondition: staged intent must be in the gate's actual assistant message");
@@ -352,7 +350,7 @@ for (const intent of ["done", "ping"] as const) {
     run.assertChildBash(child, command);
     assert.equal(run.observed().filter(e => e.kind === "session_start" && e.terminal === owned.surface).length, 1);
     run.assertions.siblingSettlement = { intent, assistantEntryId: attempt.batch.id, releasedAt, ended, settled, deliveredAt, delivery, retained };
-  });
+  }, intent);
 }
 
 journey("parent OS death and recovery", async run => {

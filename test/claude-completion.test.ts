@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, delimiter, join } from "node:path";
+import { basename, delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
 import { waitForCompletion } from "../pi-extension/subagents/completion.ts";
@@ -24,14 +24,23 @@ function fixture(entries: unknown[], run: (paths: { dir: string; sentinel: strin
   }
 }
 
-function runHook(sentinel: string | undefined, payload: unknown, autoExit: string | undefined = "1", overrides: NodeJS.ProcessEnv = {}) {
+function spawnHook(input: string | undefined, overrides: NodeJS.ProcessEnv, cwd?: string, fixtureBin?: string) {
+  const bash = findBashExecutable();
+  assert.ok(bash, "Bash is required to run the Claude hook");
   const env = { ...process.env, ...overrides };
-  delete env.PI_CLAUDE_SENTINEL;
-  delete env.PI_CLAUDE_AUTO_EXIT;
-  if (sentinel !== undefined) env.PI_CLAUDE_SENTINEL = sentinel;
-  if (autoExit !== undefined) env.PI_CLAUDE_AUTO_EXIT = autoExit;
-  const result = spawnSync("bash", [hook], { input: JSON.stringify(payload), env, encoding: "utf8", timeout: 5_000 });
+  const pathKey = Object.keys(env).find(key => key.toLowerCase() === "path") ?? "PATH";
+  const gitTools = join(dirname(bash), "..", "usr", "bin");
+  const tools = process.platform === "win32" && existsSync(gitTools) ? gitTools : dirname(bash);
+  env[pathKey] = [fixtureBin, tools, env[pathKey]].filter(Boolean).join(delimiter);
+  const result = spawnSync(bash, [hook], { cwd, input, env, encoding: "utf8", timeout: 5_000, windowsHide: true });
   assert.equal(result.error, undefined);
+  return result;
+}
+
+function runHook(sentinel: string | undefined, payload: unknown, autoExit: string | null = "1", overrides: NodeJS.ProcessEnv = {}) {
+  const result = spawnHook(JSON.stringify(payload), {
+    ...overrides, PI_CLAUDE_SENTINEL: sentinel, PI_CLAUDE_AUTO_EXIT: autoExit ?? undefined,
+  });
   assert.equal(result.status, 0, result.stderr);
 }
 
@@ -158,7 +167,7 @@ describe("Claude Stop completion hook", () => {
 
   it("supports existing launch scripts without the new auto-exit flag", () => {
     fixture([user("Old task"), user("Follow-up")], ({ sentinel, transcript }) => {
-      runHook(sentinel, { transcript_path: transcript, last_assistant_message: "Result" }, undefined);
+      runHook(sentinel, { transcript_path: transcript, last_assistant_message: "Result" }, null);
       assert.equal(readFileSync(sentinel, "utf8").trim(), "Result");
     });
   });
@@ -197,11 +206,12 @@ describe("Claude Stop completion hook", () => {
 });
 
 describe("Claude hook interpreter selection", () => {
-  for (const [name, available, selected] of [
-    ["prefers a working python3", ["python3", "python", "py"], "python3"],
-    ["falls back past a broken python3 alias", ["python"], "python"],
-    ["supports the Windows py -3 launcher", ["py"], "py"],
-    ["reports missing Python without pretending completion", [], undefined],
+  for (const [name, available, selected, hasStoreRedirector] of [
+    ["prefers a working python3", ["python3", "python", "py"], "python3", false],
+    ["falls back past a broken python3 alias", ["python"], "python", false],
+    ["skips the Windows Store redirector without running it", ["python"], "python", true],
+    ["supports the Windows py -3 launcher", ["py"], "py", false],
+    ["reports missing Python without pretending completion", [], undefined, false],
   ] as const) {
     it(name, () => {
       const dir = mkdtempSync(join(tmpdir(), "claude-python-selection-"));
@@ -209,14 +219,28 @@ describe("Claude hook interpreter selection", () => {
         const bin = join(dir, "bin"); mkdirSync(bin);
         for (const candidate of ["python3", "python", "py"]) {
           const valid = (available as readonly string[]).includes(candidate);
-          writeFileSync(join(bin, candidate), `#!/bin/bash\nif [[ "$*" == *sys.version_info* ]]; then exit ${valid ? 0 : 49}; fi\nprintf '%s\\n' '${candidate}' "$@" > "$PI_INTERPRETER_RECORD"\n`, { mode: 0o755 });
+          writeFileSync(join(bin, candidate), `#!/bin/bash
+${hasStoreRedirector && candidate === "python3" ? ": > redirector-invoked" : ""}
+if [[ "$*" == *sys.version_info* ]]; then
+  if IFS= read -r -n 1 byte; then exit 48; fi
+  exit ${valid ? 0 : 49}
+fi
+IFS= read -r payload
+printf '%s\\n' "$payload" > payload.txt
+printf '%s\\n' '${candidate}' "$@" > interpreter.txt
+`, { mode: 0o755 });
         }
-        const bash = findBashExecutable(); assert.ok(bash, "Bash is required to run the Claude hook");
-        const pathKey = Object.keys(process.env).find(key => key.toLowerCase() === "path") ?? "PATH";
-        const env: NodeJS.ProcessEnv = { ...process.env, PI_CLAUDE_SENTINEL: "unused", PI_INTERPRETER_RECORD: "interpreter.txt" };
-        env[pathKey] = `${bin}${delimiter}${process.env[pathKey] ?? ""}`;
-        const result = spawnSync(bash, [hook], { cwd: dir, env, input: "{}", encoding: "utf8", timeout: 5_000 });
-        assert.equal(result.error, undefined);
+        if (hasStoreRedirector) {
+          // Model the link target Git Bash reports, without requiring Windows symlink privileges.
+          writeFileSync(join(bin, "readlink"), `#!/bin/bash
+case "$2" in
+  */python3) printf '%s\\n' '/c/Program Files/WindowsApps/Microsoft.DesktopAppInstaller_test/AppInstallerPythonRedirector.exe' ;;
+  *) exit 1 ;;
+esac
+`, { mode: 0o755 });
+        }
+        const result = spawnHook('{"last_assistant_message":"done"}\n', { PI_CLAUDE_SENTINEL: "unused" }, dir, bin);
+        assert.equal(existsSync(join(dir, "redirector-invoked")), false);
         assert.equal(result.status, selected ? 0 : 127, result.stderr);
         if (selected) {
           const args = readFileSync(join(dir, "interpreter.txt"), "utf8").trim().split(/\r?\n/);
@@ -224,6 +248,7 @@ describe("Claude hook interpreter selection", () => {
           if (selected === "py") assert.equal(args.shift(), "-3");
           assert.deepEqual(args.slice(0, 2), ["-X", "utf8"]);
           assert.match(args.at(-1)!, /on-stop\.py$/);
+          assert.equal(readFileSync(join(dir, "payload.txt"), "utf8").trim(), '{"last_assistant_message":"done"}');
         } else {
           assert.match(result.stderr, /requires Python 3\.8\+/);
           assert.equal(existsSync(join(dir, "interpreter.txt")), false);
