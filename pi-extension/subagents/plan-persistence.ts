@@ -4,6 +4,15 @@ import { SessionManager, type ExtensionContext, type ExtensionAPI } from "@earen
 import { createPlan, detachPlan, deserializePlan, serializePlan, type Authority, type CommandContext, type PlanSnapshot } from "./plan-store.ts";
 
 export const PLAN_ENTRY = "pi-subagents-plan/v1";
+export const PLAN_ENTRY_V2 = "pi-subagents-plan/v2";
+const planEntryType = (plan: PlanSnapshot) => plan.schemaVersion === 2 ? PLAN_ENTRY_V2 : PLAN_ENTRY;
+const isKnownPlanEntry = (type: string) => type === PLAN_ENTRY || type === PLAN_ENTRY_V2;
+function loadEntry(customType: string, data: unknown): PlanSnapshot {
+  if (!isKnownPlanEntry(customType)) throw new Error(`Unsupported plan entry schema: ${customType}; writes disabled`);
+  const plan = deserializePlan(JSON.stringify(data));
+  if (planEntryType(plan) !== customType) throw new Error("Plan entry and payload schema mismatch; writes disabled");
+  return plan;
+}
 type Manager = ExtensionContext["sessionManager"];
 // Pi can append to its in-memory tree before disk append throws. Keep the failure
 // latch across extension reloads; only explicit disk reconciliation clears it.
@@ -40,8 +49,7 @@ export class PlanPersistence {
   private load(sm: Manager): PlanSnapshot | undefined {
     const entry = this.latest(sm);
     if (!entry || entry.type !== "custom") return undefined;
-    if (entry.customType !== PLAN_ENTRY) throw new Error(`Unsupported plan entry schema: ${entry.customType}; writes disabled`);
-    return deserializePlan(JSON.stringify(entry.data));
+    return loadEntry(entry.customType, entry.data);
   }
   restore(sm: Manager): PlanView {
     this.recovery.clear();
@@ -70,12 +78,12 @@ export class PlanPersistence {
       // Never restore snapshot state from another path. Only a validated detach
       // can exempt that path from rollback detection; malformed data stays read-only.
       const entry = node.entry;
-      if (entry.type === "custom" && entry.customType === PLAN_ENTRY) {
+      if (entry.type === "custom" && entry.customType.startsWith("pi-subagents-plan/")) {
         const identity = entry.data as Partial<PlanSnapshot> | undefined;
         if (identity?.planId !== plan.planId && identity?.authority?.branchInstanceId !== plan.authority.branchInstanceId &&
           identity?.source?.planId === plan.planId && identity.source.authority?.sessionId === plan.authority.sessionId &&
           identity.source.authority?.branchInstanceId === plan.authority.branchInstanceId) {
-          try { deserializePlan(JSON.stringify(identity)); return false; }
+          try { loadEntry(entry.customType, identity); return false; }
           catch { /* An invalid descendant is not proof of an independent branch. */ }
         }
         return true;
@@ -131,7 +139,7 @@ export class PlanPersistence {
   private save(sm: Manager, plan: PlanSnapshot): PlanSnapshot {
     const validated = deserializePlan(serializePlan(plan));
     try {
-      this.append(PLAN_ENTRY, validated);
+      this.append(planEntryType(validated), validated);
       if (!existsSync(sm.getSessionFile()!)) throw new Error("Session append was not durable");
     } catch (error) {
       const message = `Plan append failed; writes disabled until explicit reconcile: ${String(error)}`;

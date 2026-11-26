@@ -1,6 +1,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
-import { resolveLaunchProfile } from "../../launch-profile.ts";
 import { dirname, join } from "node:path";
+import { isDeepStrictEqual } from "node:util";
+import { readPiLaunchProfile, resolveLaunchProfile } from "../../launch-profile.ts";
 import type {
   HarnessDriver,
   SubagentLaunchContext,
@@ -11,6 +12,8 @@ import { ASSIGNMENT_ENV, type SubagentAssignment } from "../../assignment.ts";
 import { getSubagentActivityFile } from "../../activity.ts";
 import { INITIAL_SKILLS_ENV } from "../../initial-skills.ts";
 import { shellComment } from "../../shell.ts";
+import { assertQueueProfile, assertQueueWorkArea, denyQueueTransport, isQueueMarkedSession, QUEUE_CHILD_ENV } from "../../queue-child-allocation.ts";
+import { canonicalSessionPath } from "../../ownership.ts";
 
 const SUBAGENT_CONTROL_TOOLS = ["caller_ping", "subagent_done"] as const;
 
@@ -81,6 +84,19 @@ export class PiHarnessDriver implements HarnessDriver {
 
     const profile = context.launchProfile ?? resolveLaunchProfile(context, "pi",
       buildSubagentToolAllowlist(params.tools ?? agentDefs?.tools));
+    assertQueueProfile(profile);
+    const allocation = profile.queueAllocation;
+    if (context.resume && (allocation || isQueueMarkedSession(canonicalSessionPath(subagentSessionFile)))) denyQueueTransport();
+    if (allocation) {
+      const file = canonicalSessionPath(subagentSessionFile);
+      if (params.id !== allocation.rootRunId || file !== profile.sessionFile || !isQueueMarkedSession(file) ||
+          effectiveAutoExit !== profile.autoExit || context.effectiveInteractive !== profile.interactive ||
+          !isDeepStrictEqual(context.lineage, profile.lineage)) {
+        throw new Error("Queue launch requires the original persisted Pi session identity");
+      }
+      if (!isDeepStrictEqual(readPiLaunchProfile(file), profile)) throw new Error("Queue Pi launch profile changed after persistence");
+      assertQueueWorkArea(allocation, effectiveCwd, allocation.area.access, profile.interactive);
+    }
     const parts: string[] = ["pi"];
     if (profile.projectTrust === false || context.denyProjectConfig) parts.push("--no-approve");
     parts.push("--session", shellQuote(subagentSessionFile));
@@ -127,6 +143,7 @@ export class PiHarnessDriver implements HarnessDriver {
     envParts.push(`PI_SUBAGENT_AUTO_EXIT=${effectiveAutoExit ? "1" : "0"}`);
     // Explicit default prevents a nested worker inheriting the coordinator's mode.
     envParts.push(`PI_SUBAGENT_COMPLETION_MODE=${profile.completionMode ?? "automatic"}`);
+    if (allocation) envParts.push(`${QUEUE_CHILD_ENV}=1`);
     envParts.push(`PI_SUBAGENT_SESSION=${shellQuote(subagentSessionFile)}`);
     envParts.push(`PI_SUBAGENT_ID=${shellQuote(params.id)}`);
     const activityFile = getSubagentActivityFile(artifactDir, params.id);
@@ -162,9 +179,10 @@ export class PiHarnessDriver implements HarnessDriver {
     const assignment: SubagentAssignment = {
       version: 1,
       ...(profile.planTask ? { planTask: profile.planTask } : {}),
+      ...(allocation ? { queueAllocation: allocation } : {}),
       ...(profile.assignmentContract ? { assignmentContract: profile.assignmentContract } : {}),
       childId: params.id,
-      sessionFile: subagentSessionFile,
+      sessionFile: allocation ? profile.sessionFile : subagentSessionFile,
       sender: process.env.PI_SUBAGENT_NAME || "Parent agent",
       recipient: params.name,
       role: params.agent || agentDefs?.name || "Subagent",

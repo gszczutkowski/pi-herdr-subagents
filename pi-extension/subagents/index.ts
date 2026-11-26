@@ -5,12 +5,14 @@ import { Box, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { ACTIVE_ACCENT, OPEN_ACCENT, borderLine, borderTop, borderBottom, framedMessage } from "./frame.ts";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { setTimeout as delay } from "node:timers/promises";
 import { resolveSubagentCwd } from "./paths.ts";
 import { resolveRoleInstructions } from "./role-instructions.ts";
 import { shellComment } from "./shell.ts";
-import { persistLaunchProfile, persistProfileBinding, readPiLaunchProfile, resolveLaunchProfile, resumeLaunchContext } from "./launch-profile.ts";
+import { launchProfilePath, persistLaunchProfile, persistProfileBinding, readPiLaunchProfile, resolveLaunchProfile, resumeLaunchContext } from "./launch-profile.ts";
 import { continueLiveChild, hasAcceptedContinuation } from "./live-continuation.ts";
+import { assertQueueActiveResume, captureQueueChildFence, captureQueueResumeTarget, denyQueueTransport, hasQueueAllocation, inspectPersistedQueueProfile, isQueueMarkedSession } from "./queue-child-allocation.ts";
 import { auditSession, assertSessionWriters } from "./session-audit.ts";
 import { readChildIdentity } from "./recovery-identity.ts";
 import { closeOwnedChild, type CloseResult } from "./close-control.ts";
@@ -20,14 +22,19 @@ import { prepareLaunchRun, registerLaunchedRun } from "./launch-registration.ts"
 import { createLineage, type Lineage } from "./lineage.ts";
 import { recordHistory, registerPlanHistory } from "./history.ts";
 import { registerHistoryView } from "./history-view.ts";
-import { RuntimeStore, readRuntimeManifest, type RuntimeParent } from "./runtime-store.ts";
-import { reconcileRuntime, releaseRecoveredSession, type RecoverySupervisor } from "./runtime-recovery.ts";
-import { registerRecoveryReport, type RecoveryView } from "./recovery-report.ts";
+import { RuntimeStore, dispatchFailureEventId, hasAfterIntentMarker, readRuntimeManifest, resumeIntentBinding, runtimeRenameAttempts, verifyResumeImages, type DurableRun, type RuntimeManifest, type RuntimeParent } from "./runtime-store.ts";
+import { reconcileRuntime, releaseRecoveredSession, type RecoveryDispatchDisposition, type RecoverySupervisor } from "./runtime-recovery.ts";
+import { dispatchReport, notifyRecoveryOnStartup, recoveryHistory, registerRecoveryReport, type RecoveryView } from "./recovery-report.ts";
 import type { SubagentLaunchContext } from "./harness/types.ts";
 import { fileURLToPath } from "node:url";
 import {
+  closeSync,
+  constants,
   existsSync,
+  fstatSync,
   mkdirSync,
+  openSync,
+  readSync,
 } from "node:fs";
 import {
   isTerminalAvailable,
@@ -90,7 +97,8 @@ import { globalStateSlot } from "./global-state.ts";
 import { registerPlanTools } from "./plan-tools.ts";
 import type { PlanPersistence } from "./plan-persistence.ts";
 import { AssignmentContractSchema, resolveAssignmentContract, contractTask, normalizeStructuredResult, type StructuredResult } from "./contracts.ts";
-import { PlanTaskParams, bindPlanRun, importPlanEnvelope, recordDispatchFailure, resolveResumeContract, type PlanTaskBinding } from "./plan-runtime.ts";
+import { PlanTaskParams, assertLegacyBoundTransport, bindPlanRun, DispatchEvidenceWriteError, importPlanEnvelope, recordDispatchFailure, resolveResumeContract, samePlanBinding, type PlanTaskBinding } from "./plan-runtime.ts";
+import { captureDispatchEvidence, dispatchIncidents, dispatchReason, noRetry, operationCode, readDispatchEvidence, reconcileDispatchEvidence, verifiedUnsentRunIds, type DispatchEvidence, type DispatchIncident, type DispatchOperation } from "./dispatch-recovery.ts";
 import { registerPlanCommand } from "./plan-preflight.ts";
 import { createDeliveryState, deliveryDiagnostics, enqueueDelivery, flushDeliveries, pauseDeliveries, reconcileUnsentDeliveries, restoreDurableDeliveries, type DeliveryState } from "./delivery.ts";
 import {
@@ -367,16 +375,21 @@ function getArtifactDir(sessionDir: string, sessionId: string): string {
 
 const config = getSubagentConfig();
 
+function keepOpenGuidance(runId: string): string {
+  return `Child was left open at settlement. If it is still open and idle, no follow-up is needed, and you are authorized to close it, call subagent_close(${JSON.stringify({ id: runId })}). For planned follow-up, use subagent_resume with a message in the existing session.`;
+}
+
 function resolveResultPresentation(
   result: Pick<
     SubagentResult,
     "exitCode" | "elapsed" | "summary" | "sessionFile" | "errorMessage" | "keepOpen"
   >,
   name: string,
+  runId: string,
 ): string {
-  const followUp = result.keepOpen === true ? "\n\nThe child remains supervised for follow-up; subsequent results return here. Use subagent_resume with a message, or type in its pane. Close the child process to end supervision." : "";
+  const followUp = result.keepOpen === true ? `${keepOpenGuidance(runId)}\n\n` : "";
   const sessionRef = result.sessionFile
-    ? `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`
+    ? `\n\nSession: ${result.sessionFile}${result.keepOpen === true ? "" : `\nResume: pi --session ${result.sessionFile}`}`
     : "";
 
   if (result.errorMessage) {
@@ -387,15 +400,15 @@ function resolveResultPresentation(
     return (
       `Sub-agent "${name}" failed after ${formatElapsed(result.elapsed)} ` +
       `(provider/agent error — auto-retry exhausted).\n\n` +
-      `Error: ${result.errorMessage}\n\n` +
+      `${followUp}Error: ${result.errorMessage}\n\n` +
       `The subagent did not produce a result. You can retry by spawning a new ` +
-      `subagent or resume the session with subagent_resume.${sessionRef}${followUp}`
+      `subagent or resume the session with subagent_resume.${sessionRef}`
     );
   }
 
   return result.exitCode !== 0
-    ? `Sub-agent "${name}" failed (exit code ${result.exitCode}).\n\n${result.summary}${sessionRef}${followUp}`
-    : `Sub-agent "${name}" completed (${formatElapsed(result.elapsed)}).\n\n${result.summary}${sessionRef}${followUp}`;
+    ? `Sub-agent "${name}" failed (exit code ${result.exitCode}).\n\n${followUp}${result.summary}${sessionRef}`
+    : `Sub-agent "${name}" completed (${formatElapsed(result.elapsed)}).\n\n${followUp}${result.summary}${sessionRef}`;
 }
 
 /**
@@ -476,7 +489,12 @@ interface SubagentRuntime {
   planImportErrors?: Map<string, string>;
   store?: RuntimeStore;
   stopRecovery?: RecoverySupervisor;
+  recoveryInFlight?: { ctx: ExtensionContext; pi?: ExtensionAPI; store?: RuntimeStore; operation: Promise<string | undefined> };
   recoveryError?: string;
+  recoveryIOError?: boolean;
+  dispatchEvidence?: Map<string, DispatchEvidence>;
+  dispatchRepair?: { store: RuntimeStore; incidents: DispatchIncident[]; storeError?: string;
+    requiresExplicitReconcile?: true; journalReadFault?: true }; // journalReadFault can survive reload from older code
   /** Settlements observed while no session-bound context is available. */
   suspendedCompletions?: Map<string, { running: RunningSubagent; result: SubagentResult }>;
   runningSubagents: Map<string, RunningSubagent>;
@@ -500,7 +518,7 @@ const runningSubagents = runtime.runningSubagents;
 function durableStoreFor(ctx: Pick<ExtensionContext, "sessionManager">): RuntimeStore | undefined {
   // Legacy host/test adapters cannot claim durable recovery support.
   if (typeof ctx.sessionManager.getHeader !== "function" || typeof ctx.sessionManager.getBranch !== "function") return undefined;
-  if (runtime.recoveryError) throw new Error(runtime.recoveryError);
+  assertStorageAvailable();
   if (runtime.store) {
     runtime.store.assertCustody();
     return runtime.store;
@@ -537,39 +555,253 @@ function ownsActiveBranch(ctx: ExtensionContext | undefined, parent: RuntimePare
   } catch { return false; }
 }
 
+function recoveryIOError(error: unknown): boolean {
+  return ["EPERM", "EBUSY", "EIO", "ENOSPC", "EACCES", "EROFS", "EMFILE", "ENFILE"].includes(operationCode(error) ?? "");
+}
+
+function activeDispatchRepair() {
+  const repair = runtime.dispatchRepair;
+  if (!repair || repair.store !== runtime.store) return;
+  if (repair.journalReadFault) repair.requiresExplicitReconcile = true;
+  return repair;
+}
+
+function dispatchStoragePause(code: string): Error {
+  return Object.assign(new Error(`Dispatch metadata write paused (${code}). Use subagents_reconcile, or type /subagents-reconcile in the original Pi session.`), { code });
+}
+
+type DispatchRepair = NonNullable<SubagentRuntime["dispatchRepair"]>;
+
+function dispatchStorageError(explicitFence?: DispatchRepair): string | undefined {
+  const repair = activeDispatchRepair();
+  return repair !== explicitFence ? repair?.storeError : undefined;
+}
+
+function assertStorageAvailable(explicitFence?: DispatchRepair): void {
+  if (runtime.recoveryError) throw new Error(runtime.recoveryError);
+  const code = dispatchStorageError(explicitFence);
+  if (code) throw dispatchStoragePause(code);
+}
+
+function pauseRecoveredSupervision(): void {
+  runtime.stopRecovery?.();
+  runtime.stopRecovery = undefined;
+  pauseDeliveries(delivery);
+}
+
+function latchDispatchStorageFault(store: RuntimeStore, code: string, incidents?: DispatchIncident[]): void {
+  if (runtime.store !== store) return;
+  const repair = activeDispatchRepair();
+  // Incidental reads cannot clear or replace an observed fence. A failed
+  // reconciliation owns the latest repair diagnostics but leaves it latched.
+  runtime.dispatchRepair = { store, incidents: incidents ?? repair?.incidents ?? [],
+    storeError: incidents !== undefined ? code : repair?.storeError ?? code, requiresExplicitReconcile: true };
+  pauseRecoveredSupervision();
+}
+
+function applyDispatchRepair(repair: DispatchRepair): void {
+  if (repair.storeError) latchDispatchStorageFault(repair.store, repair.storeError, repair.incidents);
+  else if (runtime.store === repair.store) runtime.dispatchRepair = repair;
+}
+
+function evidenceMemory(): Map<string, DispatchEvidence> { return runtime.dispatchEvidence ??= new Map(); }
+
+function readParentDispatchEvidence(directory: string, manifest: Pick<RuntimeManifest, "parent" | "retainedDispatchEvidence">,
+  store?: RuntimeStore) {
+  const evidence = readDispatchEvidence(directory, manifest, evidenceMemory());
+  if (evidence.storeError && store) latchDispatchStorageFault(store, evidence.storeError);
+  return evidence;
+}
+
+function canProjectPlan(explicitFence?: DispatchRepair): boolean {
+  const repair = activeDispatchRepair();
+  return !repair?.requiresExplicitReconcile || repair === explicitFence;
+}
+
+function dispatchPlanProjection(store: RuntimeStore, explicitFence?: DispatchRepair) {
+  return { store, memory: evidenceMemory(), incidents: activeDispatchRepair()?.incidents,
+    canImport: () => runtime.store === store && canProjectPlan(explicitFence),
+    readEvidence: (manifest: RuntimeManifest) => {
+      const evidence = readParentDispatchEvidence(store.directory, manifest, store);
+      const storeError = runtime.store === store ? dispatchStorageError(explicitFence) : undefined;
+      return storeError ? { ...evidence, storeError } : evidence;
+    },
+    onCustodyError: (error: unknown) => {
+      const code = operationCode(error);
+      if (code) latchDispatchStorageFault(store, code);
+    } };
+}
+
+function assertFreshDispatchStorage(store: RuntimeStore | undefined): void {
+  assertStorageAvailable();
+  if (!store) return;
+  if (runtime.store !== store) throw new Error("Fresh dispatch lost current runtime custody");
+  const custody = store.dispatchCustody();
+  if (custody.custodyPaused !== undefined) throw new Error("Fresh dispatch requires current branch custody");
+  // Only journal readability/schema is global. This gate doesn't classify or
+  // import individual claims and doesn't have to clone historical runs/outbox.
+  readParentDispatchEvidence(store.directory, custody, store);
+  assertStorageAvailable();
+}
+
+function reconcileDispatchMetadata(ctx: ExtensionContext, store: RuntimeStore) {
+  store.assertCustody();
+  const manifest = store.snapshot();
+  if (manifest.custodyPaused || !ownsActiveBranch(ctx, manifest.parent)) throw new Error("Dispatch repair requires current branch custody");
+  const plan = runtime.plans?.read(ctx.sessionManager);
+  const evidence = readParentDispatchEvidence(store.directory, manifest, store);
+  return { store, ...reconcileDispatchEvidence(store, evidence, plan?.writable ? plan.snapshot : undefined, evidenceMemory()) };
+}
+
+function readDispatchDisposition(ctx: ExtensionContext, store: RuntimeStore): RecoveryDispatchDisposition {
+  const manifest = store.snapshot();
+  const evidence = readParentDispatchEvidence(store.directory, manifest, store);
+  if (evidence.storeError) throw dispatchStoragePause(evidence.storeError);
+  const view = runtime.plans?.read(ctx.sessionManager);
+  const incidents = dispatchIncidents(manifest, view?.writable ? view.snapshot : undefined,
+    store.directory, evidence, activeDispatchRepair()?.incidents);
+  return {
+    unsent: verifiedUnsentRunIds(incidents),
+    conflicts: new Set(incidents.filter(item => item.status === "still-blocked" && item.code === "EVIDENCE_CONFLICT").map(item => item.runId)),
+  };
+}
+
+function handleLaunchFailure(ctx: ExtensionContext, store: RuntimeStore | undefined, binding: PlanTaskBinding | undefined,
+  unprepared: { id: string; sessionFile: string; name: string; task: string; startTime: number }, error: unknown, dispatched: boolean, operation: DispatchOperation): void {
+  const saved = store?.getRun(unprepared.id);
+  const run = saved ? { ...unprepared, sessionFile: saved.sessionFile } : unprepared;
+  const afterIntent = operation === verifyResumeImages ? resumeIntentBinding({ ...run, planTask: binding }) : undefined;
+  try { recordDispatchFailure(runtime.plans!, ctx, binding, run.id, error, store, run, dispatched, afterIntent,
+    store ? dispatchPlanProjection(store) : undefined); }
+  catch (failure) {
+    if (!(failure instanceof DispatchEvidenceWriteError) || !store) {
+      (runtime.planImportErrors ??= new Map()).set(run.id, `Dispatch ${run.id}: task import pending (${operationCode(failure) ?? "IMPORT_REFUSED"})`);
+      return;
+    }
+    const { record, retained } = captureDispatchEvidence(evidenceMemory(), store, {
+      runId: run.id, sessionFile: run.sessionFile, startedAt: run.startTime, binding, dispatched, operation,
+    }, error, failure.writeError);
+    const last = activeDispatchRepair();
+    // A failed durable write isn't cleared by a successful read or timer pass.
+    // Never apply a captured context's failure to a replacement branch/store.
+    if (runtime.store === store) runtime.dispatchRepair = { store, storeError: record.writeCode, requiresExplicitReconcile: last?.requiresExplicitReconcile,
+      incidents: [...(last?.incidents ?? []).filter(item => item.runId !== run.id), {
+        runId: run.id, status: "still-blocked", phase: record.phase, code: record.writeCode, reason: dispatchReason(record), recordedAt: record.recordedAt,
+        ...(retained !== "none" ? { evidence: retained } : {}),
+        next: `${dispatched ? `${noRetry} ` : ""}Use subagents_reconcile, or type /subagents-reconcile in the original Pi session.`, attempts: runtimeRenameAttempts(failure.writeError) ?? 1,
+      }] };
+    if (error instanceof Error) error.message += `; dispatch ${run.id} ${record.phase}, failure evidence ${retained === "none" ? "not retained" : retained} (${record.writeCode}). Use subagents_reconcile or type /subagents-reconcile in the original Pi session.`;
+  }
+}
+
 /** Read only this parent's manifest, never acquire custody or scan other sessions. */
-function readRecoveryView(ctx: ExtensionContext): RecoveryView {
+function readRecoveryView(ctx: ExtensionContext, explicitFence?: DispatchRepair): RecoveryView {
   try {
     if (typeof ctx.sessionManager.getHeader !== "function" || typeof ctx.sessionManager.getBranch !== "function") {
       return { error: "Host lacks branch/header APIs; durable recovery unavailable" };
     }
     const header = ctx.sessionManager.getHeader();
-    if (!header?.id || !ctx.sessionManager.getSessionFile()) return { error: "Saved parent session unavailable" };
-    const manifest = runtime.store?.snapshot() ?? readRuntimeManifest(join(getArtifactDir(ctx.sessionManager.getSessionDir(), header.id), "subagent-runtime"));
+    const sessionFile = ctx.sessionManager.getSessionFile();
+    if (!header?.id || !sessionFile) return { error: "Saved parent session unavailable" };
+    const current = runtime.store;
+    const directory = current?.directory ?? join(getArtifactDir(ctx.sessionManager.getSessionDir(), header.id), "subagent-runtime");
+    const manifest = current?.snapshot() ?? readRuntimeManifest(directory);
     if (manifest && !ownsActiveBranch(ctx, manifest.parent)) return { error: "Parent session/active branch mismatch; no recovery access" };
-    if (runtime.recoveryError) return { error: runtime.recoveryError };
-    runtime.store?.assertCustody();
-    return { manifest, paused: manifest?.custodyPaused,
-      diagnostics: [...(runtime.planImportErrors?.values() ?? []), ...deliveryDiagnostics(delivery),
+    if (manifest && runtime.recoveryError && !runtime.recoveryIOError) return { error: runtime.recoveryError };
+    let storageError = manifest ? runtime.recoveryError ?? dispatchStorageError(explicitFence) : undefined;
+    try { current?.assertCustody(); } catch (error) {
+      if (!recoveryIOError(error)) return { error: String(error) };
+      if (current) latchDispatchStorageFault(current, operationCode(error)!);
+      storageError = String(error);
+    }
+    const plan = runtime.plans?.read(ctx.sessionManager);
+    const savedPlan = plan?.writable ? plan.snapshot : undefined;
+    const evidence = manifest ? readParentDispatchEvidence(directory, manifest, current)
+      : { records: new Map(), conflicts: new Set<string>(), diagnostics: [], verifiedFiles: new Set<string>() };
+    if ("storeError" in evidence) storageError ??= evidence.storeError;
+    const dispatch = dispatchIncidents(manifest, savedPlan, directory, evidence, [...(activeDispatchRepair()?.incidents ?? [])]);
+    const missing = new Set(dispatch.filter(item => item.status === "dispatch-unknown" && item.code === "NO_DURABLE_RUN").map(item => item.runId));
+    const importErrors: string[] = [];
+    const history: NonNullable<RecoveryView["history"]> = [];
+    if (manifest) for (const [id, message] of runtime.planImportErrors ?? []) {
+      // Pre-journal runtimes preserved this string and run ID across /reload,
+      // but could not retain evidence to import. Keep it as history only for
+      // the exact unknown run; real pending imports still block reconciliation.
+      if (missing.has(id) && message.startsWith("Dispatch failed/uncertain; task import pending: Error: Failure evidence NOT persisted;")) {
+        history.push({ runId: id, message });
+      } else importErrors.push(message);
+    }
+    return { manifest, paused: manifest?.custodyPaused, storageError, dispatch, history,
+      planNoticeScope: !manifest && savedPlan ? [canonicalSessionPath(sessionFile), header.id, savedPlan.planId, savedPlan.authority.branchInstanceId] : undefined,
+      diagnostics: [...evidence.diagnostics, ...importErrors, ...deliveryDiagnostics(delivery),
         ...(runtime.stopRecovery?.status?.().errors.map(failure => `Supervision paused${failure.runId ? ` (${failure.runId})` : ""}: ${failure.error}`) ?? []),
         ...[...runningSubagents.values()].flatMap(child => child.observationError ? [`${child.name}: ${child.observationError}`] : [])] };
   } catch (error) { return { error: String(error) }; }
 }
 
-async function recoverParentRuntime(ctx: ExtensionContext): Promise<void> {
+function pendingParentRecovery(ctx: ExtensionContext): Promise<string | undefined> | undefined {
+  const { recoveryInFlight, latestCtx, pi, store } = runtime;
+  if (recoveryInFlight && latestCtx?.sessionManager === ctx.sessionManager && recoveryInFlight.ctx === latestCtx &&
+      recoveryInFlight.pi === pi && recoveryInFlight.store === store) return recoveryInFlight.operation;
+}
+
+function recoverParentRuntime(ctx: ExtensionContext, repair = true, explicitFence?: DispatchRepair): Promise<string | undefined> {
+  const pending = pendingParentRecovery(ctx);
+  if (pending) return pending;
+  const { latestCtx, pi } = runtime;
+  const restore = restoreParentRuntime(ctx, repair, explicitFence);
+  if (!latestCtx || latestCtx.sessionManager !== ctx.sessionManager || runtime.latestCtx !== latestCtx || runtime.pi !== pi) return restore;
+  // Restoration may acquire a store synchronously before awaiting its first
+  // child probe. Match the acquired store, and do not join across navigation.
+  const flight = { ctx: latestCtx, pi, store: runtime.store, operation: restore.finally(() => {
+    if (runtime.recoveryInFlight === flight) runtime.recoveryInFlight = undefined;
+  }) };
+  runtime.recoveryInFlight = flight;
+  return flight.operation;
+}
+
+async function restoreParentRuntime(ctx: ExtensionContext, repair: boolean, explicitFence?: DispatchRepair): Promise<string | undefined> {
   if (typeof ctx.sessionManager.getHeader !== "function") return;
+  // Pi gives the caller a fresh context object. Capture the active lifecycle
+  // context separately so navigation/reload still invalidates this attempt.
+  const { latestCtx, pi } = runtime;
+  let expectedStore = runtime.store;
+  let parent: RuntimeParent | undefined;
+  let startupRepair: SubagentRuntime["dispatchRepair"];
+  const isCurrent = () => latestCtx?.sessionManager === ctx.sessionManager && runtime.latestCtx === latestCtx &&
+    runtime.pi === pi && runtime.store === expectedStore && (!parent || ownsActiveBranch(latestCtx, parent));
   try {
+    if (!isCurrent()) throw new Error("Recovery requires the current parent session");
     const header = ctx.sessionManager.getHeader();
     if (!header?.id) return;
-    const directory = join(getArtifactDir(ctx.sessionManager.getSessionDir(), header.id), "subagent-runtime");
-    const manifest = runtime.store?.snapshot() ?? readRuntimeManifest(directory);
-    if (!manifest) return;
-    if (manifest.custodyPaused) throw new Error(`Recovery requires an explicit branch decision: ${manifest.custodyPaused}`);
-    if (!ownsActiveBranch(ctx, manifest.parent)) throw new Error("Recovery parent session/active branch mismatch; no custody inherited");
-    const store = runtime.store ?? new RuntimeStore(directory, manifest.parent);
-    runtime.store = store;
+    const directory = runtime.store?.directory ?? join(getArtifactDir(ctx.sessionManager.getSessionDir(), header.id), "subagent-runtime");
+    const previous = runtime.store?.snapshot() ?? readRuntimeManifest(directory);
+    if (!previous) return;
+    if (previous.custodyPaused) throw new Error(`Recovery requires an explicit branch decision: ${previous.custodyPaused}`);
+    if (!ownsActiveBranch(ctx, previous.parent)) throw new Error("Recovery parent session/active branch mismatch; no custody inherited");
+    parent = previous.parent;
+    const store = expectedStore ?? new RuntimeStore(directory, parent, candidate => {
+      candidate.isCurrent = () => ownsActiveBranch(runtime.latestCtx, previous.parent);
+      startupRepair = reconcileDispatchMetadata(ctx, candidate);
+      if (startupRepair.storeError) {
+        // Do not rotate custody after a journal read/validation or storage
+        // failure. Readable run-local conflicts don't block rotation.
+        throw Object.assign(new Error(`Dispatch evidence write blocked (${startupRepair.storeError})`), { code: startupRepair.storeError });
+      }
+    });
+    runtime.store = expectedStore = store;
     delivery.store = store;
-    store.isCurrent = () => ownsActiveBranch(runtime.latestCtx, manifest.parent);
+    store.isCurrent = () => ownsActiveBranch(runtime.latestCtx, previous.parent);
+    if (startupRepair) runtime.dispatchRepair = startupRepair;
+    else if (repair && !activeDispatchRepair()?.requiresExplicitReconcile) applyDispatchRepair(reconcileDispatchMetadata(ctx, store));
+    if (dispatchStorageError(explicitFence)) {
+      // A reload/tree restore changes the supervisor's captured context. Do
+      // not leave the expired supervisor installed while storage is fenced.
+      pauseRecoveredSupervision();
+      return;
+    }
+    const disposition = readDispatchDisposition(ctx, store);
+    const manifest = store.snapshot();
     const eventIds = new Set(ctx.sessionManager.getBranch().flatMap((entry) => {
       const message = entry.type === "custom_message" ? entry : entry.type === "message" ? entry.message : undefined;
       const id = (message as any)?.details?.eventId;
@@ -578,6 +810,7 @@ async function recoverParentRuntime(ctx: ExtensionContext): Promise<void> {
         JSON.stringify((message as any)?.content) === JSON.stringify(expected.content) ? [id] : [];
     }));
     store.assertCustody();
+    pauseDeliveries(delivery);
     restoreDurableDeliveries(delivery, store, eventIds);
     for (const [key, settlement] of runtime.suspendedCompletions ?? []) {
       if (settlement.running.durableStore !== store) continue;
@@ -592,6 +825,9 @@ async function recoverParentRuntime(ctx: ExtensionContext): Promise<void> {
       }
     }
     runtime.stopRecovery?.();
+    // Only this restoration may work behind the old fence. A new fault replaces
+    // its identity and immediately stops the pass; timers never bypass it.
+    let restoring = true;
     const stopRecovery = await reconcileRuntime(store, (run, evidence) => {
       // Recovery may commit this event before the preserved live watcher polls.
       const live = runningSubagents.get(run.id);
@@ -601,24 +837,41 @@ async function recoverParentRuntime(ctx: ExtensionContext): Promise<void> {
       enqueueSubagentCompletion(running, { ...evidence, name: run.name, task: run.task,
         summary: evidence.summary ?? evidence.errorMessage ?? "Recovered run-bound completion (no immutable summary)",
         sessionFile: run.sessionFile, elapsed: Math.floor((Date.now() - run.startTime) / 1000) });
-    }, () => runtime.store === store && ownsActiveBranch(runtime.latestCtx, manifest.parent), {
-      maxEventsPerPass: 100,
+    }, () => isCurrent() && !dispatchStorageError(restoring ? explicitFence : undefined), {
+      maxEventsPerPass: 100, disposition,
       onError: failure => {
-        const current = runtime.latestCtx;
+        if (!isCurrent()) return;
         const message = `Subagent supervision paused${failure.runId ? ` (${failure.runId})` : ""}: ${failure.error}. Use /subagents-reconcile after fixing storage.`;
         reportDelegationPause(store, message);
-        if (current?.hasUI) current.ui.notify(message, "warning");
+        if (latestCtx?.hasUI) latestCtx.ui.notify(message, "warning");
       },
     });
-    if (runtime.store !== store || !ownsActiveBranch(runtime.latestCtx, manifest.parent)) { stopRecovery(); return; }
+    restoring = false;
+    try {
+      if (!isCurrent()) throw new Error("Recovery lost current parent session/branch custody");
+      const fault = dispatchStorageError(explicitFence);
+      if (fault) throw dispatchStoragePause(fault);
+      store.assertCustody();
+      if (explicitFence) {
+        const { errors } = stopRecovery.status();
+        if (errors.length) throw new Error(errors[0].error);
+      }
+    } catch (error) { stopRecovery(); throw error; }
     runtime.stopRecovery = stopRecovery;
-    store.assertCustody();
     runtime.recoveryError = undefined;
+    runtime.recoveryIOError = undefined;
   } catch (error) {
-    if (runtime.latestCtx !== ctx) return;
-    runtime.recoveryError = `Subagent recovery paused: ${String(error)}`;
-    pauseDeliveries(delivery);
-    if (ctx.hasUI) ctx.ui.notify(runtime.recoveryError, "warning");
+    const message = `Subagent recovery paused: ${String(error)}`;
+    if (isCurrent()) {
+      if (explicitFence && activeDispatchRepair() === explicitFence && recoveryIOError(error)) {
+        latchDispatchStorageFault(explicitFence.store, operationCode(error)!, explicitFence.incidents);
+      }
+      runtime.recoveryError = message;
+      runtime.recoveryIOError = !!startupRepair?.storeError || !!activeDispatchRepair()?.requiresExplicitReconcile || recoveryIOError(error);
+      pauseDeliveries(delivery);
+      if (latestCtx?.hasUI) latestCtx.ui.notify(message, "warning");
+    }
+    return message;
   }
 }
 
@@ -734,7 +987,7 @@ export function enqueueSubagentCompletion(running: RunningSubagent, result: Suba
   const normalized = normalizeStructuredResult(result.structuredResult);
   const resultDiagnostic = normalized.resultDiagnostic ?? result.resultDiagnostic
     ?? (!normalized.structuredResult ? "Unstructured result (optional structure absent or invalid): requires parent review, not acceptance." : undefined);
-  const base = resolveResultPresentation(result, running.name)
+  const base = resolveResultPresentation(result, running.name, running.id)
     + (normalized.structuredResult ? `\n\nStructured result (proposal, requires parent review):\n${JSON.stringify(normalized.structuredResult, null, 2)}` : "")
     + (resultDiagnostic ? `\n\n${resultDiagnostic}` : "");
   enqueueCompletion(running, {
@@ -747,7 +1000,8 @@ export function enqueueSubagentCompletion(running: RunningSubagent, result: Suba
       response: result.errorMessage ? `Error: ${result.errorMessage}` : result.summary,
       ...normalized,
       ...(resultDiagnostic ? { resultDiagnostic } : {}),
-      keepOpen: result.keepOpen, agent: running.agent, exitCode: result.exitCode,
+      keepOpen: result.keepOpen, ...(result.keepOpen === true ? { runId: running.id } : {}),
+      agent: running.agent, exitCode: result.exitCode,
       elapsed: result.elapsed, sessionFile: result.sessionFile, lineage: running.lineage,
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
       ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
@@ -1052,7 +1306,7 @@ function interruptCustodyGuard(running: RunningSubagent, ctx: ExtensionContext |
   const surface = running.surface, activityFile = running.activityFile;
   return () => {
     signal?.throwIfAborted();
-    if (runtime.recoveryError) throw new Error(runtime.recoveryError);
+    assertStorageAvailable();
     if (runtime.treeSuspension || running.terminalActionsAllowed === false ||
         running.id !== runId || running.cli !== cli || runningSubagents.get(runId) !== running ||
         sessionOwners.get(path) !== owner || owner.runId !== runId || !owner.dispatched ||
@@ -1254,9 +1508,10 @@ async function launchSubagent(
     };
   },
   parentThinking: ThinkingLevel,
-  options?: { surface?: string; signal?: AbortSignal },
+  options?: { surface?: string; signal?: AbortSignal; assertExecution?: () => void },
 ): Promise<RunningSubagent> {
   options?.signal?.throwIfAborted();
+  options?.assertExecution?.();
   const startTime = Date.now();
   const id = randomUUID();
 
@@ -1314,12 +1569,16 @@ async function launchSubagent(
   ].join("-");
   const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
 
+  const selectedPlan = params.planTask ? runtime.plans!.read(ctx.sessionManager).snapshot : undefined;
+  if (selectedPlan) assertLegacyBoundTransport(selectedPlan);
   const store = durableStoreFor(ctx);
+  assertFreshDispatchStorage(store);
   const owner = reserveSession(subagentSessionFile, id);
   let planTask: PlanTaskBinding | undefined;
+  let operation: DispatchOperation = "prepare-launch";
   try {
   if (params.planTask && !store) throw new Error("Task-bound runs require durable runtime custody");
-  const boundTask = params.planTask ? runtime.plans!.read((ctx as ExtensionContext).sessionManager).snapshot?.tasks.find(t => t.taskId === params.planTask!.taskId) : undefined;
+  const boundTask = selectedPlan?.tasks.find(t => t.taskId === params.planTask!.taskId);
   const assignmentContract = resolveAssignmentContract(params.assignmentContract, boundTask);
   planTask = bindPlanRun(runtime.plans!, ctx as ExtensionContext, id, params.planTask);
   const surfacePreCreated = !!options?.surface;
@@ -1410,17 +1669,24 @@ async function launchSubagent(
     .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
 
+  operation = "persist-prepared";
   const preparedRun = prepareLaunchRun(store, { id, planTask, name: params.name, task: params.task, startTime,
     sessionFile: built.sessionFile ?? subagentSessionFile,
     surface, cli: built.cli, activityFile, sentinelFile: built.sentinelFile,
     launchScriptFile, profile: launchContext.launchProfile, lineage });
+  operation = "prepare-transport";
   runScriptInPane(surface, built.command, {
     onDispatch: () => {
+      operation = "validate-dispatch";
       options?.signal?.throwIfAborted();
       validateSources();
       assertAgentDirectoryAuthorized(ctx, getAgentConfigDir(), effectiveAgentDir, targetCwdForSession);
       if (planTask) bindPlanRun(runtime.plans!, ctx as ExtensionContext, id, undefined, planTask);
-      store?.phase(id, "dispatch-intent"); owner.dispatched = true;
+      options?.assertExecution?.();
+      assertFreshDispatchStorage(store);
+      operation = "persist-intent";
+      store?.commitFreshDispatch(id, canonicalSessionPath(preparedRun.sessionFile), planTask); owner.dispatched = true;
+      operation = "send-to-terminal";
     },
     scriptPath: launchScriptFile,
     scriptPreamble: (built.launchScriptPreamble ?? [
@@ -1430,22 +1696,17 @@ async function launchSubagent(
     ].map(shellComment)).join("\n"),
   });
 
+  operation = "persist-supervised";
   store?.phase(id, "supervised");
+  operation = "register-supervision";
   recordHistory(lineage, id, "assignment", params.task, id, [subagentSessionFile, launchScriptFile]);
   const running = registerLaunchedRun(runningSubagents, store, preparedRun, {
     agent: params.agent, hasActivitySnapshots: driver.hasActivitySnapshots === true, runtimePlan,
   });
   return running;
   } catch (error) {
-    try { recordDispatchFailure(runtime.plans!, runtime.latestCtx ?? ctx as ExtensionContext, planTask, id, error,
-      store, { id, sessionFile: subagentSessionFile, name: params.name, task: params.task, startTime }, owner.dispatched); }
-    catch (importError) {
-      (runtime.planImportErrors ??= new Map()).set(id, `Dispatch failed/uncertain; task import pending: ${String(importError)}`);
-      if (String(importError).includes("NOT persisted")) {
-        runtime.recoveryError = String(importError);
-        if (error instanceof Error) error.message += `; ${String(importError)}`;
-      }
-    }
+    if (operation !== "prepare-launch" || planTask) handleLaunchFailure(ctx as ExtensionContext, store, planTask,
+      { id, sessionFile: subagentSessionFile, name: params.name, task: params.task, startTime }, error, owner.dispatched, operation);
     if (!owner.dispatched) {
       releaseSession(subagentSessionFile, id);
       if (owner.surface && !options?.surface) {
@@ -1681,7 +1942,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       const ctx = runtime.latestCtx;
       const store = runtime.store;
       if (!ctx || query?.sessionManager !== ctx.sessionManager || runtime.pi !== pi || delivery.api !== pi ||
-          !store || runtime.recoveryError || runtime.treeSuspension) return;
+          !store || runtime.recoveryError || activeDispatchRepair()?.storeError || runtime.treeSuspension) return;
       try { store.assertCustody(); } catch { return; }
       // A parked or already delivered result is not a future wakeup. An idle
       // keepOpen process only qualifies for a freshly accepted continuation.
@@ -1706,24 +1967,38 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   const imported = new Set<string>();
   let importStore: RuntimeStore | undefined;
   let importOffset = 0;
-  delivery.onEnvelope = (runId, envelope) => {
+  const importEnvelope = (runId: string, envelope: Parameters<NonNullable<DeliveryState["onEnvelope"]>>[1], explicitFence?: DispatchRepair) => {
     const eventId = String((envelope.message.details as any)?.eventId ?? runId);
     if (imported.has(eventId)) return;
     pendingImports.set(eventId, { runId, envelope });
+    if (!canProjectPlan(explicitFence)) return;
     try {
-      const binding = runtime.store?.runBinding(runId) ?? runningSubagents.get(runId)?.planTask;
-      if (binding) {
-        if (!runtime.latestCtx) throw new Error("Parent context unavailable during reload");
-        runtime.store?.assertCustody();
-        importPlanEnvelope(runtime.plans!, runtime.latestCtx, binding, runId, envelope);
+      const store = runtime.store;
+      const ctx = runtime.latestCtx;
+      const marker = hasAfterIntentMarker(envelope);
+      const failureEvent = eventId === dispatchFailureEventId(runId);
+      const binding = store?.runBinding(runId) ?? (marker ? undefined : runningSubagents.get(runId)?.planTask);
+      if (marker || binding || (failureEvent && store)) {
+        if (!ctx) {
+          if (marker || (failureEvent && store)) return;
+          throw new Error("Parent context unavailable during reload");
+        }
+        // Consult the current durable cursor even if a stale callback omitted
+        // a marker, or if an ordinary result shares a quarantined cursor.
+        if (!importPlanEnvelope(runtime.plans!, ctx, binding, runId, envelope,
+          store ? dispatchPlanProjection(store, explicitFence) : undefined)) return;
       }
       pendingImports.delete(eventId);
       imported.add(eventId);
       runtime.planImportErrors!.delete(eventId);
       if (eventId.includes(":dispatch-failure:")) runtime.planImportErrors!.delete(runId);
-    } catch (error) { runtime.planImportErrors!.set(eventId, `Task import pending: ${String(error)}`); }
+    } catch (error) {
+      if (explicitFence && recoveryIOError(error)) latchDispatchStorageFault(explicitFence.store, operationCode(error)!);
+      runtime.planImportErrors!.set(eventId, `Task import pending: ${String(error)}`);
+    }
   };
-  const retryPlanImports = () => {
+  delivery.onEnvelope = importEnvelope;
+  const retryPlanImports = (explicitFence?: DispatchRepair) => {
     const store = runtime.store;
     if (store !== importStore) { importStore = store; importOffset = 0; imported.clear(); }
     if (store) {
@@ -1737,7 +2012,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         if (event) pendingImports.set(id, { runId: event.runId, envelope: event.envelope });
       }
     }
-    for (const { runId, envelope } of pendingImports.values()) delivery.onEnvelope?.(runId, envelope);
+    for (const { runId, envelope } of pendingImports.values()) importEnvelope(runId, envelope, explicitFence);
   };
   pi.registerCommand("subagents-approve", {
     description: "Approve this project's .pi/agents directory for local subagent definitions",
@@ -1756,30 +2031,85 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       }
     },
   });
-  pi.registerCommand("subagents-reconcile", {
-    description: "Explicit bounded retry of paused supervision/imports and proven-unsent results; never relaunches or replays ambiguous dispatch",
-    handler: async (_args, ctx) => {
-      if (runtime.store && !ownsActiveBranch(ctx, runtime.store.snapshot().parent)) throw new Error("Reconciliation requires current branch custody");
-      runtime.latestCtx = ctx;
-      runtime.store?.assertCustody();
-      if (runtime.stopRecovery) runtime.stopRecovery.reconcile();
-      else if (runtime.recoveryError || runtime.store?.listRuns().some(run => !runningSubagents.has(run.id))) await recoverParentRuntime(ctx);
+  const reconcile = async (ctx: ExtensionContext) => {
+    const latestCtx = runtime.latestCtx;
+    const isCurrent = () => !runtime.treeSuspension && latestCtx?.sessionManager === ctx.sessionManager &&
+      runtime.latestCtx === latestCtx && runtime.pi === pi;
+    let error: string | undefined;
+    let view: RecoveryView | undefined;
+    let explicitFence: DispatchRepair | undefined;
+    try {
+      if (!isCurrent()) throw new Error("Reconciliation requires the current parent session");
+      const store = runtime.store;
+      if (store && (!ownsActiveBranch(ctx, store.snapshot().parent) || store.snapshot().custodyPaused)) throw new Error("Reconciliation requires current branch custody");
+      const pending = pendingParentRecovery(ctx);
+      if (!pending && store) {
+        const fence = activeDispatchRepair();
+        const repair = reconcileDispatchMetadata(ctx, store);
+        if (fence?.requiresExplicitReconcile && !repair.storeError) {
+          // Fresh disposition for this pass, but no public thaw until restoration
+          // and the final synchronous checks succeed on this same writer.
+          explicitFence = runtime.dispatchRepair = { ...fence, incidents: repair.incidents };
+        } else applyDispatchRepair(repair);
+      }
+      if (pending || !dispatchStorageError(explicitFence)) {
+        const supervisor = runtime.stopRecovery;
+        const disposition = !pending && !explicitFence && store ? readDispatchDisposition(ctx, store) : undefined;
+        const untracked = !pending && !explicitFence && store?.listRuns().some(run => !runningSubagents.has(run.id) && !disposition?.unsent.has(run.id) &&
+          !(supervisor && (supervisor.tracks?.(run.id) ?? true)));
+        if (pending || !store || explicitFence || runtime.recoveryError || untracked) {
+          const failure = await (pending ?? recoverParentRuntime(ctx, !store, explicitFence));
+          if (failure) throw new Error(failure);
+          const recoveredStore = runtime.store;
+          if (!isCurrent() || (store && recoveredStore !== store) ||
+              (recoveredStore && !ownsActiveBranch(ctx, recoveredStore.snapshot().parent))) {
+            throw new Error("Reconciliation lost current parent session/branch custody");
+          }
+        } else supervisor?.reconcile(disposition);
+      }
+      assertStorageAvailable(explicitFence);
       for (const child of runningSubagents.values()) {
         if (!child.retryObservation || child.terminalActionsAllowed === false) continue;
         child.durableStore?.assertCustody();
         child.retryObservation();
       }
-      retryPlanImports();
-      if (!runtime.recoveryError) {
-        reconcileUnsentDeliveries(delivery);
-        delivery.api = pi;
-        flushDeliveries(delivery);
+      reconcileUnsentDeliveries(delivery);
+      retryPlanImports(explicitFence);
+      assertStorageAvailable(explicitFence); // Plan proof can itself observe a storage fault.
+      if (explicitFence) {
+        view = readRecoveryView(ctx, explicitFence);
+        assertStorageAvailable(explicitFence);
+        const refused = view.error ?? view.storageError ?? view.paused;
+        if (refused) throw new Error(refused);
+        runtime.dispatchRepair = { store: explicitFence.store, incidents: explicitFence.incidents };
       }
-      if (ctx.hasUI) {
-        const errors = [...(runtime.stopRecovery?.status().errors ?? []), ...deliveryDiagnostics(delivery)];
-        ctx.ui.notify(runtime.recoveryError ?? (errors.length ? `Supervision remains paused for ${errors.length} error(s); see /subagents-recovery.` : "Artifact reconciliation requested; no child was relaunched. Review recovery diagnostics for remaining errors."),
-          runtime.recoveryError || errors.length ? "warning" : "info");
+      delivery.api = pi;
+      flushDeliveries(delivery);
+      if (view) view.diagnostics = [...new Set([...(view.diagnostics ?? []), ...deliveryDiagnostics(delivery)])];
+    } catch (failure) {
+      if (explicitFence && isCurrent() && activeDispatchRepair() === explicitFence) {
+        if (recoveryIOError(failure)) latchDispatchStorageFault(explicitFence.store, operationCode(failure)!, explicitFence.incidents);
+        else pauseRecoveredSupervision();
       }
+      error = `${operationCode(failure) ?? "RECONCILE_REFUSED"}: ${String(failure)}`;
+    }
+    view ??= isCurrent() ? readRecoveryView(ctx) : {};
+    const blocked = error ?? view.error ?? view.storageError ?? view.paused;
+    const allIncidents = view.dispatch ?? [];
+    const incidents = allIncidents.slice(0, 10);
+    const status = blocked || view.diagnostics?.length || allIncidents.some(item => item.status === "still-blocked") ? "still-blocked"
+      : allIncidents.some(item => item.status === "dispatch-unknown") ? "dispatch-unknown" : "resolved";
+    const text = [`Reconciliation ${status}; no child was relaunched or sent a command.`,
+      ...(blocked ? [`Storage/custody: ${blocked}. See the read-only recovery report before retrying metadata.`] : []),
+      ...dispatchReport(view), ...(view.diagnostics ?? []).slice(0, 3), ...recoveryHistory(view)].join("\n");
+    return { status, text, incidents };
+  };
+  pi.registerCommand("subagents-reconcile", {
+    description: "Reconcile saved subagent metadata; never relaunches or replays ambiguous dispatch",
+    handler: async (args, ctx) => {
+      if (args.trim()) throw new Error("Usage: /subagents-reconcile");
+      const result = await reconcile(ctx);
+      if (ctx.hasUI) ctx.ui.notify(result.text, result.status === "resolved" ? "info" : "warning");
     },
   });
   // Reconciliation precedes every publication/restoration phase. Importing an
@@ -1805,14 +2135,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     runtime.latestCtx = ctx;
     runtime.pi = pi;
-    if (typeof ctx.sessionManager?.getHeader === "function") await recoverParentRuntime(ctx);
+    const recoveryFailure = typeof ctx.sessionManager?.getHeader === "function" ? await recoverParentRuntime(ctx) : undefined;
     if (runtime.latestCtx !== ctx) return;
     retryPlanImports();
-    const recoveryView = readRecoveryView(ctx);
-    if (ctx.hasUI && Object.keys(recoveryView.manifest?.runs ?? {}).length) {
-      ctx.ui.notify(`Saved subagent assignments found (${Object.keys(recoveryView.manifest!.runs).length}). Review /subagents-recovery or subagents_recovery before explicit resume; saved evidence is not current liveness or acceptance.`, "warning");
-    }
-    if (!runtime.recoveryError) {
+    notifyRecoveryOnStartup(ctx, readRecoveryView(ctx));
+    if (!recoveryFailure && !runtime.recoveryError && !activeDispatchRepair()?.storeError) {
       delivery.api = pi;
       flushDeliveries(delivery);
     }
@@ -1839,6 +2166,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       // Only a confirmed lineage change is irreversible. Cancellation, summary
       // abort and summary errors leave the original branch's custody intact.
       runtime.recoveryError = "Subagent custody paused: changed active lineage requires an explicit branch decision";
+      runtime.recoveryIOError = false;
       detachRuntimeWatchers();
       cleanupSubagentsForShutdown("tree", runningSubagents);
       try {
@@ -1846,6 +2174,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       } finally {
         runtime.store.close();
         runtime.store = undefined;
+        runtime.dispatchRepair = undefined;
+        runtime.planImportErrors?.clear();
         delivery.store = undefined;
         delivery.pending.clear();
         delivery.handedOff.clear();
@@ -1853,9 +2183,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       }
       return;
     }
-    await recoverParentRuntime(ctx);
+    const recoveryFailure = await recoverParentRuntime(ctx);
     if (runtime.latestCtx !== ctx) return;
-    if (!runtime.recoveryError) { delivery.api = pi; flushDeliveries(delivery); }
+    if (!recoveryFailure && !runtime.recoveryError && !activeDispatchRepair()?.storeError) { delivery.api = pi; flushDeliveries(delivery); }
   };
   pi.on("session_before_tree", (_event, ctx) => {
     if (runtime.treeSuspension) clearInterval(runtime.treeSuspension.timer);
@@ -1869,6 +2199,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       if (runtime.treeSuspension !== suspension || !ctx.isIdle()) return;
       void finishTreeNavigation(ctx).catch((error) => {
         runtime.recoveryError = `Subagent tree recovery paused: ${String(error)}`;
+        runtime.recoveryIOError = recoveryIOError(error);
         pauseDeliveries(delivery);
       });
     }, 25) };
@@ -1927,6 +2258,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       runtime.modelCatalog = undefined;
       runtime.agentCatalog = undefined;
       runtime.recoveryError = undefined;
+      runtime.recoveryIOError = undefined;
+      runtime.dispatchRepair = undefined;
+      runtime.planImportErrors?.clear();
     }
   });
 
@@ -1939,6 +2273,86 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   );
 
   const shouldRegister = (name: string) => !deniedTools.has(name);
+  const delegatedPath = process.env.PI_SUBAGENT_SESSION;
+  const delegatedSession = !!(process.env.PI_SUBAGENT_ID || delegatedPath);
+  const requireUnallocatedChild = captureQueueChildFence();
+
+  function assertChildSessionHeader(path: string, sessionId: string): string {
+    // Open only after branch + manifest authorization. Inspect at most 64 KiB
+    // and parse only the physical first line, never falling through to entries.
+    // Nonblocking + regular-file check prevents a replacement FIFO stalling Pi.
+    try {
+      const fd = openSync(path, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0) | (constants.O_NOFOLLOW ?? 0));
+      try {
+        if (fstatSync(fd).isFile()) {
+          const bytes = Buffer.alloc(64 * 1024);
+          let length = 0;
+          while (length < bytes.length) {
+            const count = readSync(fd, bytes, length, bytes.length - length, length);
+            if (!count) break;
+            const end = bytes.subarray(length, length + count).indexOf(0x0a);
+            if (end >= 0) {
+              const header = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes.subarray(0, length + end)));
+              if (header?.type === "session" && header.id === sessionId &&
+                  Number.isSafeInteger(header.version) && header.version > 0 &&
+                  typeof header.cwd === "string" && header.cwd && typeof header.timestamp === "string" && header.timestamp) return header.cwd;
+              break;
+            }
+            length += count;
+          }
+        }
+      } finally { closeSync(fd); }
+    } catch { /* A missing, unreadable or malformed header cannot prove identity. */ }
+    throw new Error("Owned child Pi session header is missing, invalid, or does not match the recorded session ID.");
+  }
+
+  function authorizeChildSession(path: string, ctx: ExtensionContext, selected?: RunningSubagent) {
+    if (!delegatedSession) return;
+    const store = runtime.store;
+    const denied = () => new Error("This tool requires a direct Pi child recorded on the current session branch.");
+    if (!store) throw denied();
+    const manifest = store.snapshot();
+    const validateCustody = () => {
+      if (runtime.pi !== pi || runtime.latestCtx?.sessionManager !== ctx.sessionManager || runtime.store !== store ||
+          runtime.treeSuspension || manifest.custodyPaused || !delegatedPath ||
+          canonicalSessionPath(delegatedPath) !== manifest.parent.sessionFile || !ownsActiveBranch(ctx, manifest.parent) ||
+          path === manifest.parent.sessionFile || canonicalSessionPath(path) !== path) throw denied();
+      store.assertCustody();
+    };
+    validateCustody();
+    // The caller's manifest and exact immediate-parent lineage are the proof.
+    // Neither an arbitrary launch profile nor a root-wide lineage edge is enough.
+    // Compare the recorded canonical string without resolving it again: a moved
+    // or retargeted link must not transfer authority to a different session.
+    const isDirect = (run?: DurableRun) => run?.cli === "pi" && run.phase !== "prepared" && run.sessionFile === path &&
+      run.lineage?.child.sessionFile === path && run.lineage.parent.sessionFile === manifest.parent.sessionFile &&
+      run.lineage.parent.sessionId === manifest.parent.headerId;
+    const owner = sessionOwners.get(path);
+    const live = owner && runningSubagents.get(owner.runId);
+    if ((selected && selected !== live) || (live && live.durableStore !== store)) throw denied();
+    const run = owner ? manifest.runs[owner.runId] : Object.values(manifest.runs).find(isDirect);
+    if (!run?.lineage || !isDirect(run)) throw denied();
+    const { lineage } = run;
+    assertChildSessionHeader(path, lineage.child.sessionId);
+    return { lineage, validate: () => {
+      validateCustody();
+      assertChildSessionHeader(path, lineage.child.sessionId);
+    } };
+  }
+
+  // A nested coordinator is also a parent of its own children. Custody is
+  // determined by the current session/branch, never by ancestor launch markers.
+  if (shouldRegister("subagents_reconcile"))
+    pi.registerTool({
+      name: "subagents_reconcile", label: "Subagent reconciliation",
+      description: "Parent-only bounded metadata repair for the current branch. Never launches or sends commands to children. Use subagents_recovery for a read-only report.",
+      parameters: Type.Object({}, { additionalProperties: false }),
+      async execute(_id, _params, signal, _onUpdate, ctx) {
+        signal?.throwIfAborted();
+        const { status, text, incidents } = await reconcile(ctx);
+        return { content: [{ type: "text", text }], details: { status, incidents }, isError: status === "still-blocked" };
+      },
+    });
 
   // ── subagent tool ──
   if (shouldRegister("subagent"))
@@ -2008,7 +2422,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         ) {
           throw new Error(`Unsupported parent thinking level: ${parentThinking}`);
         }
-        const running = await launchSubagent(params, ctx, parentThinking, { signal: _signal });
+        const running = await launchSubagent(params, ctx, parentThinking, { signal: _signal,
+          assertExecution: () => requireUnallocatedChild(ctx.sessionManager) });
 
         // Create a separate AbortController for the watcher
         // (the tool's signal completes when we return)
@@ -2298,17 +2713,21 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
   if (shouldRegister("subagent_audit")) pi.registerTool({
     name: "subagent_audit", label: "Audit Subagent Session",
-    description: "Read-only OS audit of Pi CLI processes explicitly selecting one canonical session. Supply sessionPath OR owned id/name. Returns at most 32 PID/birth identities, never command lines. Uncertain is not safe; no automatic cleanup.",
+    description: "Read-only OS audit of Pi CLI processes explicitly selecting one canonical session. Supply sessionPath OR owned id/name. In a delegated session, only direct Pi children on the current branch may be audited. Returns at most 32 PID/birth identities, never command lines. Uncertain is not safe; no automatic cleanup.",
     parameters: Type.Object({ sessionPath: Type.Optional(Type.String()), id: Type.Optional(Type.String()), name: Type.Optional(Type.String()) }, { additionalProperties: false }),
     async execute(_id, params, _signal, _update, ctx) {
       if ((params.sessionPath && (params.id || params.name)) || (params.id && params.name)) throw new Error("Supply sessionPath OR owned id/name (one selector)");
       let path = params.sessionPath;
+      let selected: RunningSubagent | undefined;
       if (!path) {
         const target = resolveInterruptTarget(params);
         if ("error" in target) throw new Error(target.error);
-        path = target.running.sessionFile;
+        selected = target.running;
+        path = selected.sessionFile;
       }
-      const audit = auditSession(canonicalSessionPath(path, ctx.cwd));
+      path = canonicalSessionPath(path, ctx.cwd);
+      authorizeChildSession(path, ctx, selected);
+      const audit = auditSession(path);
       return { content: [{ type: "text", text: JSON.stringify(audit) }], details: audit };
     },
   });
@@ -2332,14 +2751,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "When the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT poll for status. All of that is wasted work — the harness handles delivery for you. " +
         "DO NOT fabricate or assume results. After resuming, either end your turn or work on other independent tasks; the harness will wake you when the result is ready. " +
-        "Use when a sub-agent was cancelled or needs follow-up work.",
+        "Use when a sub-agent was cancelled or needs follow-up work. In a delegated session, only direct Pi children on the current branch may be resumed.",
       promptSnippet:
         "Continue a settled interrupted or keepOpen idle live Pi child in its existing pane, or resume a closed session in a new pane. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT poll for status. All of that is wasted work — the harness handles delivery for you. " +
         "DO NOT fabricate or assume results. After resuming, either end your turn or work on other independent tasks; the harness will wake you when the result is ready. " +
-        "Use when a sub-agent was cancelled or needs follow-up work.",
+        "Use when a sub-agent was cancelled or needs follow-up work. In a delegated session, only direct Pi children on the current branch may be resumed.",
       parameters: Type.Object({
         planTask: Type.Optional(PlanTaskParams),
         sessionPath: Type.String({ description: "Path to the session .jsonl file to resume" }),
@@ -2391,11 +2810,49 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
         _signal?.throwIfAborted();
-        params.sessionPath = canonicalSessionPath(params.sessionPath, ctx.cwd);
+        const requestedPath = params.sessionPath;
+        params = { ...params, sessionPath: canonicalSessionPath(requestedPath, ctx.cwd) };
+        const scope = authorizeChildSession(params.sessionPath, ctx);
+        requireUnallocatedChild(ctx.sessionManager);
         const name = params.name ?? "Resume";
-        // Fail closed before reading history (in particular foreign harness transcripts).
-        const profile = readPiLaunchProfile(params.sessionPath);
+        // Fail closed before reading the profile or history of an out-of-scope session.
+        const profilePath = launchProfilePath(params.sessionPath);
+        const validateProfilePath = () => {
+          if (canonicalSessionPath(requestedPath, ctx.cwd) !== params.sessionPath) throw new Error("Resume target path changed during preparation");
+          if (scope && canonicalSessionPath(profilePath) !== profilePath) throw new Error("Owned child launch profile path has changed.");
+        };
+        validateProfilePath();
+        const target = captureQueueResumeTarget(params.sessionPath);
+        const profile = readPiLaunchProfile(params.sessionPath, { exactPath: true });
+        target.verifyIdentity();
+        const validateQueueTarget = (expectedProfile = profile, rereadProfile = true) => {
+          validateProfilePath();
+          target.verifyIdentity();
+          requireUnallocatedChild(ctx.sessionManager);
+          const current = rereadProfile ? inspectPersistedQueueProfile(params.sessionPath) : undefined;
+          if (current) {
+            if (hasQueueAllocation(current.value)) denyQueueTransport();
+            if (!isDeepStrictEqual(current.value, expectedProfile)) throw new Error("Resume launch profile changed during preparation");
+          }
+          // Scan last against the original session pin; a same-inode append
+          // during earlier reads must be visible. Recheck both observed images.
+          const assignment = profile.queueAllocation ? undefined : target.scanAssignment();
+          if (!profile.queueAllocation && (assignment?.value || isQueueMarkedSession(params.sessionPath))) denyQueueTransport();
+          const verifyAssignment = () => {
+            validateProfilePath();
+            if (!profile.queueAllocation && isQueueMarkedSession(params.sessionPath)) denyQueueTransport();
+            assignment?.verifyImage();
+          };
+          const verifyImages = () => {
+            current?.verifyImage();
+            verifyAssignment();
+          };
+          verifyImages();
+          return { verifyAssignment, verifyImages };
+        };
+        if (scope && !isDeepStrictEqual(profile.lineage, scope.lineage)) throw new Error("Saved launch profile does not match the direct child's recorded lineage.");
         const validateProfileSources = () => {
+          validateProfilePath();
           assertAgentDirectoryAuthorized(ctx, getAgentConfigDir(), profile.agentDir, profile.cwd);
           if (profile.role && !profile.definitionSource) throw new Error("Legacy named-agent profile lacks source provenance; start a new subagent with explicit restrictions.");
           assertDefinitionAuthorized(ctx, getAgentConfigDir(), profile.definitionSource ?? {});
@@ -2404,19 +2861,141 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           throw new Error("Resume must preserve the saved autoExit/interactivity profile. Start a new subagent to change it.");
         }
         validateProfileSources();
-        if (runtime.recoveryError) throw new Error(runtime.recoveryError);
-        runtime.store?.assertCustody();
+        validateQueueTarget(profile, false); // The initial profile was just read with the verified path.
+        if (profile.queueAllocation) {
+          // Only the original root's current in-process runtime can attest to
+          // the selected branch and the plan/storage fault state. The checks
+          // are deliberately independent of the legacy binding/dispatch path.
+          const owner = sessionOwners.get(params.sessionPath);
+          const child = owner && runningSubagents.get(owner.runId);
+          if (!child || !owner) denyQueueTransport(); // No closed queue resume.
+          assertStorageAvailable();
+          const store = runtime.store;
+          const manifest = store?.dispatchCustody();
+          const run = store?.getRun(child.id);
+          const view = runtime.plans!.read(ctx.sessionManager);
+          if (!store || !manifest || manifest.custodyPaused !== undefined || runtime.pi !== pi || runtime.treeSuspension ||
+              runtime.latestCtx?.sessionManager !== ctx.sessionManager || pendingParentRecovery(ctx) ||
+              !ownsActiveBranch(ctx, manifest.parent) || child.terminalActionsAllowed === false ||
+              child.lifecycle.process.kind !== "running" || child.durableStore !== store ||
+              child.id !== profile.queueAllocation.rootRunId || !owner.dispatched || owner.surface !== child.surface ||
+              owner.closeRequestId || owner.continuationRequestId || run?.continuationRequestId ||
+              run?.phase !== "supervised" || run.cli !== "pi" || run.sessionFile !== params.sessionPath ||
+              !samePlanBinding(run.planTask, profile.queueAllocation.binding) || !samePlanBinding(child.planTask, run.planTask) ||
+              !isDeepStrictEqual(run.profile, profile) || !isDeepStrictEqual(run.lineage, profile.lineage) ||
+              !view.writable || !view.snapshot || !profile.lineage ||
+              profile.lineage.parent.sessionFile !== manifest.parent.sessionFile ||
+              profile.lineage.rootCheckpoint !== manifest.parent.checkpoint || profile.lineage.rootBranchToken !== manifest.parent.branchToken) {
+            throw new Error("Active queue resume requires current trusted runtime and the original Pi launch profile");
+          }
+          assertQueueActiveResume(view.snapshot, profile, assertChildSessionHeader(params.sessionPath, profile.lineage.child.sessionId));
+          // The checks above do not issue a permit; do not route through the
+          // legacy continuation or publish a request until v2 is wired.
+          denyQueueTransport();
+        }
+        const original = profile.planTask ?? params.planTask;
+        const assertResumeDispatchKnown = (savedBinding = profile.planTask) => {
+          assertStorageAvailable();
+          const store = runtime.store;
+          // The active plan may be the only record of an earlier dispatch.
+          // Check it before acquiring a store or attaching a replacement run.
+          if (!store && typeof ctx.sessionManager.getBranch !== "function") return;
+          const header = store ? undefined : ctx.sessionManager.getHeader?.();
+          const directory = store?.directory ?? (header?.id ? join(getArtifactDir(ctx.sessionManager.getSessionDir(), header.id), "subagent-runtime") : undefined);
+          if (!directory) return;
+          store?.assertCustody();
+          const manifest = store?.snapshot() ?? readRuntimeManifest(directory);
+          if (manifest && (manifest.custodyPaused || !ownsActiveBranch(ctx, manifest.parent))) throw new Error("Resume requires current branch custody");
+          const view = runtime.plans!.read(ctx.sessionManager);
+          const plan = view.writable ? view.snapshot : undefined;
+          // Omitting planTask or using a sidecar without it must not drop a
+          // selected queue claim. Use exact target paths and plan-side run IDs.
+          const selectedPlan = view.snapshot;
+          if (manifest && selectedPlan?.queue) {
+            for (const task of selectedPlan.tasks) {
+              for (const attempt of task.attempts) {
+                const id = attempt.reservation?.runId;
+                if (id && manifest.runs[id]?.sessionFile === params.sessionPath) assertLegacyBoundTransport(selectedPlan);
+              }
+            }
+          }
+          const evidence = manifest ? readParentDispatchEvidence(directory, manifest, store)
+            : { records: new Map<string, DispatchEvidence>(), conflicts: new Set<string>(), diagnostics: [], verifiedFiles: new Set<string>() };
+          if (evidence.storeError) throw new Error(`Dispatch evidence unavailable (${evidence.storeError}). Use subagents_reconcile.`);
+          const incidents = dispatchIncidents(manifest, plan, directory, evidence);
+          // The legacy CAS can bind a closed resume before its first profile
+          // write fails. Initial adoption requires an explicit retry of that
+          // task and canonical before-send disposition of the old binding.
+          const selection = params.planTask;
+          const owner = sessionOwners.get(params.sessionPath);
+          const retryTask = !profile.planTask && (!owner || !runningSubagents.has(owner.runId)) &&
+            plan?.schemaVersion === 1 && selection?.planId === plan.planId
+            ? plan.tasks.find(task => task.taskId === selection.taskId && task.status === "in_progress" &&
+                task.attempts.at(-1)?.attemptId === selection.attemptId &&
+                task.statusHistory.findLast(change => change.status === "in_progress")?.reason === "Parent requested retry") : undefined;
+          // Once adopted, the saved binding alone cannot bypass a predecessor.
+          // Require a clean, supervised run of the exact current retry in this
+          // session. This is historical dispatch proof, not live writer custody.
+          const adopted = profile.planTask;
+          const adoptedTask = adopted && samePlanBinding(adopted, savedBinding) && manifest && plan?.schemaVersion === 1
+            ? plan.tasks.find(task => {
+                const attempt = task.attempts.at(-1);
+                if (!attempt || !["in_progress", "blocked", "in_review"].includes(task.status) ||
+                    task.statusHistory.findLast(change => change.status === "in_progress")?.reason !== "Parent requested retry" ||
+                    !samePlanBinding(adopted, { planId: plan.planId, taskId: task.taskId, attemptId: attempt.attemptId, authority: plan.authority })) return false;
+                return attempt.runIds.some(id => {
+                  const successor = manifest.runs[id];
+                  return successor?.phase === "supervised" && successor.sessionFile === params.sessionPath &&
+                    samePlanBinding(successor.planTask, adopted) && !incidents.some(item => item.runId === id);
+                });
+              }) : undefined;
+          const currentRetry = retryTask ?? adoptedTask;
+          for (const run of Object.values(manifest?.runs ?? {})) {
+            if (run.sessionFile !== params.sessionPath) continue;
+            if (hasQueueAllocation(run.profile)) denyQueueTransport();
+            const binding = run.planTask;
+            if (!binding || samePlanBinding(binding, savedBinding)) continue;
+            const predecessor = currentRetry?.attempts.slice(0, -1).find(attempt =>
+              attempt.attemptId === binding.attemptId && attempt.runIds.includes(run.id));
+            if (plan && currentRetry && predecessor && samePlanBinding(binding, { planId: plan.planId, taskId: currentRetry.taskId,
+                attemptId: predecessor.attemptId, authority: plan.authority }) && run.profile === undefined &&
+                run.continuationRequestId === undefined && !runningSubagents.has(run.id) && run.eventCursor.length === 1 &&
+                incidents.some(item => item.runId === run.id && item.status === "resolved" && item.phase === "before-send" && item.evidence === "outbox")) continue;
+            throw new Error("Resume requires the original task binding in the saved launch profile. Use subagents_recovery for evidence.");
+          }
+          const savedAuthority = profile.planTask?.authority;
+          const related = original && plan?.planId === original.planId && (!savedAuthority ||
+            (plan.authority.sessionId === savedAuthority.sessionId && plan.authority.branchInstanceId === savedAuthority.branchInstanceId))
+            ? plan.tasks.find(task => task.taskId === original.taskId)?.attempts.flatMap(attempt => [...attempt.runIds]) : undefined;
+          const incident = incidents.find(item => {
+            const run = manifest?.runs[item.runId];
+            const record = evidence.records.get(item.runId);
+            // An after-intent claim cannot bind a second session when the
+            // committed run already owns the binding. Ownerless claims and
+            // other possible-send evidence keep their conservative fence.
+            const journalTarget = (record?.operation === verifyResumeImages ? !run : item.phase !== "before-send") &&
+              record?.sessionFile === params.sessionPath;
+            return item.status !== "resolved" && (journalTarget || run?.sessionFile === params.sessionPath || related?.includes(item.runId));
+          });
+          if (incident) throw new Error(`Run ${incident.runId}: ${incident.status}. ${noRetry} Use subagents_recovery for evidence.`);
+          return verifiedUnsentRunIds(incidents);
+        };
+        assertResumeDispatchKnown();
         assertResumeWriters(params.sessionPath);
         const previousOwner = sessionOwners.get(params.sessionPath);
         if (previousOwner?.surface) {
           const inspection = await inspectPane(previousOwner.surface);
+          scope?.validate();
+          validateQueueTarget();
+          assertResumeDispatchKnown();
           // Inspection yielded: never release a replacement owner's reservation.
           if (inspection.kind === "missing" && sessionOwners.get(params.sessionPath) === previousOwner) {
             releaseSession(params.sessionPath, previousOwner.runId);
           }
         } else if (previousOwner && runtime.store && !runningSubagents.has(previousOwner.runId)) {
-          releaseRecoveredSession(runtime.store, params.sessionPath);
+          releaseRecoveredSession(runtime.store, params.sessionPath, assertResumeDispatchKnown());
         }
+        if (scope) authorizeChildSession(params.sessionPath, ctx);
         assertResumeWriters(params.sessionPath);
         const liveOwner = sessionOwners.get(params.sessionPath);
         if (liveOwner && runningSubagents.has(liveOwner.runId)) {
@@ -2431,6 +3010,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             params.planTask, child.planTask ?? profile.planTask);
           const continuationParams = { ...params, message: contractTask(params.message, continuationContract) };
           const validateContinuationCustody = () => {
+            scope?.validate();
             if (runtime.treeSuspension || child.terminalActionsAllowed === false || child.durableStore !== runtime.store ||
                 sessionOwners.get(params.sessionPath) !== liveOwner || liveOwner.runId !== child.id ||
                 liveOwner.surface !== child.surface || !liveOwner.dispatched) {
@@ -2449,17 +3029,31 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               if (runningSubagents.get(child.id) !== child) throw new Error("Continuation child is no longer tracked");
               _signal?.throwIfAborted();
               validateProfileSources();
+              assertResumeDispatchKnown();
               assertResumeWriters(params.sessionPath);
-              // Validate after async inspection, immediately before dispatch.
               resolveResumeContract(runtime.plans!, ctx, continuationContract, params.planTask, child.planTask ?? profile.planTask);
+              let provenance = validateQueueTarget();
               child.planTask = bindPlanRun(runtime.plans!, ctx, child.id, params.planTask, child.planTask);
               if (child.planTask) {
                 if (!child.durableStore) throw new Error("Task-bound continuation requires durable custody");
                 child.durableStore.bindRun(child.id, child.planTask, continuationContract);
                 persistProfileBinding(child.sessionFile, child.planTask, continuationContract);
               }
+              scope?.validate();
+              // A legacy v1 binding can deliberately rewrite its profile.
+              if (child.planTask) {
+                provenance.verifyAssignment();
+                provenance = validateQueueTarget({ ...profile, planTask: child.planTask,
+                  ...(continuationContract ? { assignmentContract: continuationContract } : {}) });
+              } else provenance.verifyImages();
               child.durableStore?.continuation(child.id, requestId);
-              if (explicitCompletion && child.hasTurnResult) child.delegatedContinuation = { requestId, owner: liveOwner };
+              // Recheck the images after intent persistence and request staging,
+              // immediately before the rename that wakes the child watcher.
+              return () => {
+                requireUnallocatedChild(ctx.sessionManager);
+                provenance.verifyImages();
+                if (explicitCompletion && child.hasTurnResult) child.delegatedContinuation = { requestId, owner: liveOwner };
+              };
             },
           });
           recordHistory(child.lineage, child.id, "continuation", `Parent continuation (${result.status}): ${params.message ?? ""}`,
@@ -2488,18 +3082,22 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
+        assertResumeDispatchKnown();
+        // Read-only preflight before acquiring durable custody: a historical
+        // plan must not leave a writer, manifest or checkpoint behind.
+        const assignmentContract = resolveResumeContract(runtime.plans!, ctx, profile.assignmentContract, params.planTask, profile.planTask);
         const store = durableStoreFor(ctx);
         const owner = reserveSession(params.sessionPath, id);
         let planTask: PlanTaskBinding | undefined;
+        let operation: DispatchOperation = "prepare-launch";
         try {
         if ((params.planTask || profile.planTask) && !store) throw new Error("Task-bound runs require durable runtime custody");
-        // Validate saved fields before attaching a run: stale contracts are not
-        // silently rewritten, and rejected metadata is not a dispatch failure.
-        const assignmentContract = resolveResumeContract(runtime.plans!, ctx, profile.assignmentContract, params.planTask, profile.planTask);
         planTask = bindPlanRun(runtime.plans!, ctx, id, params.planTask, profile.planTask);
         // Preserve the original binding, never infer authority from the selected branch.
         const resumeProfile = { ...profile, ...(planTask ? { planTask } : {}), ...(assignmentContract ? { assignmentContract } : {}) };
+        validateProfilePath();
         if (planTask) persistProfileBinding(params.sessionPath, planTask, assignmentContract);
+        scope?.validate();
         // Record entry count before resuming so we can extract new messages
         const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
 
@@ -2510,6 +3108,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
         await delay(getShellReadyDelayMs(), undefined, { signal: _signal });
         _signal?.throwIfAborted();
+        scope?.validate();
+        validateProfilePath();
+        target.verifyIdentity();
         store?.assertCustody();
         if (sessionOwners.get(params.sessionPath) !== owner) throw new Error("Session ownership changed during launch preparation");
         assertResumeWriters(params.sessionPath);
@@ -2534,24 +3135,40 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             .replace(/-+/g, "-")
             .replace(/^-|-$/g, "") || "resume"}-resume-${id}.sh`,
         );
+        operation = "persist-prepared";
         const preparedRun = prepareLaunchRun(store, { id, planTask, name, task: params.message ?? "resumed session", startTime,
           sessionFile: params.sessionPath, surface, cli: "pi", activityFile,
           launchScriptFile, profile: resumeProfile, lineage: resumeProfile.lineage, entryCountBefore });
+        operation = "prepare-transport";
         runScriptInPane(surface, built.command, {
           onDispatch: () => {
+            operation = "validate-dispatch";
             _signal?.throwIfAborted();
+            scope?.validate();
             validateProfileSources();
+            assertResumeDispatchKnown(planTask ?? profile.planTask);
             assertResumeWriters(params.sessionPath);
             resolveResumeContract(runtime.plans!, ctx, assignmentContract, undefined, planTask);
             if (planTask) bindPlanRun(runtime.plans!, ctx, id, undefined, planTask);
-            store?.phase(id, "dispatch-intent"); owner.dispatched = true;
+            scope?.validate();
+            const provenance = validateQueueTarget(resumeProfile);
+            operation = "persist-intent";
+            store?.commitFreshDispatch(id, params.sessionPath, planTask);
+            // Only this final, synchronous check runs after intent but before
+            // marking the transport possibly sent. Preserve that distinction.
+            if (store) operation = verifyResumeImages;
+            provenance.verifyImages();
+            owner.dispatched = true;
+            operation = "send-to-terminal";
           },
           scriptPath: launchScriptFile,
           scriptPreamble: built.launchScriptPreamble?.join("\n"),
         });
 
         // Register as a running subagent for widget tracking
+        operation = "persist-supervised";
         store?.phase(id, "supervised");
+        operation = "register-supervision";
         recordHistory(profile.lineage, id, "continuation", `Parent closed-session resume: ${params.message ?? ""}`,
           id, [params.sessionPath, launchScriptFile]);
         const running: RunningSubagent = registerLaunchedRun(runningSubagents, store, preparedRun, {
@@ -2580,17 +3197,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           },
         };
         } catch (error) {
-          try { recordDispatchFailure(runtime.plans!, ctx, planTask, id, error,
-            store, { id, sessionFile: params.sessionPath, name, task: params.message ?? "resumed session", startTime }, owner.dispatched); }
-          catch (importError) {
-            runtime.planImportErrors!.set(id, `Dispatch failed/uncertain; task import pending: ${String(importError)}`);
-            if (String(importError).includes("NOT persisted")) {
-              runtime.recoveryError = String(importError);
-              if (error instanceof Error) error.message += `; ${String(importError)}`;
-            }
-          }
+          if (operation !== "prepare-launch" || planTask) handleLaunchFailure(ctx, store, planTask,
+            { id, sessionFile: params.sessionPath, name, task: params.message ?? "resumed session", startTime }, error, owner.dispatched, operation);
           if (!owner.dispatched) {
-            releaseSession(params.sessionPath, id);
+            // Release the exact reservation, not whatever a changed path now resolves to.
+            if (sessionOwners.get(params.sessionPath) === owner) sessionOwners.delete(params.sessionPath);
             if (owner.surface) {
               try { closePane(owner.surface); } catch { /* best-effort cleanup */ }
             }
@@ -2709,16 +3320,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             contentLines.push("", theme.fg("warning", details.resultDiagnostic.slice(0, 1024)));
           }
         }
-        if (details?.keepOpen) {
-          contentLines.push("", theme.fg("dim", "Pane stayed open for follow-up conversation."));
+        if (details?.keepOpen === true) {
+          const guidance = typeof details.runId === "string" ? keepOpenGuidance(details.runId) : "Pane stayed open for follow-up conversation.";
+          contentLines.push("", theme.fg("dim", guidance));
         }
         if (details?.runtimePlan?.runtimeMismatch && typeof details?.response === "string") {
           contentLines.push("", theme.fg("warning", `Runtime warning: ${details.runtimePlan.runtimeMismatch}`));
         }
         if (options.expanded && details?.sessionFile) {
-          contentLines.push("");
-          contentLines.push(theme.fg("dim", `Session: ${details.sessionFile}`));
-          contentLines.push(theme.fg("dim", `Resume: pi --session ${details.sessionFile}`));
+          contentLines.push("", theme.fg("dim", `Session: ${details.sessionFile}`));
+          if (details.keepOpen !== true) contentLines.push(theme.fg("dim", `Resume: pi --session ${details.sessionFile}`));
         }
 
         return ["", ...framedMessage(`Message from ${sender}`, contentLines.join("\n"), bgFn).render(width)];

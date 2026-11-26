@@ -4,7 +4,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
+import { OPEN_ACCENT } from "../pi-extension/subagents/frame.ts";
 import { registerHistoryView, renderHistoryTree } from "../pi-extension/subagents/history-view.ts";
 import { createLineage } from "../pi-extension/subagents/lineage.ts";
 import { historyAnchors, readHistory, recordHistory } from "../pi-extension/subagents/history.ts";
@@ -34,11 +35,17 @@ test("native tree widget command toggles, retains closed history and watches wit
     registerHistoryView(pi, () => lineage.eventDirectory);
     assert.equal(widgetWrites, 0, "factory does not start resources or access session");
     await emit("session_start", {}, ctx);
-    const render = () => widgets.get("subagent-history-tree")({}, { fg: (_c: string, s: string) => s }).render(100).join("\n");
-    assert.equal(render().includes("nested-id"), false);
+    const command = (args: string) => commands.get("subagents-tree").handler(args, ctx);
+    const component = () => widgets.get("subagent-history-tree")({}, { fg: (_c: string, s: string) => `\x1b[90m${s}\x1b[39m` });
+    const render = () => stripTerminalSequences(component().render(100).join("\n"));
+    assert.equal(widgetWrites, 0, "even populated history is not shown by default");
     const before = sm.getEntries().length;
-    await commands.get("subagents-tree").handler("expand", ctx);
-    assert.ok(render().includes("nested-id"));
+    await command("compact");
+    assert.equal(render().includes("nested-id"), false);
+    await command("expand");
+    assert.match(render(), /╭─ Subagent tree · 3 sessions · 2 explicit events/);
+    assert.match(render(), /└─ - nested-id/);
+    assert.equal(component().render(100)[0].startsWith(`${OPEN_ACCENT}╭`), true);
     await commands.get("subagents-tree").handler(`toggle ${lineage.child.sessionId}`, ctx);
     assert.equal(render().includes("nested-id"), false);
     await commands.get("subagents-tree").handler(`toggle ${lineage.child.sessionId}`, ctx);
@@ -49,6 +56,13 @@ test("native tree widget command toggles, retains closed history and watches wit
     await new Promise(resolve => setTimeout(resolve, 250));
     assert.ok(widgetWrites > writes, "actual filesystem watcher refreshed the UI");
     assert.ok(render().includes("Explicit bounded question"));
+    // Selecting before the assignment hides the entire delegated subtree but not the requested view.
+    sm.branch(checkpoint);
+    await emit("session_tree", {}, ctx);
+    assert.match(render(), /╭─ Subagent tree ─/);
+    assert.match(render(), /No branch-authorized history yet\./);
+    assert.doesNotMatch(render(), /nested-id|Explicit bounded question|0 sessions/);
+    assert.equal(readHistory(historyAnchors(sm)).length, 0);
     await emit("session_shutdown", {}, ctx);
     const stoppedWrites = widgetWrites;
     recordHistory(nested, "nested-run", "result", "After shutdown", "late");
@@ -56,10 +70,55 @@ test("native tree widget command toggles, retains closed history and watches wit
     assert.equal(widgetWrites, stoppedWrites);
     const reopened = SessionManager.open(sm.getSessionFile()!);
     assert.equal(readHistory(historyAnchors(reopened)).length, 4, "zero process registry needed on restart");
-    // Selecting before the assignment hides the entire delegated subtree.
-    sm.branch(checkpoint);
-    assert.equal(readHistory(historyAnchors(sm)).length, 0);
   } finally { await emit("session_shutdown", {}, {}); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("empty history stays hidden on native refreshes and can be opened and dismissed", async () => {
+  const handlers = new Map<string, Function>();
+  const commands = new Map<string, any>();
+  let factory: any;
+  let reads = 0, observation = 0;
+  const pi = {
+    on: (name: string, fn: Function) => handlers.set(name, fn),
+    registerCommand: (name: string, definition: any) => commands.set(name, definition),
+  } as any;
+  const ctx = {
+    mode: "tui", hasUI: true, sessionManager: {
+      getBranch: () => { reads++; return []; }, getSessionFile: () => join(tmpdir(), "tree-test.jsonl"),
+    },
+    ui: { setWidget: (name: string, next: any) => { assert.equal(name, "subagent-history-tree"); factory = next; } },
+  };
+  const emit = (name: string, event = {}) => handlers.get(name)?.(event, ctx);
+  const command = (args: string) => commands.get("subagents-tree").handler(args, ctx);
+  registerHistoryView(pi, () => { observation++; return join(tmpdir(), "missing-tree-test-directory"); });
+  try {
+    emit("session_start");
+    emit("session_tree");
+    emit("tool_execution_end", { toolName: "subagent" });
+    assert.equal(factory, undefined);
+    assert.equal(reads + observation, 0);
+    await command("");
+    const component = factory({}, { fg: (_c: string, line: string) => line });
+    const lines = stripTerminalSequences(component.render(70).join("\n")).split("\n");
+    assert.match(lines[0], /^╭─ Subagent tree ─/);
+    assert.match(lines[1], /No branch-authorized history yet\./);
+    assert.match(lines[2], /not a process status view/);
+    assert.match(lines[3], /^╰─+╯$/);
+    assert.match(lines[4], /^\/subagents-tree compact.*off$/);
+    assert.ok(lines.slice(0, 4).every(line => visibleWidth(line) === 68));
+    await command("off");
+    const before = reads + observation;
+    emit("session_tree");
+    emit("tool_execution_end", { toolName: "plan_update" });
+    assert.equal(factory, undefined);
+    assert.equal(reads + observation, before);
+    await command("expand");
+    assert.ok(factory);
+    emit("session_shutdown");
+    assert.equal(factory, undefined);
+    emit("session_start");
+    assert.equal(factory, undefined);
+  } finally { emit("session_shutdown"); }
 });
 
 test("tree projection bounds narrow Unicode, cycles, disconnected parents and deep nesting", () => {

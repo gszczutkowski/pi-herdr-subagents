@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createAgentSession, DefaultResourceLoader, SessionManager, SettingsManager, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
-import { PlanPersistence, PLAN_ENTRY } from "../pi-extension/subagents/plan-persistence.ts";
+import { PlanPersistence, PLAN_ENTRY, PLAN_ENTRY_V2 } from "../pi-extension/subagents/plan-persistence.ts";
 import * as store from "../pi-extension/subagents/plan-store.ts";
 import {
   clipCheckpointText, CONTEXT_CHECKPOINT_BYTES, CONTEXT_CHECKPOINT_CONTEXT_TYPE, CONTEXT_CHECKPOINT_ENTRY,
@@ -94,6 +94,19 @@ test("native retain-none compaction, reopen and extension reload preserve explic
     assert.equal(readFileSync(sm.getSessionFile()!, "utf8"), bytes);
     assert.equal(reload.appends(), 0);
     assert.equal(sm.getEntries().filter(entry => entry.type === "custom_message").length, 0);
+  } finally { cleanup(); }
+});
+
+test("checkpoint references the selected v2 plan entry, not the old v1 entry", async () => {
+  const { sm, plans, cleanup } = fixture();
+  try {
+    const initial = plans.create(sm, 0, "Queue plan");
+    const active = plans.mutate(sm, initial.planId, initial.revision, (p, c) => store.configureQueue(p, c, 1));
+    const entry = sm.getLeafEntry();
+    assert.ok(entry?.type === "custom" && entry.customType === PLAN_ENTRY_V2);
+    const r = registration(sm, plans);
+    const saved = await r.invoke(save());
+    assert.deepEqual(saved.details.checkpoint.plan, { planId: active.planId, revision: active.revision, entryId: entry.id });
   } finally { cleanup(); }
 });
 

@@ -1,6 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createLifecycle, markDelivery, type SubagentLifecycle } from "./lifecycle.ts";
 import { messageNotificationReason, notificationOptions } from "./notification-policy.ts";
+import { hasAfterIntentMarker } from "./runtime-store.ts";
 
 export interface DeliveryOwner {
   id: string;
@@ -69,6 +70,7 @@ export function enqueueDelivery(
     message: { ...snapshot, details: { ...(snapshot.details as Record<string, unknown> | undefined), eventId } },
     options,
   });
+  if (hasAfterIntentMarker(envelope)) throw new Error("After-intent dispatch failure evidence is import-only");
   // Persist before publication; callbacks and owners are never serialized.
   state.store?.enqueue(eventId, owner.id, envelope);
   state.pending.set(eventId, { envelope, owner, onHandoff, attempts: 0, retryAt: 0, inFlight: false, store: state.store });
@@ -84,6 +86,14 @@ export function restoreDurableDeliveries(
   branchEventIds: ReadonlySet<string>,
 ): void {
   for (const [id, event] of Object.entries(store.snapshot().outbox)) {
+    if (hasAfterIntentMarker(event.envelope) || store.hasMalformedAfterIntentCursor(event.runId)) {
+      // Quarantine even when the branch appears to acknowledge the event.
+      // Notification handoff cannot convert a persisted claim into proof.
+      state.pending.delete(id);
+      if (event.status === "handedOff") state.handedOff.add(id);
+      else state.handedOff.delete(id);
+      continue;
+    }
     if (branchEventIds.has(id) && event.status !== "handedOff") store.delivery(id, "handedOff");
     if (event.status === "handedOff" || branchEventIds.has(id)) {
       state.handedOff.add(id);
@@ -129,7 +139,8 @@ export function reconcileUnsentDeliveries(state: DeliveryState, limit = 100): nu
   for (const [id, entry] of state.pending) {
     if (recovered >= limit) break;
     if (!entry.parked || entry.failure?.stage !== "before-send" || entry.inFlight || entry.store !== store ||
-        entry.owner.lifecycle.delivery !== "pending" || entry.owner.source?.lifecycle.delivery === "suppressed") continue;
+        store.hasMalformedAfterIntentCursor(entry.owner.id) || entry.owner.lifecycle.delivery !== "pending" ||
+        entry.owner.source?.lifecycle.delivery === "suppressed") continue;
     const event = store.getEvent(id);
     if (event?.status !== "pending" || event.runId !== entry.owner.id ||
         JSON.stringify(event.envelope) !== JSON.stringify(entry.envelope)) continue;
@@ -156,7 +167,8 @@ export function flushDeliveries(state: DeliveryState): void {
   state.timer = undefined;
   if (!state.api) return;
   for (const [id, entry] of state.pending) {
-    if (entry.owner.lifecycle.delivery !== "pending" || entry.owner.source?.lifecycle.delivery === "suppressed") {
+    if (hasAfterIntentMarker(entry.envelope) || state.store?.hasMalformedAfterIntentCursor(entry.owner.id) ||
+        entry.owner.lifecycle.delivery !== "pending" || entry.owner.source?.lifecycle.delivery === "suppressed") {
       state.pending.delete(id);
       continue;
     }

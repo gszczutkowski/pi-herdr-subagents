@@ -1,10 +1,13 @@
 import { randomUUID } from "node:crypto";
+import { captureDependencies, isDefiniteUnsentRetryPredecessor, isQueueResultEvidenceCurrent, needsReplacementRepair, queueAdmissionReasons, queueEvidenceMinimum, sameDependencies, type BlockerInput, type DependencyGeneration, type InfrastructureRetryInput, type InfrastructureRetryLink, type QueueBlocker, type QueueRepair, type QueueReview, type QueueRuntimeAdapter, type QueueSettings, type RepairInput, type Reservation, type WorkArea } from "./plan-queue.ts";
+import { canonicalWorkArea, collectQueueAdmissionFacts, inspectQueueRuntime, queueRuntimeAvailable, sameWorkArea } from "./plan-queue-work-area.ts";
+import { queueText, validateBlocker, validateInfrastructureRetry, validateQueueLimit, validateQueueSchema, validateRepair } from "./plan-queue-schema.ts";
 
 /** Pure parent command layer. Callers retain the current snapshot and supply trusted
  * session/branch context; worker proposals are data, never authority. This is not
- * an OS/security sandbox. No persistence, runtime hooks, or snapshot-replace command.
- * Revision checks only protect commands against the current snapshot supplied by
- * that caller; future storage adapters must serialize the compare-and-swap.
+ * an OS/security sandbox. Queue gates consult local work-area identity and trusted
+ * synchronous runtime observations. Revision checks protect against the supplied
+ * snapshot; persistence must serialize the current-revision compare-and-append.
  */
 
 export interface Authority { readonly sessionId: string; readonly branchInstanceId: string }
@@ -15,6 +18,7 @@ export interface Attempt {
   readonly childSession?: string;
   readonly origin?: { readonly planId: string; readonly authority: Authority };
   readonly results: readonly ResultReference[];
+  readonly reservation?: Reservation;
 }
 export interface ResultReference {
   readonly eventId: string;
@@ -27,8 +31,8 @@ export interface StatusChange { readonly revision: number; readonly status: Task
 export type TaskStatus = "pending" | "in_progress" | "blocked" | "in_review" | "accepted" | "failed" | "skipped" | "cancelled";
 export interface Criterion { readonly criterionId: string; readonly text: string }
 export interface Artifact { readonly artifactId: string; readonly ref: string }
-export interface Evidence { readonly evidenceId: string; readonly criterionId: string; readonly ref: string; readonly artifactId?: string; readonly resultEventId?: string }
-export interface Decision { readonly revision: number; readonly kind: "accept" | "invalidate"; readonly reason: string; readonly criteria: Readonly<Record<string, readonly string[]>> }
+export interface Evidence { readonly evidenceId: string; readonly criterionId: string; readonly ref: string; readonly artifactId?: string; readonly resultEventId?: string; readonly queue?: { readonly revision: number; readonly attemptId?: string } }
+export interface Decision { readonly revision: number; readonly kind: "accept" | "invalidate"; readonly reason: string; readonly criteria: Readonly<Record<string, readonly string[]>>; readonly dependencies?: readonly DependencyGeneration[]; readonly evidenceAfter?: number }
 export interface TaskDetails {
   readonly scope: string;
   readonly criteria: readonly Criterion[];
@@ -45,9 +49,14 @@ export interface PlanTask extends TaskDetails {
   readonly status: TaskStatus;
   readonly statusReason: string;
   readonly statusHistory: readonly StatusChange[];
+  readonly workArea?: WorkArea;
+  readonly blockers?: readonly QueueBlocker[];
+  readonly queueReview?: QueueReview;
+  readonly repairs?: readonly QueueRepair[];
 }
 export interface PlanSnapshot {
-  readonly schemaVersion: 1;
+  readonly schemaVersion: 1 | 2;
+  readonly queue?: QueueSettings;
   readonly revision: number;
   readonly planId: string;
   readonly title: string;
@@ -76,9 +85,9 @@ function keys(value: object, allowed: readonly string[]): void {
   requireValue(value !== null && typeof value === "object" && Object.keys(value).every(key => allowed.includes(key)), "Unsupported snapshot field");
 }
 function validate(plan: PlanSnapshot): void {
-  keys(plan, ["schemaVersion", "revision", "planId", "title", "authority", "tasks", "source"]);
+  keys(plan, ["schemaVersion", "revision", "planId", "title", "authority", "tasks", "source", "queue"]);
   keys(plan.authority, ["sessionId", "branchInstanceId"]);
-  requireValue(plan.schemaVersion === 1, "Unsupported schema version");
+  requireValue(plan.schemaVersion === 1 || plan.schemaVersion === 2, "Unsupported schema version");
   requireValue(Number.isSafeInteger(plan.revision) && plan.revision >= 0, "Invalid revision");
   uuid(plan.planId); text(plan.title); text(plan.authority.sessionId); text(plan.authority.branchInstanceId);
   if (plan.source !== undefined) {
@@ -95,7 +104,7 @@ function validate(plan: PlanSnapshot): void {
   const runs = new Set<string>();
   const events = new Set<string>();
   for (const task of plan.tasks) {
-    keys(task, ["taskId", "title", "scope", "owner", "criteria", "dependencies", "artifacts", "attempts", "evidence", "decisions", "status", "statusReason", "statusHistory"]);
+    keys(task, ["taskId", "title", "scope", "owner", "criteria", "dependencies", "artifacts", "attempts", "evidence", "decisions", "status", "statusReason", "statusHistory", "workArea", "blockers", "queueReview", "repairs"]);
     uuid(task.taskId); text(task.title); text(task.scope); text(task.owner);
     requireValue(["pending", "in_progress", "blocked", "in_review", "accepted", "failed", "skipped", "cancelled"].includes(task.status), "Invalid status");
     text(task.statusReason);
@@ -136,7 +145,7 @@ function validate(plan: PlanSnapshot): void {
     }
     const evidenceIds = new Set<string>();
     for (const evidence of task.evidence) {
-      keys(evidence, ["evidenceId", "criterionId", "ref", "artifactId", "resultEventId"]);
+      keys(evidence, ["evidenceId", "criterionId", "ref", "artifactId", "resultEventId", "queue"]);
       uuid(evidence.evidenceId); uuid(evidence.criterionId); text(evidence.ref);
       requireValue(!evidenceIds.has(evidence.evidenceId), "Duplicate evidence"); evidenceIds.add(evidence.evidenceId);
       if (evidence.artifactId !== undefined) requireValue(artifacts.has(evidence.artifactId), "Unknown artifact");
@@ -144,7 +153,7 @@ function validate(plan: PlanSnapshot): void {
     }
     let previousDecisionRevision = -1;
     for (const decision of task.decisions) {
-      keys(decision, ["revision", "kind", "reason", "criteria"]);
+      keys(decision, ["revision", "kind", "reason", "criteria", "dependencies", "evidenceAfter"]);
       requireValue(decision.criteria !== null && typeof decision.criteria === "object" && !Array.isArray(decision.criteria) && Object.keys(decision.criteria).length <= 1000, "Invalid decision criteria");
       text(decision.reason);
       requireValue(["accept", "invalidate"].includes(decision.kind) && Number.isSafeInteger(decision.revision) && decision.revision >= 0 && decision.revision <= plan.revision && decision.revision > previousDecisionRevision, "Invalid decision");
@@ -179,7 +188,7 @@ function validate(plan: PlanSnapshot): void {
     // preserves both histories, including attempts no longer supervised here.
     requireValue(task.attempts.length === task.statusHistory.filter((change: StatusChange) => change.status === "in_progress").length, "Attempt history mismatch");
     for (const attempt of task.attempts) {
-      keys(attempt, ["attemptId", "runIds", "childSession", "results", "origin"]);
+      keys(attempt, ["attemptId", "runIds", "childSession", "results", "origin", "reservation"]);
       if (attempt.origin !== undefined) {
         keys(attempt.origin, ["planId", "authority"]);
         keys(attempt.origin.authority, ["sessionId", "branchInstanceId"]);
@@ -204,6 +213,7 @@ function validate(plan: PlanSnapshot): void {
       }
     }
   }
+  const tasksById = new Map(plan.tasks.map(task => [task.taskId, task]));
   const visiting = new Set<string>();
   const visited = new Set<string>();
   function visit(task: PlanTask): void {
@@ -213,12 +223,13 @@ function validate(plan: PlanSnapshot): void {
     requireValue(new Set(task.dependencies).size === task.dependencies.length, "Duplicate dependency");
     for (const id of task.dependencies) {
       requireValue(id !== task.taskId, "Self dependency");
-      const dependency = plan.tasks.find(t => t.taskId === id);
+      const dependency = tasksById.get(id);
       requireValue(dependency, "Missing dependency"); visit(dependency);
     }
     visiting.delete(task.taskId); visited.add(task.taskId);
   }
   plan.tasks.forEach(visit);
+  validateQueueSchema(plan);
 }
 function validateAcceptance(task: PlanTask, mapping: Readonly<Record<string, readonly string[]>>): void {
   requireValue(task.criteria.length > 0 && Object.keys(mapping).length === task.criteria.length, "Map ALL criteria");
@@ -257,13 +268,20 @@ export function editTask(plan: PlanSnapshot, context: CommandContext, taskId: st
   return changeTask(plan, context, taskId, task => {
     const edited = { ...task, ...patch };
     if (task.status !== "accepted" || Object.keys(patch).length === 0) return edited;
-    return { ...setStatus(edited, plan, "in_review", "Task definition edited"), decisions: [...task.decisions, { revision: plan.revision + 1, kind: "invalidate", reason: "Task definition edited", criteria: {} }] };
+    return { ...setStatus(edited, plan, "in_review", "Task definition edited"), queueReview: undefined,
+      decisions: [...task.decisions, { revision: plan.revision + 1, kind: "invalidate", reason: "Task definition edited", criteria: {} }] };
   });
 }
-export function addEvidence(plan: PlanSnapshot, context: CommandContext, taskId: string, evidence: Omit<Evidence, "evidenceId">): PlanSnapshot {
+export function addEvidence(plan: PlanSnapshot, context: CommandContext, taskId: string, evidence: Omit<Evidence, "evidenceId" | "queue">): PlanSnapshot {
+  keys(evidence, ["criterionId", "ref", "artifactId", "resultEventId"]);
   return changeTask(plan, context, taskId, task => {
     requireValue(task.criteria.some(c => c.criterionId === evidence.criterionId), "Unknown criterion");
-    return { ...task, evidence: [...task.evidence, { ...evidence, evidenceId: randomUUID() }] };
+    const attempt = task.attempts.at(-1);
+    if (plan.queue && evidence.resultEventId !== undefined) {
+      requireValue(isQueueResultEvidenceCurrent(task, evidence.resultEventId, attempt, captureDependencies(plan, task)), "Stale queue result evidence; record independent evidence for the current attempt and dependency versions");
+    }
+    return { ...task, evidence: [...task.evidence, { ...evidence, evidenceId: randomUUID(),
+      ...(plan.queue && { queue: { revision: plan.revision + 1, attemptId: attempt?.attemptId } }) }] };
   });
 }
 export function accept(plan: PlanSnapshot, context: CommandContext, taskId: string, criteria: Readonly<Record<string, readonly string[]>>, reason: string): PlanSnapshot {
@@ -271,12 +289,31 @@ export function accept(plan: PlanSnapshot, context: CommandContext, taskId: stri
   return changeTask(plan, context, taskId, task => {
     requireValue(task.status === "in_review", "Accept requires in_review");
     validateAcceptance(task, criteria);
-    return { ...setStatus(task, plan, "accepted", reason), decisions: [...task.decisions, { revision: plan.revision + 1, kind: "accept", reason, criteria }] };
+    const dependencies = plan.queue ? captureDependencies(plan, task) : undefined;
+    let evidenceAfter: number | undefined;
+    if (plan.queue) {
+      const attempt = task.attempts.at(-1);
+      requireValue(!attempt || attempt.reservation?.dispatchedRevision !== undefined, "Accept requires positively confirmed dispatch of the current queue attempt");
+      const invalidated = task.decisions.at(-1)?.kind === "invalidate" && task.decisions.at(-1)!.revision > (task.statusHistory.findLast(c => c.status === "in_progress")?.revision ?? 0);
+      const review = task.queueReview;
+      const baseline = review?.dependencies ?? (!invalidated ? attempt?.reservation?.dependencies : undefined);
+      requireValue(dependencies && sameDependencies(dependencies, baseline ?? (task.dependencies.length === 0 && !attempt && !invalidated ? [] : undefined)), "Queue dependency generation changed or unverified; reverify review before accept");
+      if (invalidated) requireValue(review && review.revision > task.decisions.at(-1)!.revision, "Queue review invalidated; reverify review before accept");
+      evidenceAfter = queueEvidenceMinimum(task, attempt, dependencies);
+      if (evidenceAfter !== undefined) {
+        const after = evidenceAfter;
+        const fresh = new Set(task.evidence.filter(e => e.queue && e.queue.revision > after && e.queue.attemptId === attempt?.attemptId &&
+          (e.resultEventId === undefined || isQueueResultEvidenceCurrent(task, e.resultEventId, attempt, dependencies))).map(e => e.evidenceId));
+        requireValue(Object.values(criteria).every(refs => refs.every(id => fresh.has(id))), "Queue review needs new evidence for all criteria in the current attempt and review epoch");
+      }
+    }
+    return { ...setStatus(task, plan, "accepted", reason), decisions: [...task.decisions, { revision: plan.revision + 1, kind: "accept", reason, criteria, ...(dependencies && { dependencies }), ...(evidenceAfter !== undefined && { evidenceAfter }) }] };
   });
 }
 /** References an existing runtime ID; this module never creates a second runtime identity. */
 export function attachRun(plan: PlanSnapshot, context: CommandContext, taskId: string, attemptId: string, runId: string): PlanSnapshot {
   authorize(plan, context);
+  requireValue(!plan.queue, "Queue runs must use beginQueueDispatch before manifest or transport");
   const existing = plan.tasks.find(t => t.taskId === taskId)?.attempts.find(a => a.attemptId === attemptId);
   if (existing?.runIds.includes(runId)) {
     requireAttemptAuthority(plan, existing);
@@ -301,19 +338,229 @@ function setStatus(task: PlanTask, plan: PlanSnapshot, status: TaskStatus, reaso
 function requireAttemptAuthority(plan: PlanSnapshot, attempt: Attempt): void {
   requireValue(attempt.origin ? attempt.origin.planId === plan.planId && attempt.origin.authority.sessionId === plan.authority.sessionId && attempt.origin.authority.branchInstanceId === plan.authority.branchInstanceId : !plan.source, "Inherited attempt is read-only; retry to create a new attempt");
 }
-function newAttempt(task: PlanTask, plan: PlanSnapshot, childSession: string | undefined, reason: string): PlanTask {
-  return { ...setStatus(task, plan, "in_progress", reason), attempts: [...task.attempts, { attemptId: randomUUID(), origin: { planId: plan.planId, authority: plan.authority }, runIds: [], ...(childSession === undefined ? {} : { childSession }), results: [] }] };
+function newAttempt(task: PlanTask, plan: PlanSnapshot, childSession: string | undefined, reason: string, adapter?: QueueRuntimeAdapter, infrastructureRetry?: InfrastructureRetryLink): PlanTask {
+  let reservation: Reservation | undefined;
+  if (plan.queue) {
+    requireValue(childSession === undefined, "Queue attempts cannot inherit a child session");
+    assertQueueAdmission(plan, task, adapter, undefined, { reusingRepair: infrastructureRetry !== undefined });
+    const dependencies = captureDependencies(plan, task);
+    requireValue(task.workArea && dependencies, "Verified work area and dependencies required");
+    reservation = { phase: "reserved", area: task.workArea, dependencies, ...(infrastructureRetry && { infrastructureRetry }) };
+  }
+  return { ...setStatus(task, plan, "in_progress", reason), queueReview: undefined, attempts: [...task.attempts, { attemptId: randomUUID(), origin: { planId: plan.planId, authority: plan.authority }, runIds: [], ...(childSession === undefined ? {} : { childSession }), results: [], ...(reservation && { reservation }) }] };
 }
-export function startAttempt(plan: PlanSnapshot, context: CommandContext, taskId: string, childSession?: string): PlanSnapshot {
+export function startAttempt(plan: PlanSnapshot, context: CommandContext, taskId: string, childSession?: string, adapter?: QueueRuntimeAdapter): PlanSnapshot {
   return changeTask(plan, context, taskId, task => {
     requireValue(task.status === "pending", "Start requires pending");
-    return newAttempt(task, plan, childSession, "Parent started attempt");
+    return newAttempt(task, plan, childSession, "Parent started attempt", adapter);
   });
 }
-export function retry(plan: PlanSnapshot, context: CommandContext, taskId: string, childSession?: string): PlanSnapshot {
+export function retry(plan: PlanSnapshot, context: CommandContext, taskId: string, childSession?: string, adapter?: QueueRuntimeAdapter): PlanSnapshot {
   return changeTask(plan, context, taskId, task => {
     requireValue(["failed", "blocked", "in_review"].includes(task.status), "Retry requires failed, blocked or in_review");
-    return newAttempt(task, plan, childSession, "Parent requested retry");
+    return newAttempt(task, plan, childSession, "Parent requested retry", adapter);
+  });
+}
+function requireQueue(plan: PlanSnapshot): QueueSettings {
+  requireValue(plan.queue, "queue_not_enabled");
+  return plan.queue;
+}
+function updateQueue(plan: PlanSnapshot, context: CommandContext, queue: QueueSettings): PlanSnapshot {
+  authorize(plan, context);
+  return snapshot({ ...plan, schemaVersion: 2, queue, revision: plan.revision + 1 });
+}
+export function configureQueue(plan: PlanSnapshot, context: CommandContext, maxActive: number): PlanSnapshot {
+  authorize(plan, context);
+  validateQueueLimit(maxActive);
+  requireValue(plan.queue || plan.tasks.every(task => task.attempts.length === 0), "Queue opt-in requires a plan without existing attempts");
+  return updateQueue(plan, context, { mode: "ready_order", enabledRevision: plan.revision + 1, ...plan.queue, maxActive });
+}
+export function queuePause(plan: PlanSnapshot, context: CommandContext, reason: string): PlanSnapshot {
+  queueText(reason);
+  return updateQueue(plan, context, { ...requireQueue(plan), pause: { reason, revision: plan.revision + 1 } });
+}
+export function queueContinue(plan: PlanSnapshot, context: CommandContext, reason: string): PlanSnapshot {
+  queueText(reason); authorize(plan, context);
+  const queue = requireQueue(plan);
+  return queue.pause ? updateQueue(plan, context, { ...queue, pause: undefined }) : plan;
+}
+export function setWorkArea(plan: PlanSnapshot, context: CommandContext, taskId: string, cwd: string, access: WorkArea["access"]): PlanSnapshot {
+  requireQueue(plan);
+  return changeTask(plan, context, taskId, task => {
+    requireValue(task.status === "pending" && task.attempts.every(a => a.reservation?.phase === "released"), "Work area changes require pending without an active reservation");
+    return { ...task, workArea: canonicalWorkArea(cwd, access), queueReview: undefined };
+  });
+}
+export function setBlocker(plan: PlanSnapshot, context: CommandContext, taskId: string, blocker: BlockerInput): PlanSnapshot {
+  requireQueue(plan); validateBlocker(blocker);
+  return changeTask(plan, context, taskId, task => {
+    requireValue(task.attempts.at(-1)?.attemptId === blocker.attemptId, "Blocker requires the current attempt ID, if any");
+    requireValue(["pending", "in_progress", "in_review", "blocked"].includes(task.status), "Cannot block task in this status");
+    return { ...setStatus(task, plan, "blocked", blocker.summary), blockers: [...task.blockers ?? [], { ...blocker, revision: plan.revision + 1 }] };
+  });
+}
+function assertQueueAdmission(plan: PlanSnapshot, task: PlanTask, adapter?: QueueRuntimeAdapter, ownAttemptId?: string, options: { continuing?: boolean; reusingRepair?: boolean } = {}): void {
+  const facts = collectQueueAdmissionFacts(plan, true, adapter, task.taskId);
+  const reasons = queueAdmissionReasons(plan, task, facts, ownAttemptId).filter(({ code }) =>
+    !(options.continuing && ["capacity_exhausted", "capacity_occupant"].includes(code)) &&
+    !(options.reusingRepair && ["replacement_repair_required", "repair_limit_reached"].includes(code)));
+  requireValue(reasons.length === 0, `Queue admission denied: ${reasons.map(r => r.code).join(", ")}`);
+}
+function requireCurrentReservation(plan: PlanSnapshot, task: PlanTask, attemptId: string) {
+  requireQueue(plan);
+  const attempt = task.attempts.at(-1);
+  requireValue(attempt?.attemptId === attemptId && attempt.reservation, "Current queue reservation required");
+  requireAttemptAuthority(plan, attempt);
+  return { attempt, reservation: attempt.reservation };
+}
+function updateReservation(task: PlanTask, attemptId: string, reservation: Reservation, runIds?: readonly string[]): PlanTask {
+  return { ...task, attempts: task.attempts.map(a => a.attemptId === attemptId ? { ...a, reservation, ...(runIds && { runIds }) } : a) };
+}
+function assertQueueExecution(plan: PlanSnapshot, task: PlanTask, attemptId: string, cwd: string, adapter?: QueueRuntimeAdapter, continuing = false) {
+  const { reservation } = requireCurrentReservation(plan, task, attemptId);
+  assertQueueAdmission(plan, task, adapter, attemptId, { continuing });
+  requireValue(sameDependencies(reservation.dependencies, captureDependencies(plan, task)), "Queue dependency generation changed; do not dispatch");
+  requireValue(sameWorkArea(reservation.area, canonicalWorkArea(cwd, reservation.area.access)), "Launch cwd does not match the queue reservation");
+  return reservation;
+}
+/** Atomically records the single-use authorization and correlates the runtime ID.
+ * Caller must successfully append this before creating its manifest or invoking
+ * transport. A later missing manifest is not proof that nothing was sent. */
+export function beginQueueDispatch(plan: PlanSnapshot, context: CommandContext, taskId: string, attemptId: string, runId: string, cwd: string, adapter?: QueueRuntimeAdapter): PlanSnapshot {
+  queueText(runId);
+  return changeTask(plan, context, taskId, task => {
+    requireValue(task.status === "in_progress", "Dispatch requires in_progress");
+    const reservation = assertQueueExecution(plan, task, attemptId, cwd, adapter);
+    requireValue(reservation.phase === "reserved", "Reservation is not awaiting its first dispatch");
+    return updateReservation(task, attemptId, { ...reservation, phase: "uncertain", runId }, [runId]);
+  });
+}
+/** Recheck the initiating call's intent immediately before transport after any
+ * asynchronous preparation. This is a negative-conflict/preparation guard,
+ * not transport authorization. An initiating ephemeral permit and an atomic
+ * runtime manifest boundary are still required; recovered intent cannot send. */
+export function verifyQueueDispatchIntent(plan: PlanSnapshot, context: CommandContext, taskId: string, attemptId: string, runId: string, cwd: string, adapter?: QueueRuntimeAdapter): void {
+  authorize(plan, context);
+  const task = plan.tasks.find(t => t.taskId === taskId);
+  requireValue(task?.status === "in_progress", "Dispatch requires in_progress");
+  const reservation = assertQueueExecution(plan, task, attemptId, cwd, adapter);
+  requireValue(reservation.phase === "uncertain" && reservation.runId === runId, "Dispatch intent no longer current");
+  const binding = { planId: plan.planId, authority: plan.authority, taskId, attemptId, runId };
+  let observation;
+  try { observation = adapter?.inspect(binding); }
+  catch { throw new Error("Runtime dispatch disposition could not be checked"); }
+  requireValue(observation?.state === "unknown", "Dispatch intent already has a runtime disposition or observation is unavailable");
+  let preparable = false;
+  try { preparable = adapter?.canPrepareDispatch?.(binding) === true; }
+  catch { /* Unavailable custody is not authority to prepare. */ }
+  requireValue(preparable, "Runtime cannot positively exclude a known or conflicting dispatch intent");
+}
+export function confirmQueueDispatch(plan: PlanSnapshot, context: CommandContext, taskId: string, attemptId: string, runId: string, adapter?: QueueRuntimeAdapter): PlanSnapshot {
+  return changeTask(plan, context, taskId, task => {
+    const { reservation } = requireCurrentReservation(plan, task, attemptId);
+    requireValue(reservation.phase === "uncertain" && reservation.runId === runId && queueRuntimeAvailable(plan, adapter), "Current dispatch intent and runtime custody required");
+    const proof = inspectQueueRuntime(plan, taskId, attemptId, runId, adapter);
+    requireValue(proof.state === "working" || proof.state === "settled", "Dispatch not positively confirmed");
+    return updateReservation(task, attemptId, { ...reservation, phase: "dispatched", dispatchedRevision: plan.revision + 1 });
+  });
+}
+/** Checks an already-held execution allocation, not authorization for a fresh
+ * process or a new runId. No capacity reallocation for the same tree. */
+export function verifyQueueContinuation(plan: PlanSnapshot, context: CommandContext, taskId: string, attemptId: string, runId: string, cwd: string, adapter?: QueueRuntimeAdapter): void {
+  authorize(plan, context);
+  const task = plan.tasks.find(t => t.taskId === taskId);
+  requireValue(task?.status === "in_progress", "Ordinary queue continuation requires in_progress");
+  assertQueueContinuation(plan, task, attemptId, runId, cwd, adapter);
+}
+function assertQueueContinuation(plan: PlanSnapshot, task: PlanTask, attemptId: string, runId: string, cwd: string, adapter?: QueueRuntimeAdapter): void {
+  const reservation = assertQueueExecution(plan, task, attemptId, cwd, adapter, true);
+  requireValue((reservation.phase === "dispatched" || reservation.phase === "uncertain") && reservation.runId === runId &&
+    inspectQueueRuntime(plan, task.taskId, attemptId, runId, adapter).state === "working", "Queue continuation requires the same supervised execution and active reservation");
+}
+export function releaseReservation(plan: PlanSnapshot, context: CommandContext, taskId: string, attemptId: string, reason: string, adapter?: QueueRuntimeAdapter): PlanSnapshot {
+  queueText(reason); authorize(plan, context);
+  const task = plan.tasks.find(t => t.taskId === taskId);
+  requireValue(task, "Unknown task");
+  const { reservation } = requireCurrentReservation(plan, task, attemptId);
+  if (reservation.phase === "released") return plan;
+  requireValue(queueRuntimeAvailable(plan, adapter), "Queue runtime unavailable; cannot release reservation");
+  // Only a reservation with no durable intent can prove non-dispatch locally.
+  // Once intent exists, the adapter must resolve that exact identity positively.
+  const proof = reservation.runId === undefined ? "not_dispatched" : inspectQueueRuntime(plan, taskId, attemptId, reservation.runId, adapter).state;
+  requireValue(proof === "settled" || (proof === "not_dispatched" && reservation.phase !== "dispatched"), "Cannot release queue reservation without positive dispatch/tree settlement proof");
+  const released = updateReservation(task, attemptId, { ...reservation, phase: "released",
+    ...(proof === "settled" && { dispatchedRevision: reservation.dispatchedRevision ?? plan.revision + 1 }),
+    release: { revision: plan.revision + 1, reason, proof } });
+  return changeTask(plan, context, taskId, () => task.status === "in_progress" ? setStatus(released, plan, "blocked", reason) : released);
+}
+function replayedQueueRepair(plan: PlanSnapshot, taskId: string, attemptId: string, input: RepairInput, replacement?: true): boolean {
+  const duplicate = plan.tasks.find(t => t.repairs?.some(d => d.decisionId === input.decisionId));
+  if (!duplicate) return false;
+  const decision = duplicate.repairs!.find(d => d.decisionId === input.decisionId)!;
+  requireValue(duplicate.taskId === taskId && decision.attemptId === attemptId && decision.replacement === replacement && decision.reviewRef === input.reviewRef &&
+    decision.artifactVersion === input.artifactVersion && decision.reason === input.reason, "Conflicting repair decision ID");
+  return true;
+}
+/** Same-tree post-review repair. Replay returns the identical snapshot and
+ * cannot authorize another send. Transport integration is separate. */
+export function recordQueueRepair(plan: PlanSnapshot, context: CommandContext, taskId: string, attemptId: string, runId: string, cwd: string, input: RepairInput, adapter?: QueueRuntimeAdapter): PlanSnapshot {
+  authorize(plan, context); requireQueue(plan); validateRepair(input);
+  if (replayedQueueRepair(plan, taskId, attemptId, input)) return plan;
+  return changeTask(plan, context, taskId, task => {
+    requireValue(task.status === "in_review", "Queue repair requires in_review");
+    const round = (task.repairs?.length ?? 0) + 1;
+    requireValue(round <= 3, "Queue repair limit reached");
+    assertQueueContinuation(plan, task, attemptId, runId, cwd, adapter);
+    return { ...task, queueReview: { attemptId, dependencies: captureDependencies(plan, task)!, revision: plan.revision + 1 },
+      repairs: [...task.repairs ?? [], { ...input, attemptId, round, revision: plan.revision + 1 }] };
+  });
+}
+/** Charges a replacement round before reserving the next attempt. Ordinarily
+ * the decision applies only to the immediate successor. Explicit infrastructure
+ * retries can carry it across a proved non-send; no replay resets the budget. */
+export function recordQueueReplacementRepair(plan: PlanSnapshot, context: CommandContext, taskId: string, attemptId: string, input: RepairInput): PlanSnapshot {
+  authorize(plan, context); requireQueue(plan); validateRepair(input);
+  if (replayedQueueRepair(plan, taskId, attemptId, input, true)) return plan;
+  return changeTask(plan, context, taskId, task => {
+    const { reservation } = requireCurrentReservation(plan, task, attemptId);
+    requireValue(needsReplacementRepair(task) && ["pending", "in_review", "failed", "blocked"].includes(task.status), "Replacement repair requires a previously reviewed task eligible for a new attempt");
+    requireValue(reservation.phase === "released", "Replacement repair requires release of the prior reservation");
+    requireValue(!task.repairs?.some(repair => repair.replacement && repair.attemptId === attemptId), "A replacement repair is already recorded for this attempt");
+    const round = (task.repairs?.length ?? 0) + 1;
+    requireValue(round <= 3, "Queue repair limit reached");
+    return { ...task, repairs: [...task.repairs ?? [], { ...input, attemptId, replacement: true, round, revision: plan.revision + 1 }] };
+  });
+}
+/** Explicit retry of a replacement that definitely never crossed transport.
+ * The authorization remains the immutable repair decision; the attempt is new,
+ * and beginQueueDispatch must append a different run ID if one was used. */
+export function retryQueueInfrastructure(plan: PlanSnapshot, context: CommandContext, taskId: string, input: InfrastructureRetryInput, adapter?: QueueRuntimeAdapter): PlanSnapshot {
+  requireQueue(plan); validateInfrastructureRetry(input);
+  return changeTask(plan, context, taskId, task => {
+    const { attempt, reservation } = requireCurrentReservation(plan, task, input.predecessorAttemptId);
+    requireValue(isDefiniteUnsentRetryPredecessor(task, attempt), "Infrastructure retry requires definite non-send release and no conflicting block");
+    const decision = task.repairs?.at(-1);
+    const predecessorLink = reservation.infrastructureRetry;
+    requireValue(decision?.replacement === true && decision.decisionId === input.repairDecisionId &&
+      (predecessorLink ? predecessorLink.repairDecisionId === decision.decisionId : decision.attemptId === task.attempts.at(-2)?.attemptId),
+      "Infrastructure retry must reuse the current replacement repair decision");
+    const next = newAttempt(task, plan, undefined, input.reason, adapter, { repairDecisionId: decision.decisionId, predecessorAttemptId: attempt.attemptId });
+    if (reservation.runId !== undefined) {
+      const observation = inspectQueueRuntime(plan, taskId, attempt.attemptId, reservation.runId, adapter);
+      requireValue(observation.state === "not_dispatched" && !observation.proposal, "Runtime cannot reaffirm definite non-send of the predecessor intent");
+    }
+    return next;
+  });
+}
+/** Explicit parent reverification; do not silently rebase a stale attempt or
+ * reuse the old evidence mapping. Add new criterion evidence after this call. */
+export function revalidateQueueReview(plan: PlanSnapshot, context: CommandContext, taskId: string): PlanSnapshot {
+  requireQueue(plan);
+  return changeTask(plan, context, taskId, task => {
+    requireValue(task.status === "in_review", "Queue reverification requires in_review");
+    const dependencies = captureDependencies(plan, task);
+    requireValue(dependencies, "Queue review dependencies are not currently accepted");
+    return { ...task, queueReview: { attemptId: task.attempts.at(-1)?.attemptId, dependencies, revision: plan.revision + 1 } };
   });
 }
 function transition(plan: PlanSnapshot, context: CommandContext, taskId: string, from: readonly TaskStatus[], to: TaskStatus, reason: string): PlanSnapshot {
@@ -340,7 +587,7 @@ export function cancel(plan: PlanSnapshot, context: CommandContext, taskId: stri
 export function reopen(plan: PlanSnapshot, context: CommandContext, taskId: string, reason: string): PlanSnapshot {
   return changeTask(plan, context, taskId, task => {
     requireValue(["accepted", "failed", "skipped", "cancelled"].includes(task.status), "Reopen requires terminal state");
-    return { ...setStatus(task, plan, "pending", reason), ...(task.status === "accepted" ? { decisions: [...task.decisions, { revision: plan.revision + 1, kind: "invalidate" as const, reason, criteria: {} }] } : {}) };
+    return { ...setStatus(task, plan, "pending", reason), queueReview: undefined, ...(task.status === "accepted" ? { decisions: [...task.decisions, { revision: plan.revision + 1, kind: "invalidate" as const, reason, criteria: {} }] } : {}) };
   });
 }
 /** Worker payload is data only: a parent must authorize recording it. */
@@ -363,6 +610,10 @@ export function recordResult(plan: PlanSnapshot, context: CommandContext, taskId
     // Completion is observation, never acceptance. Old attempts and terminal tasks
     // retain late events without changing the parent's decision.
     if (task.attempts.at(-1)?.attemptId !== attemptId || !["in_progress", "blocked", "in_review"].includes(task.status) || result.kind === "process_exit") return recorded;
+    // A delayed child proposal cannot supersede the parent's explicit blocker
+    // or revive an assignment already released as never dispatched.
+    if (plan.queue && (targetAttempt.reservation?.release?.proof === "not_dispatched" ||
+      (task.status === "blocked" && task.blockers?.at(-1)?.revision === task.statusHistory.at(-1)?.revision))) return recorded;
     if (result.kind === "ping") return setStatus(recorded, plan, "blocked", result.reason!);
     if (result.kind === "failure") return setStatus(recorded, plan, "failed", result.reason!);
     return setStatus(recorded, plan, "in_review", result.reason ?? "Worker result requires parent review");
@@ -373,12 +624,18 @@ export function recordResult(plan: PlanSnapshot, context: CommandContext, taskId
 export function detachPlan(plan: PlanSnapshot, authority: Authority, entryId: string, reason: string): PlanSnapshot {
   validate(plan); text(reason); text(entryId);
   requireValue(authority.branchInstanceId !== plan.authority.branchInstanceId, "Detach requires new branch authority");
+  requireValue(!plan.queue || plan.tasks.every(task => task.attempts.every(attempt => attempt.reservation?.phase === "released")), "Cannot detach a queue plan with outstanding reservations; reconcile on original branch");
   const explanation = `Inherited attempt requires explicit retry after detach: ${reason}`;
-  return snapshot({ ...plan, planId: randomUUID(), authority, revision: plan.revision + 1,
+  // Queue control data stays with the original branch. The explicit source
+  // pointer still identifies that historical audit; no slot or lease is copied.
+  return snapshot({ ...plan, schemaVersion: 1, queue: undefined, planId: randomUUID(), authority, revision: plan.revision + 1,
     source: { planId: plan.planId, authority: plan.authority, revision: plan.revision, entryId, reason },
     tasks: plan.tasks.map(task => ({
       ...(["in_progress", "blocked", "in_review"].includes(task.status) && task.attempts.length ? setStatus(task, plan, "blocked", explanation) : task),
-      attempts: task.attempts.map(attempt => ({ ...attempt, origin: attempt.origin ?? { planId: plan.planId, authority: plan.authority } })),
+      workArea: undefined, blockers: undefined, queueReview: undefined, repairs: undefined,
+      evidence: task.evidence.map(evidence => ({ ...evidence, queue: undefined })),
+      decisions: task.decisions.map(decision => ({ ...decision, dependencies: undefined, evidenceAfter: undefined })),
+      attempts: task.attempts.map(attempt => ({ ...attempt, reservation: undefined, origin: attempt.origin ?? { planId: plan.planId, authority: plan.authority } })),
     })),
   });
 }

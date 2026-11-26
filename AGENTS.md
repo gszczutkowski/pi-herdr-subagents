@@ -16,7 +16,7 @@
 - Subagent completion does not mean task acceptance. Inspect changes,
   acceptance criteria, and test results. Review and tests must cover
   the same version of the code.
-- If review finds defects, allow up to three repair rounds. After each round,
+- If review finds defects, allow up to six repair rounds. After each round,
   rerun review and relevant tests against the updated code. If defects remain
   after the third round, stop and report unresolved issues to the user.
   Report blockers or scope changes immediately.

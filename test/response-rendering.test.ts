@@ -125,7 +125,19 @@ describe("parent completion rendering", () => {
     }
     assert.ok(!collapsed.includes("Session:"));
     assert.ok(expanded.includes("Session: /tmp/session"));
-    assert.ok(expanded.includes("Resume: pi --session /tmp/session"));
+    assert.ok(!expanded.includes("Resume: pi --session /tmp/session"));
+  });
+
+  it("renders the keep-open close target in both views without suggesting a second writer", () => {
+    const details = { name: "Worker", response: "Finished", sessionFile: "/tmp/child", keepOpen: true, runId: "retained-child" };
+    for (const expanded of [false, true]) {
+      const { text } = render(details, "", expanded, 160);
+      assert.ok(text.includes('subagent_close({"id":"retained-child"})'));
+      assert.ok(!text.includes("pi --session"));
+    }
+    const closed = render({ ...details, keepOpen: false }, "", true).text;
+    assert.ok(!closed.includes("subagent_close"));
+    assert.ok(closed.includes("Resume: pi --session /tmp/child"));
   });
 
   it("shows an explicit placeholder for an empty structured response", () => {

@@ -1,18 +1,22 @@
 import { mock, test } from "node:test";
 import assert from "node:assert/strict";
 import childProcess from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import fs, { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { Type } from "@sinclair/typebox";
 import { withChildSession } from "./child-session.ts";
-import { readRetainedCompletion } from "../pi-extension/subagents/completion.ts";
+import { readRetainedCompletion, waitForCompletion } from "../pi-extension/subagents/completion.ts";
+import { canonicalSessionPath } from "../pi-extension/subagents/ownership.ts";
+import { runCompletionFile } from "../pi-extension/subagents/run-artifacts.ts";
+import { getBehaviorConfig } from "../pi-extension/subagents/config.ts";
 import { DELEGATION_WAIT_QUERY } from "../pi-extension/subagents/delegation-wait.ts";
 import { loadAgentDefaults, parseAgentDefinition } from "../pi-extension/subagents/discovery.ts";
 import { RuntimeStore } from "../pi-extension/subagents/runtime-store.ts";
 import { buildSubagentToolAllowlist } from "../pi-extension/subagents/harness/drivers/pi.ts";
 
+const readdirSyncOriginal = readdirSync;
 const call = (name: string, args: object = {}) => ({ type: "toolCall" as const, id: name, name, arguments: args });
 function events(): any[] {
   const dir = `${process.env.PI_SUBAGENT_SESSION}.${process.env.PI_SUBAGENT_ID}.exit.events`;
@@ -37,6 +41,24 @@ for (const explicit of [false, true]) {
     });
   });
 }
+
+test("native done without a close override honors the one-shot launch default", async () => {
+  const config = getBehaviorConfig();
+  const previous = config.closeOnDone;
+  config.closeOnDone = true;
+  try {
+    await withChildSession({ autoExit: true, respond: () => ({ stopReason: "toolUse", content: [call("subagent_done")] }) },
+      async ({ session, shutdowns }) => {
+        await session.prompt("Finish without follow-up");
+        const [completion] = events();
+        assert.equal(completion?.type, "done");
+        assert.notEqual(completion.keepOpen, true);
+        assert.equal(shutdowns(), 1);
+      });
+  } finally {
+    config.closeOnDone = previous;
+  }
+});
 
 for (const close of [true, false]) {
   test(`native done + slow sibling waits for settlement (close=${close})`, async () => {
@@ -180,21 +202,30 @@ test("reload notices a wake source lost while extensions were unbound, exactly o
   });
 });
 
-for (const scenario of ["normal", "park", "reload-park", "ping", "early-done"] as const) test(`native coordinator delegation: ${scenario}`, { timeout: 20_000 }, async () => {
+for (const scenario of ["normal", "park", "reload-park", "ping", "early-done", "repair"] as const) test(`native coordinator delegation: ${scenario}`, {
+  timeout: 20_000, skip: scenario === "repair" && !["linux", "win32"].includes(process.platform),
+}, async () => {
   const park = scenario === "park" || scenario === "reload-park";
   const twoWorkers = scenario === "ping" || scenario === "early-done";
+  const repair = scenario === "repair";
+  const rootObservation = new AbortController();
   // The Pi host, tools, watcher and outbox are real; the terminal and worker
   // process are simulated at their transport and immutable result boundaries.
   const originalExec = childProcess.execFile;
   const env = Object.fromEntries(["HERDR_ENV", "HERDR_WORKSPACE_ID", "HC_TERMINAL_ID", "HC_TERMINAL_SOCKET",
     "PI_SUBAGENT_LAYOUT", "PI_SUBAGENT_AGENT", "PI_SUBAGENT_SHELL_READY_DELAY_MS"].map(key => [key, process.env[key]]));
+  const closedPanes = new Set<string>();
+  let sequence = 0;
+  mock.method(fs, "readdirSync", (path: any, ...args: any[]) => String(path) === "/proc" ? [] : (readdirSyncOriginal as any)(path, ...args));
   mock.method(childProcess, "execSync", () => "herdr");
   mock.method(childProcess, "execFileSync", (command: string, args: string[]) => {
     if (command === "powershell.exe") return "[]";
-    return args[0] === "tab" && args[1] === "create" ? JSON.stringify({ result: { root_pane: { pane_id: "worker-pane" } } }) : "";
+    if (args[0] === "pane" && args[1] === "close") closedPanes.add(args[2]);
+    return args[0] === "tab" && args[1] === "create" ? JSON.stringify({ result: { root_pane: { pane_id: `worker-pane-${++sequence}` } } }) : "";
   });
   childProcess.execFile = Object.assign(() => { throw new Error("unexpected transport"); }, {
-    [promisify.custom]: async () => ({ stdout: JSON.stringify({ result: { pane: { pane_id: "worker-pane", agent_status: "working" } } }) }),
+    [promisify.custom]: async (_command: string, args: string[]) => ({ stdout: args[1] === "get" ? JSON.stringify(closedPanes.has(args[2])
+      ? { error: { code: "pane_not_found" } } : { result: { pane: { pane_id: args[2], agent_status: "working" } } }) : "" }),
   }) as any;
   syncBuiltinESMExports();
   try {
@@ -212,17 +243,32 @@ for (const scenario of ["normal", "park", "reload-park", "ping", "early-done"] a
     let intermediateSettled!: () => void;
     const intermediateTurn = new Promise<void>(resolve => { intermediateSettled = resolve; });
     let count = 0;
+    let repairPath: string;
+    let rootPath: string;
+    const localFollowUp = twoWorkers || repair;
     const launchTool = (id: string) => ({ ...call("subagent", { agent: "worker", name: id, task: `Implement ${id}` }), id });
     await withChildSession({ autoExit: false, completionMode: definition.completionMode,
       tools: buildSubagentToolAllowlist(definition.tools)!.split(","),
+      setup: repair ? manager => {
+        rootPath = canonicalSessionPath(join(manager.getSessionDir(), "root-observer.jsonl"));
+        const root = { sessionId: "root-observer", sessionFile: rootPath };
+        writeFileSync(rootPath, JSON.stringify({ type: "session", version: 3, id: root.sessionId, cwd: manager.getCwd(), timestamp: new Date().toISOString() }) + "\n");
+        manager.appendCustomEntry("subagent-assignment", { lineage: { version: 1, parent: root, root,
+          child: { sessionId: manager.getSessionId(), sessionFile: canonicalSessionPath(manager.getSessionFile()!) },
+          rootAssignmentId: "root-assignment", rootCheckpoint: "root-checkpoint", rootBranchToken: "root-token",
+          eventDirectory: join(manager.getSessionDir(), "root-history"),
+        } });
+      } : undefined,
       extensions: [orchestration, pi => pi.on("agent_settled", () => {
-        if (++count === 2 && twoWorkers) intermediateSettled();
-        if (count === (twoWorkers ? 3 : 2)) settled();
+        if (++count === 2 && localFollowUp) intermediateSettled();
+        if (count === (localFollowUp ? 3 : 2)) settled();
       })],
       respond: index => {
         if (index === 0) return { stopReason: "toolUse", content: twoWorkers ? [launchTool("First"), launchTool("Second")] : [launchTool("First")] };
         if (index === 1) return { content: [{ type: "text", text: "WAITING_INTERIM_ONLY" }] };
         if (index === 2 && scenario === "ping") return { stopReason: "toolUse", content: [call("caller_ping", { message: "Need decision" })] };
+        if (index === 2 && repair) return { stopReason: "toolUse", content: [call("subagent_resume", { sessionPath: repairPath, message: "Repair reviewed defect" })] };
+        if (index === 3 && repair) return { content: [{ type: "text", text: "WAITING_FOR_PRIVATE_REPAIR" }] };
         return { stopReason: "toolUse", content: [call("subagent_done", { result: proposal, close: true })] };
       },
     }, async ({ session, requests, shutdowns }) => {
@@ -230,14 +276,30 @@ for (const scenario of ["normal", "park", "reload-park", "ping", "early-done"] a
       assert.equal(loadAgentDefaults("worker")?.completionMode, undefined);
       for (const name of ["subagent", "subagents_list", "subagent_done", "subagent_close"]) assert.ok(session.getActiveToolNames().includes(name), name);
       for (const name of ["bash", "write", "edit"]) assert.ok(!session.getActiveToolNames().includes(name), name);
+      const coordinatorPath = process.env.PI_SUBAGENT_SESSION!;
+      const coordinatorId = process.env.PI_SUBAGENT_ID!;
+      const legacyPath = runCompletionFile(coordinatorPath, coordinatorId);
+      const rootReports: string[] = [];
+      // Install the same run-scoped completion observer used by a supervising
+      // root. Keep it live through both worker results and the repair turn.
+      const firstRootReport = repair ? waitForCompletion(rootObservation.signal, { sessionFile: coordinatorPath, runId: coordinatorId,
+        intervalMs: 10, retainedEventIds: () => [], readTerminalTail: async () => "" }).then(result => { rootReports.push(result.reason); return result; }) : undefined;
+      void firstRootReport?.catch(() => {});
+      const assertQuietRoot = () => {
+        assert.deepEqual(rootReports, []);
+        assert.equal(existsSync(legacyPath), false, "no legacy completion to root");
+        assert.deepEqual(events(), [], "no settled completion to root");
+      };
       await session.prompt("Coordinate export");
       assert.equal(shutdowns(), 0);
+      if (repair) assertQuietRoot();
       assert.equal(events().length, 0, "initial wait does not report to the ancestor");
       const launches = requests[1].messages.filter((message: any) => message.role === "toolResult" && message.toolName === "subagent").map((m: any) => m.details);
       assert.equal(launches.length, twoWorkers ? 2 : 1);
       const [launch, second] = launches;
       assert.equal(launch?.status, "started");
       assert.match(readFileSync(launch.launchScriptFile, "utf8"), /PI_SUBAGENT_COMPLETION_MODE=automatic/);
+      repairPath = launch.sessionFile;
       const artifact = `${launch.sessionFile}.${launch.id}.exit.events/worker-result.json`;
       mkdirSync(dirname(artifact), { recursive: true });
       if (scenario === "reload-park") {
@@ -284,17 +346,38 @@ for (const scenario of ["normal", "park", "reload-park", "ping", "early-done"] a
         mkdirSync(dirname(path), { recursive: true });
         writeFileSync(path, JSON.stringify({ type: "done", runId: second.id, eventId: "second", summary: "SECOND_REPORT" }));
       }
+      if (repair) {
+        await intermediateTurn;
+        assertQuietRoot();
+        assert.equal(shutdowns(), 0, "the coordinator remains available during local repairs");
+        const repaired = requests[3].messages.find((m: any) => m.role === "toolResult" && m.toolName === "subagent_resume")?.details;
+        assert.equal(repaired?.status, "started");
+        assert.notEqual(repaired.id, launch.id);
+        assert.equal(repaired.sessionPath, canonicalSessionPath(launch.sessionFile));
+        assert.equal(repaired.lineage.parent.sessionFile, canonicalSessionPath(coordinatorPath));
+        assert.equal(repaired.lineage.root.sessionFile, rootPath!);
+        const path = `${runCompletionFile(repaired.sessionPath, repaired.id)}.events/repair.json`;
+        mkdirSync(dirname(path), { recursive: true });
+        writeFileSync(path, JSON.stringify({ type: "done", runId: repaired.id, eventId: "repair", summary: "PRIVATE_REPAIR_REPORT" }));
+      }
       await settledOutcome;
-      assert.equal(requests.length, twoWorkers ? 4 : 3, "each worker result woke the coordinator exactly once");
+      assert.equal(requests.length, repair ? 5 : twoWorkers ? 4 : 3, "each worker result woke the coordinator exactly once");
+      if (repair) {
+        assert.match(JSON.stringify(requests.at(-1).messages), /PRIVATE_REPAIR_REPORT/);
+        const rootResult = await firstRootReport;
+        assert.deepEqual(rootReports, ["done"]);
+        assert.deepEqual(rootResult?.structuredResult, proposal, "the first report observed by root is the explicit final proposal");
+      }
       if (twoWorkers) assert.match(JSON.stringify(requests.at(-1).messages), /SECOND_REPORT/);
       assert.match(JSON.stringify(requests[2].messages), /PRIVATE_WORKER_REPORT/);
       assert.equal(events().length, scenario === "ping" ? 2 : 1);
       const final = events().find(e => e.type === "done");
       assert.deepEqual(final?.structuredResult, proposal);
-      assert.doesNotMatch(JSON.stringify(final), /PRIVATE_WORKER_REPORT|WAITING_INTERIM_ONLY/);
+      assert.doesNotMatch(JSON.stringify(final), /PRIVATE_WORKER_REPORT|PRIVATE_REPAIR_REPORT|WAITING_INTERIM_ONLY|WAITING_FOR_PRIVATE_REPAIR/);
       assert.equal(shutdowns(), 1);
     });
   } finally {
+    rootObservation.abort();
     childProcess.execFile = originalExec;
     mock.restoreAll();
     syncBuiltinESMExports();

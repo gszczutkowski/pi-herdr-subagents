@@ -5,17 +5,22 @@ import { probeProcess, sameProcess } from "./process-identity.ts";
 import { assertSessionWriters, auditSession } from "./session-audit.ts";
 import type { DurableRun, RuntimeStore } from "./runtime-store.ts";
 import { reconcileContinuation } from "./live-continuation.ts";
+import { confirmedUnsent } from "./dispatch-recovery.ts";
 
 /** Explicit resume decision for an artifact-only reservation. Neither a retained
  * completion nor a cached recovery outcome proves that a session is safe now.
  * Keep this synchronous through release so concurrent resumes cannot both win. */
-export function releaseRecoveredSession(store: RuntimeStore, sessionFile: string): void {
+export function releaseRecoveredSession(store: RuntimeStore, sessionFile: string, verifiedUnsent?: ReadonlySet<string>): void {
   store.assertCustody();
   const path = canonicalSessionPath(sessionFile);
   const owner = sessionOwners.get(path);
   if (!owner || owner.surface) return;
   const run = store.getRun(owner.runId);
-  if (!run || run.cli !== "pi" || canonicalSessionPath(run.sessionFile) !== path) return;
+  if (!run || run.cli !== "pi" || canonicalSessionPath(run.sessionFile) !== path || store.hasMalformedAfterIntentCursor(run.id)) return;
+  if (run.phase === "dispatch-intent" && verifiedUnsent?.has(run.id) && confirmedUnsent(store, run)) {
+    releaseUnsentReservation(path, run.id);
+    return;
+  }
   const identity = readChildIdentity(path, run.id);
   if (!identity) return;
   const probe = probeProcess(identity.process.pid);
@@ -29,13 +34,29 @@ export function releaseRecoveredSession(store: RuntimeStore, sessionFile: string
   releaseSession(path, run.id);
 }
 
+// A previously ambiguous intent may have an artifact-only reservation. Never
+// release a live terminal owner or one that has acquired a pending control.
+function releaseUnsentReservation(path: string, runId: string): boolean {
+  const owner = sessionOwners.get(path);
+  if (owner?.runId !== runId) return true;
+  if (owner.surface || owner.closeRequestId || owner.continuationRequestId) return false;
+  sessionOwners.delete(path);
+  return true;
+}
+
+export interface RecoveryDispatchDisposition {
+  unsent: ReadonlySet<string>;
+  conflicts: ReadonlySet<string>;
+}
 export interface RecoveryFailure { runId?: string; error: string }
 export interface RecoveryStatus { state: "active" | "paused" | "stopped"; errors: readonly RecoveryFailure[] }
 export interface RecoverySupervisor {
   (): void;
   /** One bounded artifact-only pass. No dispatch, launch, or custody acquisition. */
-  reconcile(): RecoveryStatus;
+  reconcile(disposition?: RecoveryDispatchDisposition): RecoveryStatus;
   status(): RecoveryStatus;
+  /** True if this supervisor captured the run during restoration. */
+  tracks?(runId: string): boolean;
 }
 
 /** Restart policy B. No launch builders, terminal APIs or task scripts here.
@@ -44,12 +65,16 @@ export async function reconcileRuntime(
   store: RuntimeStore,
   onEvidence: (run: DurableRun, completion: CompletionResult) => void,
   isCurrent: () => boolean,
-  options: { onError?: (failure: RecoveryFailure) => void; maxEventsPerPass?: number } = {},
+  options: { onError?: (failure: RecoveryFailure) => void; maxEventsPerPass?: number; disposition?: RecoveryDispatchDisposition } = {},
 ): Promise<RecoverySupervisor> {
   const limit = options.maxEventsPerPass ?? 100;
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) throw new Error("Recovery pass limit must be 1..1000 events");
   store.assertCustody();
-  const runs = store.listRuns().sort((a, b) => b.startTime - a.startTime);
+  let disposition = options.disposition;
+  const runs = store.listRuns().filter(run => {
+    if (!disposition?.unsent.has(run.id) || !confirmedUnsent(store, run)) return true;
+    return !releaseUnsentReservation(canonicalSessionPath(run.sessionFile), run.id);
+  }).sort((a, b) => b.startTime - a.startTime);
   const reserved = new Set<string>();
   const baseline = new Map<string, string>();
   for (const run of runs) {
@@ -59,8 +84,10 @@ export async function reconcileRuntime(
       // Same-run reservations must still pass a fresh identity probe. A different
       // run can contribute immutable evidence, never inherit writer controls.
       if (previous.runId === run.id) { reserved.add(run.id); continue; }
-      const decision = `decision: session reserved by ${previous.runId}`;
-      store.reconcileRun(run.id, decision); baseline.set(run.id, decision);
+      if (!disposition?.conflicts.has(run.id)) {
+        const decision = `decision: session reserved by ${previous.runId}`;
+        store.reconcileRun(run.id, decision); baseline.set(run.id, decision);
+      }
       continue;
     }
     const owner = reserveSession(path, run.id);
@@ -74,7 +101,8 @@ export async function reconcileRuntime(
   let nextRun = 0;
   const current = () => !stopped && isCurrent();
   const verified = new Set<string>();
-  const backlog = new Set(runs.map(run => run.id));
+  const disposed = new Set<string>();
+  const backlog = new Set(runs.filter(run => !disposition?.conflicts.has(run.id)).map(run => run.id));
   const paused = new Map<string, RecoveryFailure>();
   const indexes = new Map(runs.map(run => [run.id, new RetainedCompletionIndex()]));
   const status = (): RecoveryStatus => ({ state: stopped ? "stopped" : globalFailure || paused.size ? "paused" : "active",
@@ -121,9 +149,23 @@ export async function reconcileRuntime(
     for (let n = 0; n < runs.length && budget.remaining > 0; n++) {
       const index = (start + n) % runs.length;
       const run = runs[index];
-      if (!explicit && (paused.has(run.id) || (!verified.has(run.id) && !backlog.has(run.id)))) continue;
+      // Keep conflicting runs reserved, but do not attest liveness or import
+      // artifacts while the dispatch disposition is contradictory.
+      if (disposed.has(run.id) || disposition?.conflicts.has(run.id) ||
+          (!explicit && (paused.has(run.id) || (!verified.has(run.id) && !backlog.has(run.id))))) continue;
       nextRun = (index + 1) % runs.length;
       try {
+        // Explicit reconciliation imports journal evidence before this pass.
+        // The startup snapshot can predate that now-canonical tombstone.
+        if (explicit && disposition?.unsent.has(run.id)) {
+          const latest = store.getRun(run.id);
+          if (latest && confirmedUnsent(store, latest)) {
+            if (releaseUnsentReservation(canonicalSessionPath(latest.sessionFile), latest.id)) disposed.add(run.id);
+            backlog.delete(run.id);
+            paused.delete(run.id);
+            continue;
+          }
+        }
         harvest(run, budget);
         if (paused.has(run.id)) {
           store.reconcileRun(run.id, baseline.get(run.id) ?? "unverified: artifact reconciliation resumed; no terminal controls or automatic launch");
@@ -135,7 +177,7 @@ export async function reconcileRuntime(
   };
   for (const run of runs) {
     if (!current()) break;
-    if (!reserved.has(run.id)) continue;
+    if (!reserved.has(run.id) || disposition?.conflicts.has(run.id) || disposition?.unsent.has(run.id)) continue;
     const outcome = run.cli === "pi"
       ? await verifyRecoveryChild(run.sessionFile, run.id, store.generation, current) : "unverified";
     if (!current()) break;
@@ -144,7 +186,7 @@ export async function reconcileRuntime(
       ? "verified-live: artifact-only supervision; terminal controls disabled"
       : outcome === "exited" ? "exited: decision required before another writer"
         : "unverified: decision required; no terminal controls or automatic launch";
-    store.reconcileRun(run.id, decision); baseline.set(run.id, decision);
+    store.reconcileRun(run.id, decision, outcome === "verified-live"); baseline.set(run.id, decision);
     if (outcome === "verified-live") verified.add(run.id);
   }
   pass();
@@ -154,6 +196,7 @@ export async function reconcileRuntime(
   }
   const stop = (() => { stopped = true; if (timer) clearInterval(timer); }) as RecoverySupervisor;
   stop.status = status;
-  stop.reconcile = () => pass(true);
+  stop.tracks = runId => indexes.has(runId) && !disposed.has(runId);
+  stop.reconcile = latest => { disposition = latest; return pass(true); };
   return stop;
 }

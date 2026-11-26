@@ -4,6 +4,64 @@ This is the current scope/status entry point. `docs/history/HANDOFF.md` records 
 completed close/audit milestone; its completion is not completion of subsequent
 repair or context-optimization plans.
 
+## Current v1 repair: P1 and P3 accepted (Windows, offline)
+
+- Both [review #5](docs/plans/backlog-p1-independent-review-5.md) cases now have permanent filesystem-fault tests. A manifest read `EIO` during marked plan proof and a rename `ENOSPC` during evidence pinning stop recovered supervision and parent delivery. Ordinary completions remain pending rather than being lost or sent while paused. A readable disagreement remains scoped to its run.
+- Explicit reconciliation keeps the writer paused through supervisor restoration. If a second storage fault occurs during that wait, an ordinary turn or `/reload` cannot resume imports, delivery or dispatch. A clean explicit retry restores them without replaying the original command.
+- An in-flight bound launch that fails before send still records its durable failure. The immediate failure handler and outbox importer now apply the same writer check: neither changes the plan while paused. Two regressions verify zero sends and exactly one failure imported after repair.
+- P3: simulated parent processes in `test/runtime-recovery.test.ts` no longer inherit delegated authority markers. In `test/plan-queue.test.ts`, ready-order assertions use checkout roots obtained from real Git worktrees without racing the projection deadline. A separate injected timeout still verifies that an inconclusive check does not mean “no ready task.” Both suites passed with delegated markers set (24/24), independently repeated. P3 accepted.
+
+**Verification:** final `npm test` **939/939** (zero skipped); `npm run typecheck`, `npm run lint` and `git diff --check` passed. Independent review passed the scoped P1 fixes and repeated both dispatch suites (66/66) on the same source and test versions. Earlier full passes (936 and 937 tests) preceded the double-fault and in-flight fixes respectively and were not treated as acceptance. Public ready-order v2 remains disabled. Linux and authenticated live Pi/herdr were not tested in this iteration.
+
+## Previous P1 iteration: blocked after independent review #5
+
+The new backlog iteration completed three repair rounds and five review invocations
+(invocation #3 ended with a provider error, without a verdict). P1 is **not accepted**.
+The nonempty failure-string guard, whole-cursor marker quarantine, run-local journal
+conflicts, disputed-session scoping and journal-read fault latch passed targeted checks.
+Independent [review #5](docs/plans/backlog-p1-independent-review-5.md) still reproduced:
+
+- A manifest `EIO` in marked plan-proof custody validation is silently deferred without
+  latching the writer pause; incidental import and a fresh explicit launch remain possible.
+- Dispatch-evidence pin `ENOSPC` blocks launch initially but leaves delivery enabled;
+  same-writer reload can clear that fence without clean explicit reconciliation.
+
+**Work stopped at the three-repair-round limit in `AGENTS.md`.** No fourth repair round
+or later backlog point was started. The latest permanent targeted suites passed
+**140/140**, independently repeated; these passes do not waive the two diagnostic
+reproductions. Parent repeated the four new one-shot journal regressions **4/4** and
+verified the changed source/test hashes. Typecheck, lint and whitespace checks pass.
+Full `npm test`, authenticated live Pi/herdr and Linux acceptance remain outstanding.
+Public ready-order v2 stays disabled. No commits, pushes or deployment were performed.
+Implementation evidence: [repair round 3](docs/plans/backlog-p1-repair-round-3.md).
+The following section preserves the earlier iteration's outcome, not current acceptance.
+
+## Earlier P1 repair iteration: blocked after independent review #4
+
+Three repair rounds fixed the earlier canonical-conflict, supervisor, notification
+and plan-quarantine findings. P1 is **not accepted**: a canonical after-intent
+failure with `details.error: ""` is still accepted as unsent proof but imported as
+an ordinary result, moving its bound task to review without execution. Require a
+nonempty failure string in the shared publication/read validator and permanent
+publication/restart regressions before acceptance. See
+[review #4](docs/plans/p1-independent-review-4.md) and
+[worker verification](docs/plans/p1-repair-verification.md).
+
+The final targeted suites passed **98/98**; the parent repeated dispatch coverage
+**44/44**. These passes do not waive the independently reproduced defect. Work
+stopped at the repository's three-repair-round limit; P3 and the later backlog
+items have not been started in this iteration. Full `npm test`, live Pi/herdr and
+Linux acceptance remain outstanding. Public ready-order v2 stays disabled; no
+commits, pushes or global deployment were performed.
+
+## Current working-tree review: changes required
+
+See the [review and ordered checklist](docs/plans/working-tree-review-and-next-steps-pl.md)
+for the unpublished changes on top of `f74d605`. Fix the confirmed closed-resume
+recovery regression first. Coordinator-owned child lifecycle still needs separate
+acceptance; public ready-order v2 remains disabled until its execution gates and
+whole-tree settlement are ready. The reports below record earlier milestones.
+
 ## Interrupted resume and explicit unsent-result recovery repaired (2026-11-17)
 
 - Stale `starting` parent turn labels no longer prevent validation of a

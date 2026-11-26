@@ -1,9 +1,10 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, watch, writeFileSync, type FSWatcher } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, watch, writeFileSync, type FSWatcher } from "node:fs";
 import { join } from "node:path";
 import { canonicalSessionPath, type SessionOwner } from "./ownership.ts";
 import type { SubagentLifecycle, PaneInspection } from "./lifecycle.ts";
+import { captureQueueChildFence } from "./queue-child-allocation.ts";
 
 export const CONTINUE_COMMAND = "_subagent_continue";
 export const CONTINUATION_TRANSPORT = "artifact-v1";
@@ -12,9 +13,15 @@ export const continuationDir = (activityFile: string) => `${activityFile}.contin
 function read(path: string): any {
   try { return JSON.parse(readFileSync(path, "utf8")); } catch { return undefined; }
 }
-function publish(path: string, value: unknown): void {
+function publish(path: string, value: unknown, beforeRename?: () => void): void {
   const temporary = `${path}.${randomUUID()}.tmp`;
   writeFileSync(temporary, JSON.stringify(value), { mode: 0o600, flag: "wx" });
+  try {
+    beforeRename?.();
+  } catch (error) {
+    rmSync(temporary, { force: true });
+    throw error;
+  }
   renameSync(temporary, path);
 }
 
@@ -31,6 +38,7 @@ export function registerLiveContinuation(pi: ExtensionAPI): void {
   if (!runId || !session || !activity) return;
   const sessionFile = canonicalSessionPath(session);
   const dir = continuationDir(activity);
+  const requireUnallocatedChild = captureQueueChildFence(sessionFile);
   let watcher: FSWatcher | undefined;
   let idleToken: string | undefined;
   const busy = () => {
@@ -96,8 +104,15 @@ export function registerLiveContinuation(pi: ExtensionAPI): void {
       if (!idleToken || request.idleToken !== idleToken || !ctx.isIdle() || ctx.hasPendingMessages()) {
         reject("Child is not settled interrupted idle"); return;
       }
+      // A queue receiver does not turn a stale/in-flight parent request (or a
+      // manually supplied UUID) into a new turn without current root authority.
+      let verifyImages: ReturnType<typeof requireUnallocatedChild>;
+      try { verifyImages = requireUnallocatedChild(ctx.sessionManager); }
+      catch { reject("Queue continuation authority unavailable"); return; }
       writeFileSync(claimFile, JSON.stringify({ runId, requestId, status: "dispatching" }), { flag: "wx", mode: 0o600 });
       busy();
+      try { verifyImages!(); } // The claim and busy-state writes must not stale the proof.
+      catch { reject("Queue continuation authority unavailable"); return; }
       // Explicitly bypass extension slash commands, skills and prompt templates.
       // This is the API path, not terminal input: !, @ and multiline text stay data.
       pi.sendUserMessage(request.message, { expandPromptTemplates: false });
@@ -160,7 +175,7 @@ export function reconcileContinuation(owner: SessionOwner, child: ContinuationCh
 export async function continueLiveChild(owner: SessionOwner, child: LiveChild | undefined,
   params: { message?: string; name?: string },
   transport: { inspect: (surface: string) => Promise<PaneInspection>; send?: (surface: string, text: string) => void;
-    beforeSend?: (requestId: string) => void; settled?: (requestId: string) => void; timeoutMs?: number },
+    beforeSend?: (requestId: string) => void | (() => void); settled?: (requestId: string) => void; timeoutMs?: number },
 ): Promise<{ requestId: string; status: "accepted" | "pending" }> {
   if (owner.closeRequestId) throw new Error(`Close ${owner.closeRequestId} is pending/retained; do not continue or relaunch this process.`);
   if (owner.continuationRequestId) {
@@ -178,7 +193,7 @@ export async function continueLiveChild(owner: SessionOwner, child: LiveChild | 
   if (params.name !== undefined && params.name !== child.name) throw new Error("Live continuation cannot change the child name/configuration.");
   const requestId = randomUUID();
   owner.continuationRequestId = requestId;
-  let dispatched = false;
+  let retainReservation = false;
   try {
     const pane = await transport.inspect(child.surface);
     // HC reports a completed turn as done even while the Pi process remains open.
@@ -211,10 +226,19 @@ export async function continueLiveChild(owner: SessionOwner, child: LiveChild | 
       throw new Error("Child lacks artifact continuation support. Update/reload the child and complete a turn before continuing; no terminal fallback was attempted.");
     }
     if (owner.continuationRequestId !== requestId) throw new Error("Continuation ownership changed during inspection");
-    transport.beforeSend?.(requestId); // Validate binding/custody BEFORE making a request observable.
-    dispatched = true; // A failed publication/acknowledgement is conservatively uncertain.
+    const verifyPublication = transport.beforeSend?.(requestId);
+    retainReservation = true; // A failed publication/acknowledgement is conservatively uncertain.
     publish(join(dir, `${requestId}.request.json`), {
       runId: child.id, requestId, sessionFile: state.sessionFile, idleToken: state.idleToken, message: params.message,
+    }, () => {
+      try { verifyPublication?.(); }
+      catch (error) {
+        // The rename has not happened: only release the fence after the exact
+        // durable intent is cleared. A failed settlement retains both fences.
+        transport.settled?.(requestId);
+        retainReservation = false;
+        throw error;
+      }
     });
     const deadline = Date.now() + (transport.timeoutMs ?? 3000);
     do {
@@ -229,6 +253,6 @@ export async function continueLiveChild(owner: SessionOwner, child: LiveChild | 
     } while (Date.now() <= deadline);
     return { requestId, status: "pending" };
   } finally {
-    if (!dispatched && owner.continuationRequestId === requestId) delete owner.continuationRequestId;
+    if (!retainReservation && owner.continuationRequestId === requestId) delete owner.continuationRequestId;
   }
 }

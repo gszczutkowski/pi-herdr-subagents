@@ -2,16 +2,19 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
-import { isPlanTaskBinding, type PlanTaskBinding } from "./plan-runtime.ts";
+import { isPlanTaskBinding, samePlanBinding, type PlanTaskBinding } from "./plan-runtime.ts";
 import { isAssignmentContract, type AssignmentContract } from "./contracts.ts";
 import { framedMessage } from "./frame.ts";
 import { isLineage, type Lineage } from "./lineage.ts";
+import { isQueueChildAllocation, type QueueChildAllocation } from "./queue-child-allocation.ts";
+import { canonicalSessionPath } from "./ownership.ts";
 
 export const ASSIGNMENT_ENTRY_TYPE = "subagent-assignment";
 export const ASSIGNMENT_ENV = "PI_SUBAGENT_ASSIGNMENT_FILE";
 
 export interface SubagentAssignment {
   planTask?: PlanTaskBinding;
+  readonly queueAllocation?: QueueChildAllocation;
   assignmentContract?: AssignmentContract;
   version: 1;
   childId: string;
@@ -29,11 +32,14 @@ export function isSubagentAssignment(value: unknown): value is SubagentAssignmen
   const data = value as SubagentAssignment;
   return data.version === 1
     && (data.planTask === undefined || isPlanTaskBinding(data.planTask))
+    && (data.lineage === undefined || isLineage(data.lineage))
+    && (!Object.hasOwn(data, "queueAllocation") || (isQueueChildAllocation(data.queueAllocation) &&
+      data.childId === data.queueAllocation.rootRunId && samePlanBinding(data.planTask, data.queueAllocation.binding) &&
+      data.lineage?.child.sessionFile === data.sessionFile))
     && (data.assignmentContract === undefined || isAssignmentContract(data.assignmentContract))
     && [data.childId, data.sessionFile, data.sender, data.recipient, data.role, data.task]
       .every((field) => typeof field === "string")
-    && Array.isArray(data.skills) && data.skills.every((skill) => typeof skill === "string")
-    && (data.lineage === undefined || isLineage(data.lineage));
+    && Array.isArray(data.skills) && data.skills.every((skill) => typeof skill === "string");
 }
 
 const registeredRenderers = new WeakSet<ExtensionAPI>();
@@ -77,8 +83,9 @@ export function registerSubagentAssignment(pi: ExtensionAPI): void {
       return; // Missing/stale metadata must not prevent the actual assignment running.
     }
     const sessionFile = ctx.sessionManager.getSessionFile();
-    if (!isSubagentAssignment(data) || data.childId !== childId || !sessionFile
-      || resolve(data.sessionFile) !== resolve(sessionFile)) return;
+    if (!isSubagentAssignment(data) || data.childId !== childId || !sessionFile) return;
+    if (data.queueAllocation ? (data.sessionFile !== canonicalSessionPath(sessionFile) ||
+      data.lineage?.child.sessionId !== ctx.sessionManager.getSessionId()) : resolve(data.sessionFile) !== resolve(sessionFile)) return;
     const assignment = data;
     // Search all entries, including abandoned branches, so reload/tree/resume cannot
     // append a second launch card. Inherited parent cards have a different child ID.

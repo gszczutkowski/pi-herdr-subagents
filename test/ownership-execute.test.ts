@@ -13,6 +13,10 @@ import { canWaitForDelegation, DELEGATION_PAUSED } from "../pi-extension/subagen
 // Exercise actual tool/terminal code, replacing only OS boundaries (no live herdr).
 let powershellResponder: ((command: string) => string) | undefined;
 let processEnumerationFails = false;
+let enumerationCount = 0;
+const readPaths: string[] = [];
+const openedPaths: string[] = [];
+let beforeScriptWrite: (() => void) | undefined;
 let prepareFails = false;
 let sendFails = false;
 let serial = 0;
@@ -23,12 +27,31 @@ let onRun: (surface: string, command: string) => void = () => {};
 const escapes: string[] = [];
 const childShutdowns: Array<() => void> = [];
 const originalWrite = fs.writeFileSync;
+const originalOpen = fs.openSync;
+let beforeOpen: ((path: string) => void) | undefined;
+let afterOpen: ((path: string, fd: number) => void) | undefined;
+mock.method(fs, "openSync", (path: any, ...args: any[]) => {
+  if (typeof path === "string") { openedPaths.push(path); beforeOpen?.(path); }
+  const fd = (originalOpen as any)(path, ...args);
+  if (typeof path === "string") afterOpen?.(path, fd);
+  return fd;
+});
+const originalLstat = fs.lstatSync;
+let onLstat: ((path: any, args: any[]) => unknown) | undefined;
+mock.method(fs, "lstatSync", (path: any, ...args: any[]) => onLstat ? onLstat(path, args) : (originalLstat as any)(path, ...args));
+const originalReadSync = fs.readSync;
+let onReadSync: ((fd: number, bytes: number) => number) | undefined;
+mock.method(fs, "readSync", (fd: number, ...args: any[]) => {
+  const result = (originalReadSync as any)(fd, ...args);
+  return onReadSync?.(fd, result) ?? result;
+});
 const originalRead = fs.readFileSync;
 const originalReaddir = fs.readdirSync;
 // Match the empty Windows process snapshot below: never audit the host's live
 // processes (including inaccessible /proc entries) in these dispatch fixtures.
 mock.method(fs, "readdirSync", (path: any, ...args: any[]) => {
   if (String(path) === "/proc") {
+    enumerationCount++;
     if (processEnumerationFails) throw Object.assign(new Error("enumeration denied"), { code: "EACCES" });
     return [];
   }
@@ -37,19 +60,26 @@ mock.method(fs, "readdirSync", (path: any, ...args: any[]) => {
 let readFailureFile: string | undefined;
 let readFailureCode = "EACCES";
 mock.method(fs, "readFileSync", (path: any, ...args: any[]) => {
+  if (typeof path === "string") readPaths.push(path);
   if (readFailureFile && String(path).replaceAll("\\", "/").toLowerCase() === readFailureFile.replaceAll("\\", "/").toLowerCase()) {
     throw Object.assign(new Error(readFailureCode), { code: readFailureCode });
   }
   return (originalRead as any)(path, ...args);
 });
 mock.method(fs, "writeFileSync", (path: any, ...args: any[]) => {
-  if (prepareFails && String(path).endsWith(".sh")) throw new Error("preparation failed");
+  if (String(path).endsWith(".sh")) {
+    if (prepareFails) throw new Error("preparation failed");
+    beforeScriptWrite?.();
+  }
   return (originalWrite as any)(path, ...args);
 });
 mock.method(childProcess, "execSync", () => "herdr");
 mock.method(childProcess, "execFileSync", (_command: any, args: any) => {
   if (_command === "powershell.exe") {
-    if (processEnumerationFails && args.at(-1).includes("Where-Object")) throw new Error("enumeration denied");
+    if (args.at(-1).includes("Where-Object")) {
+      enumerationCount++;
+      if (processEnumerationFails) throw new Error("enumeration denied");
+    }
     return powershellResponder?.(args.at(-1)) ?? "[]";
   }
   if (args[0] === "tab" && args[1] === "create") {
@@ -71,17 +101,18 @@ childProcess.execFile = Object.assign(() => { throw new Error("unexpected execFi
 syncBuiltinESMExports();
 const { default: extension, __test__ } = await import("../pi-extension/subagents/index.ts");
 const { canonicalSessionPath, reserveSession, releaseSession, sessionOwners } = await import("../pi-extension/subagents/ownership.ts");
-const { persistLaunchProfile, resolveLaunchProfile } = await import("../pi-extension/subagents/launch-profile.ts");
+const { persistLaunchProfile, resolveLaunchProfile, readPiLaunchProfile } = await import("../pi-extension/subagents/launch-profile.ts");
 const { runCompletionFile } = await import("../pi-extension/subagents/run-artifacts.ts");
 const { runInPane, runScriptInPane } = await import("../pi-extension/subagents/terminal.ts");
 const { CONTINUE_COMMAND, CONTINUATION_TRANSPORT, continuationCommand, continuationDir, registerLiveContinuation } = await import("../pi-extension/subagents/live-continuation.ts");
 const { registerInterruptControl } = await import("../pi-extension/subagents/interrupt-control.ts");
-const keys = ["HERDR_ENV", "HERDR_WORKSPACE_ID", "HC_TERMINAL_ID", "HC_TERMINAL_SOCKET", "PI_SUBAGENT_SHELL_READY_DELAY_MS", "PI_DENY_TOOLS", "PI_SUBAGENT_LAYOUT"];
+const childKeys = ["PI_SUBAGENT_ID", "PI_SUBAGENT_SESSION", "PI_SUBAGENT_COMPLETION_MODE", "PI_SUBAGENT_QUEUE_CHILD"] as const;
+const keys = ["HERDR_ENV", "HERDR_WORKSPACE_ID", "HC_TERMINAL_ID", "HC_TERMINAL_SOCKET", "PI_SUBAGENT_SHELL_READY_DELAY_MS", "PI_DENY_TOOLS", "PI_SUBAGENT_LAYOUT", ...childKeys];
 const saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
 process.env.HERDR_ENV = "1";
 process.env.HERDR_WORKSPACE_ID = "workspace";
 process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
-for (const key of ["HC_TERMINAL_ID", "HC_TERMINAL_SOCKET", "PI_DENY_TOOLS", "PI_SUBAGENT_LAYOUT"]) delete process.env[key];
+for (const key of ["HC_TERMINAL_ID", "HC_TERMINAL_SOCKET", "PI_DENY_TOOLS", "PI_SUBAGENT_LAYOUT", ...childKeys]) delete process.env[key];
 after(() => {
   mock.restoreAll();
   childProcess.execFile = originalExec;
@@ -91,7 +122,7 @@ after(() => {
   }
 });
 
-async function fixture(run: (f: any) => Promise<void>, explicit = false) {
+async function fixture(run: (f: any) => Promise<void>, nested = false) {
   const dir = fs.mkdtempSync(join(tmpdir(), "ownership-execute-"));
   const agentDir = join(dir, ".pi", "agent");
   fs.mkdirSync(agentDir, { recursive: true });
@@ -125,21 +156,40 @@ async function fixture(run: (f: any) => Promise<void>, explicit = false) {
     : key === "appendEntry" ? (customType: string, data: any) => branch.push({ id: "fixture-custody", type: "custom", customType, data })
     : key === "sendMessage" ? (message: any) => { if (failNotifications) throw new Error("offline"); handoffs.push(message); }
     : key === "getThinkingLevel" ? () => "off" : () => {} });
-  const oldMode = process.env.PI_SUBAGENT_COMPLETION_MODE;
-  if (explicit) process.env.PI_SUBAGENT_COMPLETION_MODE = "explicit";
+  const rootSession = canonicalSessionPath(join(dir, "root.jsonl"));
+  const parentSession = nested ? canonicalSessionPath(join(dir, "coordinator.jsonl")) : session;
+  if (nested) {
+    const root = { sessionId: "root", sessionFile: rootSession };
+    fs.writeFileSync(rootSession, '{"type":"session","version":3,"id":"root"}\n');
+    fs.writeFileSync(parentSession, '{"type":"session","version":3,"id":"parent"}\n');
+    branch.push({ id: "assignment", type: "custom", customType: "subagent-assignment", data: { lineage: {
+      version: 1, parent: root, root, child: { sessionId: "parent", sessionFile: parentSession },
+      rootAssignmentId: "root-assignment", rootCheckpoint: "root-checkpoint", rootBranchToken: "root-token",
+      eventDirectory: join(dir, "root-history"),
+    } } });
+    process.env.PI_SUBAGENT_ID = "coordinator-run";
+    process.env.PI_SUBAGENT_SESSION = parentSession;
+    process.env.PI_SUBAGENT_COMPLETION_MODE = "explicit";
+  }
   extension(api);
   const ctx = {
     hasUI: false, scopedModels: [], cwd: dir, isProjectTrusted: () => true, model: { provider: "test", id: "model" },
     modelRegistry: { find: () => ({ provider: "test", id: "model", reasoning: true }), getAvailable: () => [{ provider: "test", id: "model" }], hasConfiguredAuth: () => true },
-    sessionManager: { getSessionFile: () => session, getSessionDir: () => dir, getSessionId: () => "parent" },
+    sessionManager: { getSessionFile: () => parentSession, getSessionDir: () => dir, getSessionId: () => "parent",
+      ...(nested ? { getHeader: () => ({ id: "parent" }), getBranch: () => branch } : {}) },
   };
   const resume = (params = {}) => tools.get("subagent_resume").execute("call", { sessionPath: session, ...params }, undefined, undefined, ctx);
   const interrupt = (id: string) => tools.get("subagent_interrupt").execute("interrupt", { id }, undefined, undefined, ctx);
-  try { await run({ dir, session, ctx, branch, tools, commands, resume, interrupt, handoffs, events,
+  try { await run({ dir, session, rootSession, parentSession, ctx, branch, tools, commands, resume, interrupt, handoffs, events,
     canWait: () => canWaitForDelegation(api, ctx),
     start: () => handlers.get("session_start")({ reason: "reload" }, ctx),
     shutdown: () => handlers.get("session_shutdown")({ reason: "reload" }, ctx),
-    reload: () => { extension(api); handlers.get("session_start")({ reason: "reload" }, ctx); },
+    reload: () => { extension(api); return handlers.get("session_start")({ reason: "reload" }, ctx); },
+    restart: () => {
+      handlers.get("session_shutdown")({ reason: "quit" }, ctx);
+      extension(api);
+      return handlers.get("session_start")({ reason: "startup" }, ctx);
+    },
     failNotifications: (value: boolean) => { failNotifications = value; } }); } finally {
     for (const stop of childShutdowns.splice(0)) stop();
     prepareFails = false;
@@ -152,7 +202,14 @@ async function fixture(run: (f: any) => Promise<void>, explicit = false) {
     handlers.get("session_shutdown")({ reason: "exit" }, ctx);
     for (const [path, owner] of sessionOwners) if (!existingOwners.has(path)) releaseSession(path, owner.runId);
     if (oldAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = oldAgentDir;
-    if (oldMode === undefined) delete process.env.PI_SUBAGENT_COMPLETION_MODE; else process.env.PI_SUBAGENT_COMPLETION_MODE = oldMode;
+    for (const key of childKeys) delete process.env[key];
+    readPaths.length = 0;
+    openedPaths.length = 0;
+    beforeScriptWrite = undefined;
+    beforeOpen = undefined;
+    afterOpen = undefined;
+    onLstat = undefined;
+    onReadSync = undefined;
     fs.rmSync(dir, { recursive: true, force: true });
   }
 }
@@ -162,6 +219,375 @@ async function until(predicate: () => boolean) {
   const deadline = Date.now() + 4000;
   while (!predicate()) { assert.ok(Date.now() < deadline, "condition timed out"); await pause(); }
 }
+
+test("reopened queue child cannot dispatch descendants; an independent legacy branch sends once", async () => fixture(async ({ tools, ctx, dir, session, restart }: any) => {
+  const { queueChildMarkerPath } = await import("../pi-extension/subagents/queue-child-allocation.ts");
+  const marker = queueChildMarkerPath(session);
+  const before = { sends: sent.length, panes: serial };
+  const spawn = () => tools.get("subagent").execute("launch", { name: "Worker", task: "test", cwd: dir }, undefined, undefined, ctx);
+  const resume = () => tools.get("subagent_resume").execute("resume", { sessionPath: join(dir, "unused.jsonl"), message: "test" }, undefined, undefined, ctx);
+  fs.writeFileSync(marker, "1\n");
+  await restart(); // Launch environment is absent and the on-disk marker is retained.
+  await assert.rejects(spawn(), /current trusted root authority/);
+  await assert.rejects(resume(), /current trusted root authority/);
+  assert.deepEqual({ sends: sent.length, panes: serial }, before);
+
+  const provenance = { type: "custom", customType: "subagent-assignment", data: { sessionFile: session, queueAllocation: null } };
+  fs.rmSync(marker);
+  ctx.sessionManager.getEntries = () => [provenance];
+  await restart(); // An abandoned or malformed card for this session is still a restriction.
+  await assert.rejects(spawn(), /current trusted root authority/);
+  assert.deepEqual({ sends: sent.length, panes: serial }, before);
+  const independent = join(dir, "independent.jsonl");
+  fs.writeFileSync(independent, "not inspected by a legacy spawn");
+  ctx.sessionManager.getSessionFile = () => independent;
+  await restart();
+  assert.ok((await spawn()).details.id, "a copied card does not authorize or restrict another session");
+  assert.deepEqual({ sends: sent.length, panes: serial }, { sends: before.sends + 1, panes: before.panes + 1 });
+}));
+
+test("profile-only queue provenance blocks registered descendant spawn after restart", async () => fixture(async ({ tools, ctx, dir, session, restart }: any) => {
+  const { launchProfilePath } = await import("../pi-extension/subagents/launch-profile.ts");
+  const before = { sends: sent.length, panes: serial };
+  const profile = readPiLaunchProfile(session);
+  fs.writeFileSync(launchProfilePath(session), JSON.stringify({ ...profile, version: 99, queueAllocation: { version: 99 } }));
+  await restart();
+  await assert.rejects(tools.get("subagent").execute("launch", { name: "Worker", task: "test", cwd: dir }, undefined, undefined, ctx),
+    /current trusted root authority/);
+  assert.deepEqual({ sends: sent.length, panes: serial }, before);
+}));
+
+for (const caseName of ["existing exact card", "exact card installed at dispatch", "copied fork card"] as const) {
+  test(`closed resume checks persisted queue assignments: ${caseName}`, async () => fixture(async ({ dir, ctx, session, resume, restart }: any) => {
+    // Resume a different target than the caller. The profile remains unbound;
+    // no marker, current plan, manifest, or in-memory card can classify it.
+    const caller = join(dir, "caller.jsonl");
+    fs.writeFileSync(caller, '{"type":"session","version":3,"id":"caller"}\n');
+    ctx.sessionManager.getSessionFile = () => caller;
+    const card = JSON.stringify({ type: "custom", customType: "subagent-assignment", id: "assignment", parentId: null,
+      data: { sessionFile: caseName === "copied fork card" ? canonicalSessionPath(join(dir, "fork-source.jsonl")) : session,
+        queueAllocation: { version: 99 } } }) + "\n";
+    const addCard = () => fs.appendFileSync(session, card);
+    await restart();
+    const before = { sends: sent.length, panes: serial, closes: closed.length };
+    if (caseName === "exact card installed at dispatch") beforeScriptWrite = addCard;
+    else addCard();
+    if (caseName === "copied fork card") {
+      assert.equal((await resume()).details.status, "started");
+      assert.equal(sent.length, before.sends + 1);
+      assert.equal(serial, before.panes + 1);
+    } else {
+      await assert.rejects(resume(), /Queue-bound transport is unavailable/);
+      assert.equal(sent.length, before.sends);
+      const prepared = Number(caseName === "exact card installed at dispatch");
+      assert.equal(serial, before.panes + prepared);
+      assert.equal(closed.length, before.closes + prepared);
+      assert.equal(sessionOwners.has(session), false);
+    }
+  }));
+}
+
+for (const queue of [false, true]) {
+  test(`large valid session and profile do not hide queue provenance (queue=${queue})`, async () => fixture(async ({ dir, session, ctx, resume }: any) => {
+    const { launchProfilePath } = await import("../pi-extension/subagents/launch-profile.ts");
+    const caller = join(dir, "caller.jsonl");
+    fs.writeFileSync(caller, '{"type":"session","version":3,"id":"caller"}\n');
+    ctx.sessionManager.getSessionFile = () => caller;
+    const saved = readPiLaunchProfile(session);
+    const timestamp = "2020-01-01T00:00:00Z";
+    fs.writeFileSync(session, JSON.stringify({ type: "session", version: 3, id: "child", cwd: dir, timestamp }) + "\n");
+    const profile = { ...saved, identity: "x".repeat(4 * 1024 * 1024 + 1) };
+    fs.writeFileSync(launchProfilePath(session), JSON.stringify(profile));
+    const large = "x".repeat(5 * 1024 * 1024);
+    let previous: string | null = null;
+    for (let i = 0; i < 13; i++) {
+      const id = `entry-${i}`;
+      fs.appendFileSync(session, JSON.stringify({ type: "message", id, parentId: previous, timestamp,
+        message: { role: "user", content: large, timestamp: 0 } }) + "\n");
+      previous = id;
+    }
+    assert.ok(fs.statSync(session).size > 64 * 1024 * 1024);
+    if (queue) {
+      const data = JSON.stringify({ type: "custom", customType: "subagent-assignment", id: "queue-card", parentId: previous, timestamp,
+        data: { sessionFile: session, queueAllocation: { version: 99 } } });
+      const prefixBytes = Buffer.byteLength(data.slice(0, data.indexOf("queueAllocation") + 5));
+      const blockSize = 64 * 1024;
+      const padding = (blockSize - ((fs.statSync(session).size + prefixBytes) % blockSize)) % blockSize;
+      fs.appendFileSync(session, " ".repeat(padding) + data + "\n");
+      assert.equal((fs.statSync(session).size - (Buffer.byteLength(data) + 1) + prefixBytes) % blockSize, 0);
+    }
+    const before = { sends: sent.length, panes: serial };
+    if (queue) {
+      await assert.rejects(resume(), /Queue-bound transport is unavailable/);
+      assert.deepEqual({ sends: sent.length, panes: serial }, before);
+    } else {
+      assert.equal((await resume()).details.status, "started");
+      assert.deepEqual({ sends: sent.length, panes: serial }, { sends: before.sends + 1, panes: before.panes + 1 });
+    }
+  }));
+}
+
+for (const scenario of ["changed", "incomplete"] as const) {
+  test(`registered resume refuses ${scenario} provenance reads before transport`, async () => fixture(async ({ dir, session, ctx, resume }: any) => {
+    const caller = join(dir, "caller.jsonl");
+    fs.writeFileSync(caller, '{"type":"session","version":3,"id":"caller"}\n');
+    ctx.sessionManager.getSessionFile = () => caller;
+    let scanFd: number | undefined, faulted = false;
+    afterOpen = (path, fd) => { if (path === session) scanFd = fd; };
+    onReadSync = (fd, result) => {
+      if (fd !== scanFd || faulted) return result;
+      faulted = true;
+      if (scenario === "incomplete") return 0;
+      fs.appendFileSync(session, '{"type":"custom","customType":"unrelated"}\n');
+      return result;
+    };
+    const before = { sends: sent.length, panes: serial };
+    await assert.rejects(resume(), /Queue provenance could not be verified/);
+    assert.equal(faulted, true);
+    assert.deepEqual({ sends: sent.length, panes: serial }, before);
+  }));
+}
+
+for (const restore of [false, true]) {
+test(`Windows parent junction substitution cannot replace the opened profile at actual resume (restored=${restore})`, { skip: process.platform !== "win32" }, async () => fixture(async ({ dir, session, resume }: any) => {
+  const { launchProfilePath } = await import("../pi-extension/subagents/launch-profile.ts");
+  const selectedDir = join(dir, "selected"), otherDir = join(dir, "other"), parked = join(dir, "parked");
+  fs.mkdirSync(selectedDir); fs.mkdirSync(otherDir);
+  const selected = canonicalSessionPath(join(selectedDir, "run.jsonl"));
+  const replacement = canonicalSessionPath(join(otherDir, "run.jsonl"));
+  const profile = { ...readPiLaunchProfile(session), sessionFile: selected };
+  fs.copyFileSync(session, selected);
+  fs.copyFileSync(session, replacement);
+  persistLaunchProfile(profile);
+  // Same lexical saved session identity in the wrong file is not provenance.
+  fs.writeFileSync(launchProfilePath(replacement), JSON.stringify(profile));
+  let replaced = false;
+  beforeOpen = path => {
+    if (path !== launchProfilePath(selected) || replaced) return;
+    fs.renameSync(selectedDir, parked);
+    fs.symlinkSync(otherDir, selectedDir, "junction");
+    replaced = true;
+  };
+  if (restore) afterOpen = path => {
+    if (path !== launchProfilePath(selected) || !replaced) return;
+    fs.rmdirSync(selectedDir);
+    fs.renameSync(parked, selectedDir);
+  };
+  const before = { sends: sent.length, panes: serial };
+  await assert.rejects(resume({ sessionPath: selected }), /Missing or unreadable launch profile/);
+  assert.equal(replaced, true);
+  assert.deepEqual({ sends: sent.length, panes: serial }, before);
+}));
+}
+
+test("registered closed resume cannot substitute a clean transcript only for the final assignment scan", async () => fixture(async ({ dir, ctx, session, resume }: any) => {
+  const caller = join(dir, "caller.jsonl"), parked = `${session}.parked`;
+  fs.writeFileSync(caller, '{"type":"session","version":3,"id":"caller"}\n');
+  ctx.sessionManager.getSessionFile = () => caller;
+  const clean = fs.readFileSync(session, "utf8");
+  const assigned = clean + JSON.stringify({ type: "custom", customType: "subagent-assignment", data: {
+    sessionFile: session, queueAllocation: { version: 99 },
+  } }) + "\n";
+  let armed = false, switched = false, restored = false, samples = 0;
+  beforeScriptWrite = () => { fs.writeFileSync(session, assigned); armed = true; };
+  function restore() {
+    fs.rmSync(session);
+    fs.renameSync(parked, session);
+    restored = true;
+  }
+  onLstat = (path, args) => {
+    if (!armed || path !== session || !args[0]?.bigint) return (originalLstat as any)(path, ...args);
+    samples++;
+    if (samples === 2) {
+      // Between original-pin verification and the scanner's own first stat.
+      fs.renameSync(session, parked);
+      fs.writeFileSync(session, clean);
+      switched = true;
+    }
+    const stat = (originalLstat as any)(path, ...args);
+    if (samples === 4) restore(); // Restore at the end of a scan if it gets that far.
+    return stat;
+  };
+  const before = { sends: sent.length, panes: serial, closes: closed.length };
+  try { await assert.rejects(resume(), /Queue provenance could not be verified/); }
+  finally {
+    onLstat = undefined;
+    if (switched && !restored) restore();
+  }
+  assert.equal(switched, true);
+  assert.equal(fs.readFileSync(session, "utf8"), assigned);
+  assert.deepEqual({ sends: sent.length, panes: serial, closes: closed.length },
+    { sends: before.sends, panes: before.panes + 1, closes: before.closes + 1 });
+}));
+
+test("registered closed resume catches a same-inode queue card appended during the final profile read", async () => fixture(async ({ dir, ctx, session, resume }: any) => {
+  const { launchProfilePath } = await import("../pi-extension/subagents/launch-profile.ts");
+  const caller = join(dir, "caller.jsonl"), sidecar = launchProfilePath(session);
+  fs.writeFileSync(caller, '{"type":"session","version":3,"id":"caller"}\n');
+  ctx.sessionManager.getSessionFile = () => caller;
+  fs.writeFileSync(sidecar, JSON.stringify({ ...readPiLaunchProfile(session), identity: "x".repeat(128 * 1024) }));
+  let armed = false, profileFd: number | undefined, appended = false;
+  beforeScriptWrite = () => { armed = true; };
+  afterOpen = (path, fd) => { if (armed && path === sidecar) profileFd = fd; };
+  onReadSync = (fd, size) => {
+    if (size > 0 && fd === profileFd && !appended) {
+      fs.appendFileSync(session, JSON.stringify({ type: "custom", customType: "subagent-assignment", data: {
+        sessionFile: session, queueAllocation: { version: 99 },
+      } }) + "\n");
+      appended = true;
+    }
+    return size;
+  };
+  const before = { sends: sent.length, panes: serial, closes: closed.length, inode: fs.statSync(session, { bigint: true }).ino };
+  await assert.rejects(resume(), /Queue-bound transport is unavailable/);
+  assert.equal(appended, true);
+  assert.equal(fs.statSync(session, { bigint: true }).ino, before.inode);
+  assert.deepEqual({ sends: sent.length, panes: serial, closes: closed.length },
+    { sends: before.sends, panes: before.panes + 1, closes: before.closes + 1 });
+}));
+
+test("closed resume cannot send after its selected transcript is replaced during preparation", async () => fixture(async ({ dir, ctx, session, resume }: any) => {
+  const caller = join(dir, "caller.jsonl");
+  fs.writeFileSync(caller, '{"type":"session","version":3,"id":"caller"}\n');
+  ctx.sessionManager.getSessionFile = () => caller;
+  const before = { sends: sent.length, panes: serial, closes: closed.length };
+  beforeScriptWrite = () => {
+    fs.renameSync(session, `${session}.old`);
+    fs.copyFileSync(`${session}.old`, session);
+  };
+  await assert.rejects(resume(), /Queue provenance could not be verified/);
+  assert.deepEqual({ sends: sent.length, panes: serial, closes: closed.length },
+    { sends: before.sends, panes: before.panes + 1, closes: before.closes + 1 });
+  assert.equal(sessionOwners.has(session), false);
+}));
+
+test("queue classification is checked again at the terminal boundary after preparation", async () => fixture(async ({ tools, ctx, dir, session }: any) => {
+  const { queueChildMarkerPath } = await import("../pi-extension/subagents/queue-child-allocation.ts");
+  const before = { sends: sent.length, panes: serial, closes: closed.length };
+  beforeScriptWrite = () => fs.writeFileSync(queueChildMarkerPath(session), "1\n");
+  await assert.rejects(tools.get("subagent").execute("launch", { name: "Worker", task: "test", cwd: dir }, undefined, undefined, ctx),
+    /current trusted root authority/);
+  assert.equal(serial, before.panes + 1, "the launch really reached prepared terminal state");
+  assert.equal(closed.length, before.closes + 1, "the unused pane is cleaned up");
+  assert.equal(sent.length, before.sends, "no command crossed the transport boundary");
+}));
+
+test("registered live resume settles an unpublished intent when the target changes during persistence", async () => fixture(async ({ dir, ctx, branch, session, resume, start }: any) => {
+  const caller = join(dir, "caller.jsonl");
+  fs.writeFileSync(caller, '{"type":"session","version":3,"id":"parent"}\n');
+  Object.assign(ctx.sessionManager, { getSessionFile: () => caller, getHeader: () => ({ id: "parent" }), getBranch: () => branch });
+  await start();
+  inspect = async (pane) => JSON.stringify({ result: { pane: { pane_id: pane, agent_status: "idle" } } });
+  const started = await resume();
+  const child = __test__.runningSubagents.get(started.details.id)!;
+  const { markProcessRunning, markInterruptRequested } = await import("../pi-extension/subagents/lifecycle.ts");
+  child.lifecycle = markInterruptRequested(markProcessRunning(child.lifecycle));
+  const store = child.durableStore!;
+  const owner = sessionOwners.get(session)!;
+  const files = continuationDir(child.activityFile!);
+  fs.mkdirSync(files, { recursive: true });
+  fs.writeFileSync(join(files, "state.json"), JSON.stringify({ runId: child.id, sessionFile: session,
+    transport: CONTINUATION_TRANSPORT, state: "interrupted-idle", idleToken: randomUUID() }));
+  const persist = store.continuation.bind(store);
+  let intent: string | undefined;
+  store.continuation = (id, requestId) => {
+    persist(id, requestId);
+    intent = store.getRun(id)?.continuationRequestId;
+    fs.appendFileSync(session, JSON.stringify({ type: "custom", customType: "subagent-assignment",
+      data: { sessionFile: session, queueAllocation: null } }) + "\n");
+  };
+  const sends = sent.length;
+  await assert.rejects(resume({ message: "follow-up" }), /Queue provenance could not be verified/);
+  assert.ok(intent);
+  assert.equal(store.getRun(child.id)?.continuationRequestId, undefined);
+  assert.equal(sessionOwners.get(session), owner);
+  assert.equal(owner.continuationRequestId, undefined);
+  assert.deepEqual(fs.readdirSync(files), ["state.json"]);
+  assert.equal(sent.length, sends);
+}));
+
+test("active queue resume validates current runtime, allocation and CWD without sending or reallocating", async () => fixture(async ({ dir, session, ctx, branch, resume, start }: any) => {
+  const { PLAN_ENTRY_V2, PlanPersistence } = await import("../pi-extension/subagents/plan-persistence.ts");
+  const planStore = await import("../pi-extension/subagents/plan-store.ts");
+  const { RuntimeStore } = await import("../pi-extension/subagents/runtime-store.ts");
+  const { queueChildMarkerPath, queueChildProfile } = await import("../pi-extension/subagents/queue-child-allocation.ts");
+  const { launchProfilePath } = await import("../pi-extension/subagents/launch-profile.ts");
+  const { createLifecycle, markProcessRunning } = await import("../pi-extension/subagents/lifecycle.ts");
+  const { registerLaunchedRun } = await import("../pi-extension/subagents/launch-registration.ts");
+  const authority = { sessionId: "root", branchInstanceId: randomUUID() };
+  const checkpoint = "root-checkpoint", branchToken = randomUUID(), runId = randomUUID();
+  const root = canonicalSessionPath(join(dir, "root.jsonl"));
+  const header = (id: string, cwd: string) => JSON.stringify({ type: "session", version: 3, id, cwd, timestamp: "2020-01-01T00:00:00Z" }) + "\n";
+  fs.writeFileSync(root, header("root", dir));
+  fs.writeFileSync(session, header("child", dir));
+  Object.assign(ctx.sessionManager, { getSessionFile: () => root, getHeader: () => ({ id: "root" }), getSessionId: () => "root",
+    getBranch: () => branch, getTree: () => [] });
+  branch.push({ id: checkpoint, type: "custom", customType: "subagent-custody", data: { branchToken } },
+    { id: "user", type: "message", message: { role: "user" } });
+  const adapter = { available: () => true, inspect: () => ({ state: "working", owner: "runtime" } as const) };
+  let plan = planStore.createPlan("Queue", authority);
+  const command = () => ({ ...authority, expectedRevision: plan.revision });
+  plan = planStore.configureQueue(plan, command(), 1);
+  plan = planStore.addTask(plan, command(), "Task");
+  const taskId = plan.tasks[0].taskId;
+  plan = planStore.setWorkArea(plan, command(), taskId, dir, "read");
+  plan = planStore.startAttempt(plan, command(), taskId, undefined, adapter);
+  const attemptId = plan.tasks[0].attempts.at(-1)!.attemptId;
+  plan = planStore.beginQueueDispatch(plan, command(), taskId, attemptId, runId, dir, adapter);
+  const planTask = { planId: plan.planId, taskId, attemptId, authority };
+  const parent = { sessionId: "root", sessionFile: root };
+  const lineage = { version: 1 as const, parent, root: parent, child: { sessionId: "child", sessionFile: session },
+    rootAssignmentId: randomUUID(), rootCheckpoint: checkpoint, rootBranchToken: branchToken, eventDirectory: dir };
+  const legacyProfile = readPiLaunchProfile(session);
+  const profile = queueChildProfile(plan, planTask, runId, { ...legacyProfile, planTask, lineage });
+  const sidecar = launchProfilePath(session);
+  fs.rmSync(sidecar);
+  persistLaunchProfile(profile);
+  plan = planStore.confirmQueueDispatch(plan, command(), taskId, attemptId, runId, adapter);
+  const planEntry = { id: "plan", type: "custom", customType: PLAN_ENTRY_V2, data: plan };
+  branch.push(planEntry);
+  await start();
+  const writer = new RuntimeStore(join(dir, "artifacts", "root", "subagent-runtime"), { sessionFile: root, headerId: "root", checkpoint, branchToken });
+  const runtime = (globalThis as any)[Symbol.for("pi-subagents/runtime")];
+  runtime.store = writer;
+  const run = { id: runId, sessionFile: session, name: "Child", task: "Task", cli: "pi", surface: "existing-pane", profile, planTask, lineage, startTime: 1 };
+  writer.prepare(run);
+  writer.commitFreshDispatch(runId, session, planTask);
+  writer.phase(runId, "supervised");
+  const owner = reserveSession(session, runId);
+  owner.dispatched = true; owner.surface = run.surface;
+  const child = registerLaunchedRun(__test__.runningSubagents, writer, run, { hasActivitySnapshots: true });
+  child.lifecycle = markProcessRunning(createLifecycle(1), 2);
+  const before = { sends: sent.length, panes: serial, saved: writer.snapshot() };
+  const reject = (pattern: RegExp) => assert.rejects(resume({ message: "Do not send" }), pattern);
+  await reject(/pending execution-tree settlement/);
+  fs.writeFileSync(session, header("child", join(dir, ".pi")));
+  await reject(/assigned CWD/);
+  fs.writeFileSync(session, header("child", dir));
+  planEntry.data = planStore.queuePause(plan, command(), "Hold");
+  await reject(/paused/);
+  planEntry.data = plan;
+  (child as any).terminalActionsAllowed = false;
+  await reject(/current trusted runtime/);
+  (child as any).terminalActionsAllowed = true;
+  const faults = new PlanPersistence(() => { throw new Error("write denied"); }, false);
+  assert.throws(() => faults.mutate(ctx.sessionManager, plan.planId, plan.revision, (p, c) => planStore.queuePause(p, c, "Fault")), /writes disabled/);
+  await reject(/current trusted runtime/);
+  assert.deepEqual(writer.snapshot(), before.saved);
+  assert.equal(owner.continuationRequestId, undefined);
+  assert.deepEqual({ sends: sent.length, panes: serial }, { sends: before.sends, panes: before.panes });
+
+  releaseSession(session, runId);
+  __test__.runningSubagents.delete(runId);
+  fs.rmSync(queueChildMarkerPath(session));
+  fs.writeFileSync(sidecar, JSON.stringify(legacyProfile));
+  // Even when plan/profile/marker information disappears in this view, the
+  // exact manifest's queue allocation prevents a legacy fallback.
+  branch.pop();
+  await reject(/Queue-bound transport is unavailable/);
+  assert.deepEqual(writer.snapshot(), before.saved);
+  assert.deepEqual({ sends: sent.length, panes: serial }, { sends: before.sends, panes: before.panes });
+}));
 
 test("isolated process enumeration is clear, but denied enumeration blocks resume before dispatch", { skip: !["linux", "win32"].includes(process.platform) }, async () => fixture(async ({ session, resume }: any) => {
   const { auditSession } = await import("../pi-extension/subagents/session-audit.ts");
@@ -753,14 +1179,207 @@ test("keepOpen first result retains watcher and owner; parent follow-up and manu
   assert.equal(handoffs.length, 3);
 }));
 
-test("explicit wait tracks accepted keepOpen follow-ups, not old results, rejected requests or replay", { timeout: 15_000 }, async () => fixture(async (f: any) => {
-  const { session, resume, handoffs, canWait, ctx, branch, events } = f;
-  ctx.sessionManager.getHeader = () => ({ id: "coordinator" });
-  ctx.sessionManager.getBranch = () => branch;
+test("coordinator role launch allowlists expose owned-child lifecycle tools", async () => {
+  const { parseAgentDefinition } = await import("../pi-extension/subagents/discovery.ts");
+  const { buildSubagentToolAllowlist } = await import("../pi-extension/subagents/harness/drivers/pi.ts");
+  const paths = ["../agents/feature-coordinator.md"];
+  const local = "../.pi/agents/coordinator.md";
+  if (fs.existsSync(new URL(local, import.meta.url))) paths.push(local);
+  for (const path of paths) {
+    const role = parseAgentDefinition(fs.readFileSync(new URL(path, import.meta.url), "utf8"), "coordinator");
+    assert.equal(role?.spawning, true);
+    assert.equal(role?.completionMode, "explicit");
+    const tools = buildSubagentToolAllowlist(role?.tools)?.split(",") ?? [];
+    for (const tool of ["subagent", "subagent_audit", "subagent_resume", "subagent_interrupt", "subagent_close", "subagent_done", "caller_ping"]) {
+      assert.ok(tools.includes(tool), `${path}: ${tool}`);
+    }
+  }
+});
+
+function assertNoCoordinatorCompletion(session: string) {
+  const completion = runCompletionFile(session, "coordinator-run");
+  assert.equal(fs.existsSync(completion), false, "no outgoing legacy completion to the root");
+  const events = `${completion}.events`;
+  assert.deepEqual(fs.existsSync(events) ? fs.readdirSync(events).filter(file => file.endsWith(".json")) : [], [],
+    "no outgoing settled completion to the root");
+}
+
+for (const scenario of ["replaced", "malformed", "oversized", "inspection", "dispatch"] as const) {
+  test(`nested coordinator rejects an invalid child header (${scenario})`, { skip: !["linux", "win32"].includes(process.platform) }, async () => fixture(async (f: any) => {
+    const { ctx, handoffs, tools } = f;
+    const idle = (pane: string) => JSON.stringify({ result: { pane: { pane_id: pane, agent_status: "idle" } } });
+    if (scenario === "inspection") inspect = async pane => idle(pane);
+    await f.start();
+    const launched = await tools.get("subagent").execute("launch", { name: "Worker", task: "Implement" }, undefined, undefined, ctx);
+    const { id, sessionFile } = launched.details;
+    const session = canonicalSessionPath(sessionFile);
+    const watcher = __test__.runningSubagents.get(id)!;
+    // Retire the live reservation and retain only the historical dispatch
+    // record, as after a worker completes and its process/pane is gone.
+    if (scenario !== "inspection") {
+      const completion = `${runCompletionFile(session, id)}.events`;
+      fs.mkdirSync(completion);
+      fs.writeFileSync(join(completion, "done.json"), JSON.stringify({ type: "done", runId: id, eventId: "done", summary: "initial work" }));
+      await until(() => handoffs.length === 1 && !__test__.runningSubagents.has(id));
+      releaseSession(session, id); // Simulate verified retirement (no real process in fixture).
+      assert.equal(sessionOwners.has(session), false);
+    }
+    const header = JSON.parse(fs.readFileSync(session, "utf8").split("\n", 1)[0]);
+    const replaceTranscript = () => fs.writeFileSync(session, scenario === "malformed" ? `bad first line\n${JSON.stringify(header)}\n`
+      : scenario === "oversized" ? `${JSON.stringify({ ...header, extra: "x".repeat(256 * 1024) })}\n`
+        : `${JSON.stringify({ ...header, id: randomUUID() })}\n`);
+    const before = sent.length;
+    const audit = () => tools.get("subagent_audit").execute("audit", { sessionPath: session }, undefined, undefined, ctx);
+    const resume = () => f.resume({ sessionPath: session, message: "repair" });
+    const denied = /Owned child Pi session header is missing, invalid, or does not match/;
+    if (scenario === "inspection") {
+      const owner = sessionOwners.get(session);
+      assert.ok(owner?.surface);
+      const auditsBefore = enumerationCount;
+      let resolveInspection: ((value: string) => void) | undefined;
+      inspect = async pane => {
+        inspect = async nextPane => idle(nextPane);
+        assert.equal(pane, owner.surface);
+        return new Promise(resolve => { resolveInspection = resolve; });
+      };
+      const failed = assert.rejects(resume(), denied);
+      void failed.catch(() => {});
+      await until(() => !!resolveInspection);
+      const readsBefore = readPaths.length;
+      replaceTranscript();
+      resolveInspection!(JSON.stringify({ error: { code: "pane_not_found" } }));
+      await failed;
+      assert.equal(sessionOwners.get(session), owner, "do not retire the previous owner after invalidation");
+      assert.equal(enumerationCount, auditsBefore + 1, "do not audit again after the inspection invalidated the target");
+      assert.ok(!readPaths.slice(readsBefore).includes(session), "replacement body was not read");
+      assert.equal(__test__.runningSubagents.get(id), watcher);
+    } else if (scenario === "dispatch") {
+      beforeScriptWrite = replaceTranscript;
+      await assert.rejects(resume(), denied);
+      assert.equal(sessionOwners.has(session), false, "release the unsent launch reservation");
+      assert.ok(closed.includes(`child-${serial}`), "close only the new, unsent pane");
+    } else {
+      replaceTranscript();
+      const readsBefore = readPaths.length;
+      const auditsBefore = enumerationCount;
+      const surfacesBefore = serial;
+      await assert.rejects(audit(), denied);
+      await assert.rejects(resume(), denied);
+      assert.ok(!readPaths.slice(readsBefore).some(path => path.startsWith(session)), "no profile or full transcript read");
+      assert.equal(enumerationCount, auditsBefore, "no OS enumeration");
+      assert.equal(serial, surfacesBefore, "no new pane");
+    }
+    assert.equal(sent.length, before, "no dispatched repair");
+  }, true));
+}
+
+test("root retains arbitrary-session audit", async () => fixture(async ({ dir, tools, ctx }: any) => {
+  const unrelated = canonicalSessionPath(join(dir, "unrelated.jsonl"));
+  const audit = await tools.get("subagent_audit").execute("audit", { sessionPath: unrelated }, undefined, undefined, ctx);
+  assert.equal(audit.details.sessionPath, unrelated);
+}));
+
+test("nested coordinator can resume a closed direct child after manifest recovery; foreign paths fail before audit/profile/history", { skip: !["linux", "win32"].includes(process.platform) }, async () => fixture(async (f: any) => {
+  const { ctx, dir, rootSession, parentSession, tools, handoffs, branch } = f;
+  const audit = (params: object) => tools.get("subagent_audit").execute("audit", params, undefined, undefined, ctx);
+  await f.start();
+  const spawn = await tools.get("subagent").execute("spawn", { name: "Worker", task: "Implement" }, undefined, undefined, ctx);
+  const session = canonicalSessionPath(spawn.details.sessionFile);
+  const profile = readPiLaunchProfile(session);
+  assert.ok(profile.lineage);
+  const done = (id: string, response: string) => {
+    const events = `${runCompletionFile(session, id)}.events`;
+    fs.mkdirSync(events, { recursive: true });
+    fs.writeFileSync(join(events, "result.json"), JSON.stringify({ type: "done", runId: id, eventId: "result", summary: response }));
+  };
+  fs.writeFileSync(`${runCompletionFile(session, spawn.details.id)}.identity.json`, JSON.stringify({
+    schema: 1, runId: spawn.details.id, sessionFile: session, headerId: profile.lineage.child.sessionId,
+    nonce: "closed-worker", process: { pid: 2147483647, birth: "original" },
+  }));
+  powershellResponder = (command) => command.includes("Where-Object") ? "[]" : "null";
+  done(spawn.details.id, "implementation");
+  await until(() => handoffs.length === 1);
+  // Ensure pane removal cleared original live controls. After restart the
+  // manifest repopulates a detached reservation that requires OS-death proof.
+  await f.restart();
+  assert.equal(__test__.runningSubagents.has(spawn.details.id), false);
+  assert.equal(sessionOwners.get(session)?.runId, spawn.details.id);
+  assert.equal((await audit({ sessionPath: session })).details.status, "clear");
+
+  const sibling = canonicalSessionPath(join(dir, "sibling.jsonl"));
+  const foreign = canonicalSessionPath(join(dir, "foreign.jsonl"));
+  const aliasDir = join(dir, "alias");
+  fs.symlinkSync(dir, aliasDir, "junction");
+  for (const path of [sibling, foreign, rootSession, parentSession]) {
+    if (!fs.existsSync(path)) fs.writeFileSync(path, "{}");
+    // A syntactically valid profile, even one claiming this parent, is not proof.
+    persistLaunchProfile({ ...profile, sessionFile: path, lineage: { ...profile.lineage, child: { ...profile.lineage.child, sessionFile: path } } });
+  }
+  const before = sent.length;
+  const auditsBefore = enumerationCount;
+  const readsBefore = readPaths.length;
+  const opensBefore = openedPaths.length;
+  for (const path of [sibling, foreign, rootSession, parentSession, join(aliasDir, "sibling.jsonl"), join(dir, "..", dir.split(/[\\/]/).at(-1)!, "foreign.jsonl"), join(dir, "SIBLING.JSONL")]) {
+    await assert.rejects(audit({ sessionPath: path }), /requires a direct Pi child/);
+    await assert.rejects(f.resume({ sessionPath: path, message: "not permitted" }), /requires a direct Pi child/);
+    const canonical = canonicalSessionPath(path).toLowerCase();
+    assert.ok(![...readPaths.slice(readsBefore), ...openedPaths.slice(opensBefore)].some(read => read.toLowerCase().startsWith(canonical)), `read unauthorized ${path}`);
+  }
+  assert.equal(enumerationCount, auditsBefore, "denied targets must not reach OS enumeration");
+  assert.equal(sent.length, before);
+
+  const alias = join(dir, "worker-alias");
+  fs.mkdirSync(alias);
+  const aliasLink = join(dir, "worker-link");
+  fs.symlinkSync(dirname(session), aliasLink, "junction");
+  const aliasPath = () => join(aliasLink, session.split(/[\\/]/).at(-1)!);
+  assert.equal((await audit({ sessionPath: aliasPath() })).details.sessionPath, session);
+  const unrelated = canonicalSessionPath(join(alias, session.split(/[\\/]/).at(-1)!));
+  fs.writeFileSync(unrelated, fs.readFileSync(session)); // Same ID does not confer path authority.
+  fs.unlinkSync(aliasLink);
+  fs.symlinkSync(alias, aliasLink, "junction");
+  const beforeRetargetAudit = enumerationCount;
+  const beforeRetargetOpen = openedPaths.length;
+  await assert.rejects(audit({ sessionPath: aliasPath() }), /requires a direct Pi child/);
+  await assert.rejects(f.resume({ sessionPath: aliasPath(), message: "retargeted alias" }), /requires a direct Pi child/);
+  assert.equal(enumerationCount, beforeRetargetAudit);
+  assert.equal(openedPaths.slice(beforeRetargetOpen).includes(unrelated), false);
+  fs.unlinkSync(aliasLink);
+  fs.symlinkSync(dirname(session), aliasLink, "junction");
+
+  const custody = branch.pop();
+  await assert.rejects(audit({ sessionPath: session }), /current session branch/);
+  await assert.rejects(f.resume({ sessionPath: session, message: "lost custody" }), /current session branch/);
+  branch.push(custody);
+  processEnumerationFails = true;
+  await assert.rejects(f.resume({ sessionPath: session, message: "uncertain" }), /process audit is uncertain/);
+  processEnumerationFails = false;
+  assert.equal(sent.length, before);
+  const resumed = await f.resume({ sessionPath: aliasPath(), message: "Repair reviewed defect" });
+  assert.equal(resumed.details.status, "started");
+  assert.notEqual(resumed.details.id, spawn.details.id);
+  assert.equal(canonicalSessionPath(resumed.details.sessionPath), session);
+  done(resumed.details.id, "repair");
+  await until(() => handoffs.length === 2);
+  assert.deepEqual(handoffs.map((message: any) => message.details.response), ["implementation", "repair"]);
+  assert.ok(handoffs.every((message: any) => message.details.lineage.parent.sessionFile === parentSession));
+  assertNoCoordinatorCompletion(parentSession);
+}, true));
+
+test("nested coordinator receives its keepOpen results and tracks accepted follow-ups, not old results, rejected requests or replay", { timeout: 15_000 }, async () => fixture(async (f: any) => {
+  const { handoffs, canWait, ctx, tools, events, rootSession, parentSession } = f;
   inspect = async pane => JSON.stringify({ result: { pane: { pane_id: pane, agent_status: "idle" } } });
   await f.start();
-  const started = await resume();
+  const started = await tools.get("subagent").execute("launch", { name: "Worker", task: "Implement" }, undefined, undefined, ctx);
   const child = __test__.runningSubagents.get(started.details.id)!;
+  const session = canonicalSessionPath(child.sessionFile);
+  const resume = (params: object) => f.resume({ sessionPath: session, ...params });
+  assert.equal(child.lineage?.parent.sessionFile, parentSession);
+  assert.equal(child.lineage?.root.sessionFile, rootSession);
+  for (const selector of [{ id: child.id }, { name: child.name }]) {
+    const audit = await tools.get("subagent_audit").execute("audit", selector, undefined, undefined, ctx);
+    assert.equal(audit.details.sessionPath, session);
+  }
   const owner = sessionOwners.get(session)!;
   const dir = continuationDir(child.activityFile!);
   const pauses: any[] = [];
@@ -774,6 +1393,9 @@ test("explicit wait tracks accepted keepOpen follow-ups, not old results, reject
     await until(() => handoffs.length > prior);
     assert.equal(handoffs.length, prior + 1);
     assert.equal(handoffs.at(-1).details.response, eventId);
+    assert.equal(handoffs.at(-1).details.lineage.parent.sessionFile, parentSession);
+    assert.equal(handoffs.at(-1).details.lineage.root.sessionFile, rootSession);
+    assertNoCoordinatorCompletion(parentSession);
   };
   const begin = async (message: string) => {
     fs.writeFileSync(join(dir, "state.json"), JSON.stringify({ runId: child.id, sessionFile: session,

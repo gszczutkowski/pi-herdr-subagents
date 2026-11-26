@@ -4,12 +4,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { PiHarnessDriver } from "../pi-extension/subagents/harness/drivers/pi.ts";
 import { canonicalSessionPath } from "../pi-extension/subagents/ownership.ts";
-import { launchProfilePath, persistLaunchProfile, readPiLaunchProfile, resolveLaunchProfile, resumeLaunchContext } from "../pi-extension/subagents/launch-profile.ts";
+import { launchProfilePath, persistLaunchProfile, persistProfileBinding, readPiLaunchProfile, resolveLaunchProfile, resumeLaunchContext } from "../pi-extension/subagents/launch-profile.ts";
 import type { SubagentLaunchContext } from "../pi-extension/subagents/harness/types.ts";
 import subagentsExtension, { __test__ } from "../pi-extension/subagents/index.ts";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { assertQueueActiveResume, assertQueueWorkArea, isQueueMarkedSession, queueChildProfile, QUEUE_CHILD_ENV } from "../pi-extension/subagents/queue-child-allocation.ts";
+import { isSubagentAssignment, registerSubagentAssignment, ASSIGNMENT_ENV } from "../pi-extension/subagents/assignment.ts";
+import * as planStore from "../pi-extension/subagents/plan-store.ts";
 
 const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 function spawn(context: SubagentLaunchContext) {
@@ -171,6 +175,91 @@ test("profiles retain inherited deny restrictions and canonical session aliases"
   } finally {
     if (previous === undefined) delete process.env.PI_DENY_TOOLS; else process.env.PI_DENY_TOOLS = previous;
   }
+}));
+
+test("internal queue preparation preserves immutable allocation through Pi profile and assignment reload", () => fixture((dir, context) => {
+  const authority = { sessionId: randomUUID(), branchInstanceId: randomUUID() };
+  let plan = planStore.createPlan("Queue", authority);
+  const command = () => ({ ...authority, expectedRevision: plan.revision });
+  const adapter = { available: () => true, inspect: () => ({ state: "working", owner: "runtime" } as const) };
+  plan = planStore.configureQueue(plan, command(), 1);
+  plan = planStore.addTask(plan, command(), "Task");
+  const taskId = plan.tasks[0].taskId;
+  plan = planStore.setWorkArea(plan, command(), taskId, dir, "read");
+  plan = planStore.startAttempt(plan, command(), taskId, undefined, adapter);
+  const binding = { planId: plan.planId, taskId, attemptId: plan.tasks[0].attempts[0].attemptId, authority };
+  const rootRunId = context.params.id = randomUUID();
+  const parent = { sessionFile: canonicalSessionPath(join(dir, "parent.jsonl")), sessionId: authority.sessionId };
+  const child = { sessionFile: canonicalSessionPath(context.subagentSessionFile), sessionId: randomUUID() };
+  context.lineage = { version: 1, parent, root: parent, child,
+    rootAssignmentId: randomUUID(), rootCheckpoint: "checkpoint", rootBranchToken: randomUUID(), eventDirectory: dir };
+  const ordinary = { ...resolveLaunchProfile(context, "pi", "read"), planTask: binding };
+  assert.throws(() => queueChildProfile(plan, binding, rootRunId, ordinary), /no longer assigned/);
+  plan = planStore.beginQueueDispatch(plan, command(), taskId, binding.attemptId, rootRunId, dir, adapter);
+  const profile = context.launchProfile = queueChildProfile(plan, binding, rootRunId, ordinary);
+  assert.equal(Object.isFrozen(profile.queueAllocation?.area), true);
+  assert.equal(Object.isFrozen(profile.queueAllocation?.binding.authority), true);
+  assert.throws(() => queueChildProfile(plan, binding, rootRunId, profile), /immutable/);
+  assert.throws(() => assertQueueActiveResume(plan, profile, dir), /positive dispatch/);
+  const driver = new PiHarnessDriver();
+  assert.throws(() => driver.buildCommand(context), /original persisted Pi session/);
+  persistLaunchProfile(profile);
+  assert.equal(isQueueMarkedSession(child.sessionFile), true);
+  assert.deepEqual(readPiLaunchProfile(child.sessionFile), profile);
+  const built = driver.buildCommand(context);
+  assert.match(built.command, new RegExp(`${QUEUE_CHILD_ENV}=1`));
+  assert.throws(() => driver.buildCommand({ ...context, effectiveCwd: context.localAgentDir! }), /assigned CWD/);
+  assert.throws(() => driver.buildCommand(reopen(dir, context)), /Queue-bound transport is unavailable/);
+  assert.throws(() => persistProfileBinding(child.sessionFile, binding), /immutable/);
+  const artifact = join(dir, `context/subagent-assignment-${rootRunId}.json`);
+  const data = JSON.parse(readFileSync(artifact, "utf8"));
+  assert.equal(isSubagentAssignment(data), true);
+  assert.deepEqual(data.queueAllocation, profile.queueAllocation);
+  assert.equal(isSubagentAssignment({ ...data, childId: randomUUID() }), false);
+  assert.equal(isSubagentAssignment({ ...data, lineage: {} }), false);
+  assert.equal(isSubagentAssignment({ ...data, queueAllocation: { ...data.queueAllocation, version: 2 } }), false);
+
+  const saved = [process.env[ASSIGNMENT_ENV], process.env.PI_SUBAGENT_ID];
+  const entries: any[] = [];
+  const ctx = { sessionManager: { getSessionFile: () => child.sessionFile, getSessionId: () => child.sessionId, getEntries: () => entries } };
+  let start: any;
+  const api = { on: (_name: string, handler: Function) => { start = handler; }, registerEntryRenderer() {},
+    appendEntry: (customType: string, data: unknown) => entries.push({ type: "custom", customType, data }) };
+  try {
+    process.env[ASSIGNMENT_ENV] = artifact;
+    process.env.PI_SUBAGENT_ID = rootRunId;
+    registerSubagentAssignment(api as any);
+    start({}, { sessionManager: { ...ctx.sessionManager, getSessionId: () => "foreign" } });
+    assert.equal(entries.length, 0);
+    writeFileSync(artifact, JSON.stringify({ ...data, lineage: {} }));
+    assert.doesNotThrow(() => start({}, ctx));
+    assert.equal(entries.length, 0);
+    writeFileSync(artifact, JSON.stringify(data));
+    start({}, ctx);
+    registerSubagentAssignment(api as any);
+    start({ reason: "reload" }, ctx);
+    assert.equal(entries.length, 1);
+    assert.deepEqual(entries[0].data.queueAllocation, profile.queueAllocation);
+  } finally {
+    for (const [index, key] of [ASSIGNMENT_ENV, "PI_SUBAGENT_ID"].entries()) {
+      if (saved[index] === undefined) delete process.env[key]; else process.env[key] = saved[index];
+    }
+  }
+
+  plan = planStore.confirmQueueDispatch(plan, command(), taskId, binding.attemptId, rootRunId, adapter);
+  assert.doesNotThrow(() => assertQueueActiveResume(plan, readPiLaunchProfile(child.sessionFile), dir));
+  assert.throws(() => assertQueueActiveResume(plan, profile, context.localAgentDir!), /assigned CWD/);
+  assert.throws(() => assertQueueWorkArea(profile.queueAllocation!, dir, "write", false), /access mode/);
+  assert.throws(() => assertQueueActiveResume(planStore.queuePause(plan, command(), "Hold"), profile, dir), /paused/);
+  const replaced = structuredClone(plan) as any;
+  replaced.tasks[0].attempts[0].reservation.area.access = "write";
+  assert.throws(() => assertQueueActiveResume(replaced, profile, dir), /stale/);
+  replaced.tasks[0].attempts[0].reservation.area.access = "read";
+  replaced.tasks[0].attempts[0].reservation.phase = "released";
+  assert.throws(() => assertQueueActiveResume(replaced, profile, dir), /occupied allocation/);
+  writeFileSync(launchProfilePath(child.sessionFile), JSON.stringify({ ...profile, queueAllocation: { ...data.queueAllocation, version: 2 } }));
+  assert.throws(() => readPiLaunchProfile(child.sessionFile), /Invalid queue allocation/);
+  assert.equal(isQueueMarkedSession(child.sessionFile), true);
 }));
 
 test("profile cannot be transplanted to a different session", () => fixture((dir, context) => {

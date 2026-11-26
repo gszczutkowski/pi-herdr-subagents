@@ -106,15 +106,16 @@ Reads cap directory enumeration at 10,000 records and retain at most 2,000 event
 older omitted records remain on disk. File fsync does not promise directory fsync
 or survival of every event after power loss.
 
-`/subagents-tree` toggles a separate native provenance widget, even with no active
-processes. Use `expand`, `compact`, `toggle <sessionId>` or `refresh`. Expanded
-nodes show the last three bounded explicit events. The tree caps sessions at 200,
-depth at 16 and output at 120 width-aware lines; malformed cycles/disconnected
-components cannot recurse indefinitely. It is a history view, not liveness or
-terminal controls. Root file observation starts only after `session_start`, is
-cleaned up on shutdown, and updates UI without a model turn. Unsupported/missing
-filesystem watch support falls back to command/tool refresh. The interactive TUI
-renders the widget; other UI modes receive command summaries, while print mode
+`/subagents-tree` opens an amber-framed history widget on demand, even when
+there is no saved history on the current branch. Use `expand`, `compact`,
+`toggle <sessionId>`, `refresh` or `off` (dismiss). Expanded nodes show the last
+three bounded explicit events. The tree caps sessions at 200, depth at 16 and
+output at 120 width-aware lines; malformed cycles/disconnected components cannot
+recurse indefinitely. It is a history view, not liveness or terminal controls.
+The tree and its file watchers stay off until opened in the TUI. Closing the
+widget or shutting down the session stops its watchers. Unsupported/missing
+filesystem watch support falls back to command/tool refresh. Refresh does not
+start a model turn. Other UI modes receive command summaries, while print mode
 has no visible widget. No live herdr/provider E2E is claimed by the unit/native
 session tests.
 
@@ -130,8 +131,12 @@ Spawn and resume persist a versioned manifest and immutable serialized outbox in
 terminal dispatch; dispatch intent precedes the uncertain transport call. Results
 and event cursors are committed together before handoff; child event files remain
 intact. Atomic same-directory replacements use restrictive permissions where the
-OS supports them. A writer lease excludes simultaneous parents; corrupt or future
-schemas fail closed rather than resetting state.
+OS supports them. On Windows only, a manifest replacement returning `EPERM` or
+`EBUSY` gets up to three retries of the same closed temporary file (10, 30, 60 ms),
+with custody rechecked before each retry. Neither the launch nor terminal send is
+retried. These error codes alone do not identify what denied the replacement.
+A writer lease excludes simultaneous parents; corrupt or future schemas fail
+closed rather than resetting state.
 
 Synchronous throws retain the original envelope for bounded-backoff retries.
 Outbox `dispatching` is persisted before `sendMessage`, and `handedOff` afterward.
@@ -171,14 +176,49 @@ built-in force-resolution of those decisions. No live terminal-recovery E2E
 guarantee is made.
 
 After terminal loss, **resume the original saved parent session and branch**.
-Startup announces recorded assignments, including runs with no plan binding;
-a bounded native context publication (4KB maximum) makes them visible
+Startup announces recorded assignments, including runs with no plan binding.
+After reviewing `/subagents-recovery`, use `/subagents-recovery-ack` to dismiss
+that startup notice for the current branch and saved state. The acknowledgement
+survives `/reload` and restarting Pi; new assignments or changes in reconciliation,
+delivery, or diagnostics bring the notice back. Acknowledgement is unavailable
+when the saved view is blocked or storage is uncertain. It neither removes
+history nor accepts results, repairs metadata, or controls children.
+A bounded native context publication (4KB maximum) still makes assignments visible
 at an existing agent/turn boundary, without starting a turn. A read-only
 post-compaction fallback preserves visibility until the next durable boundary. Use
 `/subagents-recovery [runId]` or `subagents_recovery({})` for the read-only report.
 The tool accepts `{ offset, limit }` (default 10, maximum 20) or `{ runId }` for
 detail, capped at 24KB with explicitly truncated fields. Detail includes the
 first ten retained delivery excerpts. List pages give the next offset.
+
+If both launch and failure-evidence commits fail, an independent immutable record
+in `subagent-runtime/dispatch-evidence/` retains the run ID, original plan binding
+(if any), phase and cause, but not the task or prompt. If that write also fails,
+`memory-only` means the record can survive `/reload`, not process exit. Reconcile
+from the original parent branch: users type `/subagents-reconcile` in the Pi TUI;
+agents call `subagents_reconcile({})`. Nested coordinators can reconcile their
+own children, never an ancestor's manifest; the same session/branch custody guards
+apply. Sending slash-command text via an external terminal transport is not a
+substitute for either interface. Unreadable journal evidence and failed metadata
+writes can block writer generation rollover. If only the original plan binding is
+unavailable, validated evidence for that exact run is retained in the manifest
+across rotation; it remains blocked for that run without blocking unrelated
+unbound launches. Repair still requires the original binding, nonconflicting
+records, and current branch custody. `evidence=manifest` means the original
+metadata was retained durably, not that it was imported or sent.
+
+Reconciliation repairs metadata; it never dispatches a child command. Reports
+separate storage errors from per-run outcomes. `resolved` with `before-send`
+means the original run did not reach transport. `still-blocked` means a storage,
+custody, or run-specific metadata check failed. `dispatch-unknown` means **do
+not retry the resume**. A saved dispatch intent alone does not prove execution;
+neither a pending or interrupted outbox handoff, watcher-only exit, new manifest
+revision, nor another run's evidence resolves it. This also applies to older
+plan-bound run IDs missing from the manifest without matching proof. A same-run,
+same-session child completion (including a provider error) or a successfully
+verified run-bound recovery challenge proves dispatch, not current liveness,
+task success, or acceptance. Any subsequent continuation still requires an
+explicit decision and fresh writer checks.
 
 Reports show saved task/name/run ID/session path and **saved reconciliation, not
 current liveness**. `pending` means retained for delivery, `unknown` means a
@@ -606,6 +646,8 @@ The `caller_ping` tool lets a subagent request help from its parent agent. Norma
 - `name` (optional): Display name for a new resumed pane (defaults to `Resume`); a live child must retain its name.
 - `message`: Follow-up prompt; required and nonempty for live continuation, optional for closed-session resume.
 - `autoExit` (optional): Must match the saved launch profile; omission preserves it.
+
+A delegated Pi session can audit or resume only its **own direct Pi children** recorded under its current, active branch custody. Pass the original child's session path (or an owned live run ID/exact name for audit). An alias is accepted only if it resolves to the recorded canonical path; retargeting it to another session does not transfer authority. A saved launch profile, root-wide lineage history, or a shared working directory does not grant access. Once the manifest and path are authorized, the tool checks the first Pi JSONL header (bounded to 64 KiB) against the recorded child session ID before reading the profile or transcript body or enumerating writers. A replaced, missing, or invalid header fails closed; resume also checks it again during preparation and before dispatch. Closed children retain their direct-parent record in the manifest; after restart the existing recovery, process-verification, and launch-profile requirements still apply. A top-level Pi session retains arbitrary-session audit and the existing saved-profile resume behavior. This scopes extension tools, not the OS filesystem or shell.
 
 For an owned, tracked Pi child interrupted through guarded abort or manual Escape, resume continues the **same process, run, pane and watcher** only after the child confirms `agent_settled` with an aborted run and idle state. Starting, finalizing or unknown states reject, as do actually busy children. A stale active parent observation after cancellation can be overridden only by a fresh child `interrupted-idle` token and confirmed idle pane; ordinary settled-idle evidence cannot override it. The launch configuration is unchanged. The child advertises `artifact-v1` continuation support and watches its run-specific request directory from `session_start` until shutdown/reload. After binding/custody validation, the parent atomically publishes a UUID/run/session/idle-token-bound request; the child passes the exact follow-up to `sendUserMessage` with template/command expansion disabled (not terminal/shell input or `@file` expansion). HC `idle` or `done` is only coarse pane evidence: a fresh child-issued settled token is also required. Unsupported legacy children fail with update/reload guidance; no blind terminal fallback is attempted.
 
@@ -1096,6 +1138,15 @@ Reload rechecks a silent wait; it does not start another worker.
 Pi resume preserves the saved setting; workers
 spawned by the coordinator do not inherit it. This is independent of the global
 `maxReportBytes` bound.
+
+The coordinator owns its implementation, independent review, and repair loop.
+Worker completions and follow-ups wake their immediate coordinator, not the root.
+The coordinator can audit and continue its worker directly, whether it remains
+open or has safely closed. Reserve `caller_ping` for blockers or decisions the
+coordinator cannot resolve; otherwise send one concise final evidence summary.
+An already-launched coordinator keeps its saved tool allowlist on resume; start
+a new coordinator with the updated profile if that allowlist omitted lifecycle
+tools.
 
 ### `interactive`
 

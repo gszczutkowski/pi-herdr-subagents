@@ -95,4 +95,4 @@ When authorized, load the `commit` skill if available and make a polished, descr
 
 ### 7. Return Results for Parent Review
 
-Return planId/taskId, changed paths, branch/commits, artifact references, test results, unmet criteria, and blockers. The parent validates and imports the result with `plan_update` (`result`, `evidence`, then `accept` only after verification). Do not mark ancestor tasks accepted. `plan.md` is a design artifact, not a second synchronized execution checklist.
+Return planId/taskId, changed paths, branch/commits, artifact references, test results, unmet criteria, and blockers. When calling `subagent_done` for a finished assignment, omit `close` to use the session's default completion behavior. Use `close: false` only when a concrete follow-up requires this session to stay open, and tell the parent what remains. The parent validates and imports the result with `plan_update` (`result`, `evidence`, then `accept` only after verification). Do not mark ancestor tasks accepted. `plan.md` is a design artifact, not a second synchronized execution checklist.

@@ -5,7 +5,8 @@ import type { PlanPersistence } from "./plan-persistence.ts";
 import { attachRun, recordResult, type Authority, type ResultReference } from "./plan-store.ts";
 import { isStructuredResult, resultClaimDiagnostics, resolveAssignmentContract } from "./contracts.ts";
 import type { DeliveryEnvelope } from "./delivery.ts";
-import type { RuntimeStore, DurableRun } from "./runtime-store.ts";
+import { dispatchFailureEventId, hasAfterIntentMarker, type DispatchEvidence, type RuntimeStore, type DurableRun, type resumeIntentBinding } from "./runtime-store.ts";
+import { canImportAfterIntentFailure, type DispatchEvidenceReader, type DispatchIncident } from "./dispatch-recovery.ts";
 
 const id = () => Type.String({ minLength: 1, maxLength: 8192 });
 export const PlanTaskParams = Type.Object({
@@ -22,8 +23,11 @@ const BindingSchema = Type.Object({ planId: id(), taskId: id(), attemptId: id(),
 export function isPlanTaskBinding(value: unknown): value is PlanTaskBinding {
   return Value.Check(BindingSchema, value);
 }
-const same = (a: PlanTaskBinding, b: PlanTaskBinding) => a.planId === b.planId && a.taskId === b.taskId &&
-  a.attemptId === b.attemptId && a.authority.sessionId === b.authority.sessionId && a.authority.branchInstanceId === b.authority.branchInstanceId;
+export function samePlanBinding(a: PlanTaskBinding | undefined, b: PlanTaskBinding | undefined): boolean {
+  if (!a || !b) return a === b;
+  return a.planId === b.planId && a.taskId === b.taskId && a.attemptId === b.attemptId &&
+    a.authority.sessionId === b.authority.sessionId && a.authority.branchInstanceId === b.authority.branchInstanceId;
+}
 
 /** Read-only contract preflight, including a binding inherited from a saved launch. */
 export function resolveResumeContract(persistence: PlanPersistence, ctx: ExtensionContext,
@@ -35,6 +39,7 @@ export function resolveResumeContract(persistence: PlanPersistence, ctx: Extensi
   const view = persistence.read(ctx.sessionManager);
   const plan = view.snapshot;
   if (!plan || !view.writable || plan.planId !== effective.planId) throw new Error(view.error ?? "Original writable plan is not selected");
+  assertLegacyBoundTransport(plan);
   const task = plan.tasks.find((task) => task.taskId === effective.taskId);
   if (!task) throw new Error("Bound task is missing from the selected plan");
   return resolveAssignmentContract(contract, task);
@@ -49,9 +54,10 @@ export function bindPlanRun(persistence: PlanPersistence, ctx: ExtensionContext,
   const view = persistence.read(ctx.sessionManager);
   const plan = view.snapshot;
   if (!plan || !view.writable) throw new Error(view.error ?? "No active plan");
+  assertLegacyBoundTransport(plan);
   const binding: PlanTaskBinding = selection ? { planId: selection.planId, taskId: selection.taskId,
     attemptId: selection.attemptId, authority: { ...plan.authority } } : saved!;
-  if (saved && !same(binding, saved)) throw new Error("Resume cannot redirect its original task binding");
+  if (saved && !samePlanBinding(binding, saved)) throw new Error("Resume cannot redirect its original task binding");
   const task = plan.tasks.find(t => t.taskId === binding.taskId);
   if (!task || task.attempts.at(-1)?.attemptId !== binding.attemptId || !["in_progress", "blocked", "in_review"].includes(task.status)) {
     throw new Error("Binding requires an existing current nonterminal attempt; create retry explicitly");
@@ -61,21 +67,48 @@ export function bindPlanRun(persistence: PlanPersistence, ctx: ExtensionContext,
   return structuredClone(binding);
 }
 
-/** Import is independent of result handoff. The durable outbox is also the retry
- * source, including handed-off envelopes; no second task list or auto-accept. */
+// Do not route versioned reservations through the legacy transport. It does
+// not fence delegated descendants or account for their closure/continuations.
+// This denial belongs at the binding boundary, not at result import or close.
+export function assertLegacyBoundTransport(plan: { schemaVersion: number }): void {
+  if (plan.schemaVersion !== 1) throw new Error("Queue-bound transport is unavailable; the legacy launch/continuation path cannot use this reservation");
+}
+
+export interface DispatchPlanProjection {
+  store: RuntimeStore;
+  memory: ReadonlyMap<string, DispatchEvidence>;
+  incidents?: DispatchIncident[];
+  /** Check the live writer fence before projecting any durable event. */
+  canImport?: () => boolean;
+  /** Live callers retain storage faults from both custody and journal reads. */
+  readEvidence?: DispatchEvidenceReader;
+  onCustodyError?: (error: unknown) => void;
+}
+
+/** Plan import is independent of notification handoff. False defers projection
+ * for a fenced writer, import-only claim, or conflicted cursor without a plan
+ * mutation or import error, so callers can retry against fresh evidence. */
 export function importPlanEnvelope(persistence: PlanPersistence, ctx: ExtensionContext,
-  binding: PlanTaskBinding | undefined, runId: string, envelope: DeliveryEnvelope): void {
-  if (!binding) return;
-  if (!isPlanTaskBinding(binding)) throw new Error("Invalid result task binding");
+  binding: PlanTaskBinding | undefined, runId: string, envelope: DeliveryEnvelope, dispatch?: DispatchPlanProjection): boolean {
+  if (dispatch?.canImport?.() === false || dispatch?.store.hasMalformedAfterIntentCursor(runId)) return false;
   const d = envelope.message.details as Record<string, any>;
   const eventId = d?.eventId;
+  const saved = eventId === dispatchFailureEventId(runId) ? dispatch?.store.getEvent(eventId) : undefined;
+  const marked = hasAfterIntentMarker(envelope) || (saved && hasAfterIntentMarker(saved.envelope));
+  const view = marked ? persistence.read(ctx.sessionManager) : undefined;
+  if (marked && (!dispatch || !view?.writable || (binding !== undefined && !isPlanTaskBinding(binding)) ||
+      !canImportAfterIntentFailure(dispatch.store, view.snapshot, dispatch.memory, dispatch.incidents ?? [], runId, binding, envelope,
+        dispatch.readEvidence, dispatch.onCustodyError))) return false;
+  if (!binding) return true;
+  if (!marked) dispatch?.store.assertCustody();
+  if (!isPlanTaskBinding(binding)) throw new Error("Invalid result task binding");
   if (typeof eventId !== "string") throw new Error("Missing canonical delivery event ID");
   const ping = envelope.message.customType === "subagent_ping";
   const failure = !!(d.errorMessage || d.error || (typeof d.exitCode === "number" && d.exitCode !== 0));
   const reason = String(ping ? d.message : d.errorMessage || d.error || `Process exited with code ${d.exitCode}`).slice(0, 8192) || "Child needs help";
   const result: ResultReference = { eventId, runId, ref: `${d.sessionFile || "runtime"}#${eventId}`,
     kind: ping ? "ping" : failure ? "failure" : "result", ...((ping || failure) ? { reason } : {}) };
-  const plan = persistence.read(ctx.sessionManager).snapshot;
+  const plan = (view ?? persistence.read(ctx.sessionManager)).snapshot;
   if (!plan) throw new Error("Original plan branch is not selected");
   const task = plan.tasks.find(t => t.taskId === binding.taskId);
   const diagnostics = task && isStructuredResult(d.structuredResult) ? resultClaimDiagnostics(d.structuredResult, task) : [];
@@ -86,23 +119,35 @@ export function importPlanEnvelope(persistence: PlanPersistence, ctx: ExtensionC
     : diagnostics.length && result.kind === "result" ? { ...result, reason: `Worker proposal requires parent review: ${diagnostics.join("; ")}`.slice(0, 8192) } : result;
   persistence.mutate(ctx.sessionManager, binding.planId, plan.revision,
     (p, c) => recordResult(p, c, binding.taskId, binding.attemptId, proposal), binding.authority);
+  return true;
+}
+
+export class DispatchEvidenceWriteError extends Error {
+  readonly writeError: unknown;
+  constructor(writeError: unknown) {
+    super(`Failure evidence NOT persisted; explicit reconciliation required: ${String(writeError)}`);
+    this.writeError = writeError;
+  }
 }
 
 export function recordDispatchFailure(persistence: PlanPersistence, ctx: ExtensionContext,
   binding: PlanTaskBinding | undefined, runId: string, error: unknown,
-  runtime: RuntimeStore | undefined, run: Omit<DurableRun, "phase" | "eventCursor">, dispatched = false): void {
-  if (!binding) return;
+  runtime: RuntimeStore | undefined, run: Omit<DurableRun, "phase" | "eventCursor">, dispatched = false,
+  beforeSendAfterIntent?: ReturnType<typeof resumeIntentBinding>, dispatch?: Omit<DispatchPlanProjection, "store">): void {
+  if (!binding && !runtime) return;
   const reason = `${dispatched ? "Dispatch uncertain; reconcile existing process" : "Dispatch failed before send"}: ${String(error)}`;
   const envelope: DeliveryEnvelope = { message: { customType: dispatched ? "subagent_ping" : "subagent_result", display: true,
     content: reason, details: { eventId: `subagent:${runId}:dispatch-failure:launch`,
-      ...(dispatched ? { message: reason } : { error: reason }) } },
+      ...(dispatched ? { message: reason } : { error: reason,
+         ...(beforeSendAfterIntent ? { beforeSendAfterIntent } : {}) }) } },
     options: { triggerTurn: true, deliverAs: "steer" } };
   try {
     if (!runtime) throw new Error("No durable runtime custody");
     runtime.recordDispatchFailure({ ...run, planTask: binding }, envelope);
   } catch (persistError) {
-    throw new Error(`Failure evidence NOT persisted; explicit reconciliation required: ${String(persistError)}`);
+    throw new DispatchEvidenceWriteError(persistError);
   }
-  // The immutable outbox is already committed, including original authority.
-  importPlanEnvelope(persistence, ctx, binding, runId, envelope);
+  // The immutable outbox retains original authority, so import can be retried
+  // if the current writer fence defers immediate projection.
+  importPlanEnvelope(persistence, ctx, binding, runId, envelope, dispatch && runtime ? { ...dispatch, store: runtime } : undefined);
 }

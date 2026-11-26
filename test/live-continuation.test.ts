@@ -10,24 +10,27 @@ import { CONTINUE_COMMAND, continuationCommand, continuationDir, continueLiveChi
 import { canonicalSessionPath, type SessionOwner } from "../pi-extension/subagents/ownership.ts";
 import { createLifecycle, markInterruptRequested, markProcessRunning, observeActivity, observePaneInspection, projectLifecycle } from "../pi-extension/subagents/lifecycle.ts";
 import { createSubagentActivityRecorder, readSubagentActivityFile } from "../pi-extension/subagents/activity.ts";
+import { launchProfilePath, QUEUE_CHILD_ENV, queueChildMarkerPath } from "../pi-extension/subagents/queue-child-allocation.ts";
 
-function fixture() {
+function fixture(queue = false) {
   const dir = mkdtempSync(join(tmpdir(), "live-continuation-"));
   const runId = randomUUID();
   const sessionFile = join(dir, "session.jsonl");
   writeFileSync(sessionFile, "");
   const activityFile = join(dir, "activity.json");
   const env = { PI_SUBAGENT_ID: runId, PI_SUBAGENT_SESSION: sessionFile, PI_SUBAGENT_ACTIVITY_FILE: activityFile };
-  const previous = Object.fromEntries(Object.keys(env).map((key) => [key, process.env[key]]));
+  const previous = Object.fromEntries([...Object.keys(env), QUEUE_CHILD_ENV].map((key) => [key, process.env[key]]));
   Object.assign(process.env, env);
+  if (queue) process.env[QUEUE_CHILD_ENV] = "1"; else delete process.env[QUEUE_CHILD_ENV];
   const events = new Map<string, Function>();
   const commands = new Map<string, any>();
   const sent: any[] = [];
   let idle = true;
   let pending = false;
   let failDispatch = false;
+  const entries: any[] = [];
   const ctx = { isIdle: () => idle, hasPendingMessages: () => pending,
-    sessionManager: { getSessionFile: () => sessionFile } };
+    sessionManager: { getSessionFile: () => sessionFile, getEntries: () => entries } };
   const pi = { on: (name: string, handler: Function) => events.set(name, handler),
     registerCommand: (name: string, command: any) => commands.set(name, command),
     sendUserMessage: (...args: any[]) => { sent.push(args); if (failDispatch) throw new Error("API dispatch ambiguous"); } };
@@ -44,7 +47,12 @@ function fixture() {
   const transport = { inspect: async () => ({ kind: "present", agentStatus: "idle", observedAt: Date.now() } as const),
     send: (_surface: string, _text: string) => { assert.fail("Terminal transport must never be used"); }, timeoutMs: 1000 };
   events.get("session_start")!({}, ctx);
-  return { dir, runId, sessionFile, activityFile, child, owner, events, sent, commands, ctx, invoke, transport,
+  return { dir, runId, sessionFile, activityFile, child, owner, events, sent, commands, ctx, invoke, transport, entries,
+    reopen: () => {
+      events.get("session_shutdown")!({}, ctx);
+      registerLiveContinuation(pi as any);
+      events.get("session_start")!({ reason: "reload" }, ctx);
+    },
     settle: (aborted = true) => events.get("agent_settled")!({ aborted }, ctx),
     idle: (value: boolean) => { idle = value; }, pending: (value: boolean) => { pending = value; },
     failDispatch: () => { failDispatch = true; },
@@ -506,6 +514,88 @@ test("watcher starts only in session_start and stops on shutdown/reload; stale t
     f.settle();
     assert.equal((await continueLiveChild(f.owner, f.child, { message: "new" }, f.transport)).status, "accepted");
     assert.equal(f.sent.length, 1);
+  } finally { f.cleanup(); }
+});
+
+test("queue continuation receiver fails closed across missing env, recovered assignment and duplicate request", async () => {
+  const f = fixture(true);
+  try {
+    const files = continuationDir(f.activityFile);
+    const reject = async () => {
+      f.settle();
+      await assert.rejects(continueLiveChild(f.owner, f.child, { message: "must not send" }, f.transport), /Queue continuation authority unavailable/);
+      const request = readdirSync(files).filter(name => name.endsWith(".request.json")).at(-1)!;
+      f.invoke(continuationCommand(request.slice(0, -".request.json".length)));
+      assert.equal(f.sent.length, 0, "no Pi API transport, including explicit command replay");
+      assert.equal(readdirSync(files).some(name => name.endsWith(".claim.json")), false);
+    };
+    delete process.env[QUEUE_CHILD_ENV]; // A running child never drops its captured restriction.
+    await reject();
+    const marker = queueChildMarkerPath(canonicalSessionPath(f.sessionFile));
+    writeFileSync(marker, "1\n");
+    f.reopen(); // Fresh registration without the launch marker env.
+    await reject();
+    rmSync(marker);
+    f.entries.push({ type: "custom", customType: "subagent-assignment",
+      data: { sessionFile: canonicalSessionPath(f.sessionFile), queueAllocation: null } });
+    f.reopen();
+    await reject(); // Malformed allocation cannot be reclassified as unbound.
+  } finally { f.cleanup(); }
+});
+
+test("watcher rejects a persisted queue assignment absent from preloaded entries", async () => {
+  const f = fixture();
+  try {
+    f.settle();
+    writeFileSync(f.sessionFile, JSON.stringify({ type: "custom", customType: "subagent-assignment",
+      data: { sessionFile: canonicalSessionPath(f.sessionFile), queueAllocation: null } }) + "\n", { flag: "a" });
+    assert.deepEqual(f.entries, []);
+    await assert.rejects(continueLiveChild(f.owner, f.child, { message: "follow-up" }, f.transport), /Queue continuation authority unavailable/);
+    assert.equal(f.sent.length, 0);
+    assert.equal(readdirSync(continuationDir(f.activityFile)).some(name => name.endsWith(".claim.json")), false);
+  } finally { f.cleanup(); }
+});
+
+test("failed settlement of an unpublished continuation retains its reservation", async () => {
+  const f = fixture();
+  try {
+    f.settle();
+    let intent: string | undefined;
+    await assert.rejects(continueLiveChild(f.owner, f.child, { message: "follow-up" }, {
+      ...f.transport, beforeSend: id => { intent = id; return () => { throw new Error("target changed"); }; },
+      settled: id => { assert.equal(id, intent); throw new Error("cannot persist settlement"); },
+    }), /cannot persist settlement/);
+    assert.ok(intent);
+    assert.equal(f.owner.continuationRequestId, intent);
+    assert.deepEqual(readdirSync(continuationDir(f.activityFile)), ["state.json"]);
+    assert.equal(f.sent.length, 0);
+  } finally { f.cleanup(); }
+});
+
+test("persisted queue profile alone blocks watcher and fresh private command transport", async () => {
+  const f = fixture();
+  try {
+    const files = continuationDir(f.activityFile);
+    const file = canonicalSessionPath(f.sessionFile);
+    // Unknown launch/allocation versions are restrictive, even without a
+    // marker, assignment card, or queue environment in the fresh runtime.
+    writeFileSync(launchProfilePath(file), JSON.stringify({ version: 99, sessionFile: file, queueAllocation: { version: 99 } }));
+    f.reopen();
+    f.settle();
+    await assert.rejects(continueLiveChild(f.owner, f.child, { message: "watcher" }, f.transport), /Queue continuation authority unavailable/);
+    assert.equal(readdirSync(files).filter(name => name.endsWith(".result.json")).length, 1);
+    assert.equal(f.sent.length, 0);
+    f.reopen(); // Fresh closure with no previously detected queue classification.
+    f.settle();
+    const requestId = randomUUID();
+    const { idleToken } = JSON.parse(readFileSync(join(files, "state.json"), "utf8"));
+    writeFileSync(join(files, `${requestId}.request.json`), JSON.stringify({ runId: f.runId, sessionFile: file, requestId, idleToken, message: "private command" }));
+    // The command rejects before control returns to the event loop, so this
+    // receipt is from a fresh command, not a watcher-produced duplicate.
+    f.invoke(continuationCommand(requestId));
+    assert.equal(JSON.parse(readFileSync(join(files, `${requestId}.result.json`), "utf8")).reason, "Queue continuation authority unavailable");
+    assert.equal(readdirSync(files).filter(name => name.endsWith(".claim.json")).length, 0);
+    assert.equal(f.sent.length, 0);
   } finally { f.cleanup(); }
 });
 

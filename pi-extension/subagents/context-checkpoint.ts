@@ -3,7 +3,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Type, type Static, type TSchema } from "@sinclair/typebox";
 import { Value } from "@sinclair/typebox/value";
 import { summarizePlan } from "./plan-context.ts";
-import { PLAN_ENTRY, type PlanPersistence } from "./plan-persistence.ts";
+import { PLAN_ENTRY, PLAN_ENTRY_V2, type PlanPersistence } from "./plan-persistence.ts";
 import { contextReceipt, publicationState, registerContextPublication } from "./context-publication.ts";
 
 export const CONTEXT_CHECKPOINT_PREFIX = "pi-subagents-context-checkpoint/";
@@ -161,7 +161,8 @@ export function registerContextCheckpoint(pi: ExtensionAPI, plans: PlanPersisten
   function snapshot(ctx: ExtensionContext, reason: typeof reasons[number], workingState?: CheckpointWorkingState): ContextCheckpoint {
     const sm = ctx.sessionManager;
     const view = plans.read(sm);
-    const planEntry = sm.getBranch().findLast(entry => entry.type === "custom" && entry.customType === PLAN_ENTRY);
+    const planEntryType = view.snapshot?.schemaVersion === 2 ? PLAN_ENTRY_V2 : PLAN_ENTRY;
+    const planEntry = sm.getBranch().findLast(entry => entry.type === "custom" && entry.customType === planEntryType);
     const candidate: ContextCheckpoint = {
       version: 1, originSessionId: sm.getSessionId(), capturedAt: Date.now(), reason,
       ...(workingState ? { workingState } : {}),

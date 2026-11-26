@@ -484,7 +484,7 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({
       result: Type.Optional(StructuredResultSchema),
       close: Type.Optional(Type.Boolean({
-        description: "False leaves this session and its pane open for follow-up. True closes it. Omitting it uses behavior.closeOnDone.",
+        description: "Omit for normal completion to use this session's default close behavior. Set false only for a concrete follow-up that requires this session to stay open; explain the follow-up to the parent. Set true to request shutdown after successful result publication.",
       })),
     }, { additionalProperties: false }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {

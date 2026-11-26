@@ -42,7 +42,12 @@ function hostCode(dir: string, branch: string, file = "parent.jsonl", headerId =
     await emit('session_shutdown',{reason:'quit'});`;
 }
 function execute(code: string, timeout = 30000) {
-  const result = spawnSync(process.execPath, ["--input-type=module", "-e", code], { encoding: "utf8", timeout });
+  // These subprocesses simulate parent writers, even if the test runner is a child.
+  const env = { ...process.env };
+  delete env.PI_SUBAGENT_ID;
+  delete env.PI_SUBAGENT_SESSION;
+  delete env.PI_DENY_TOOLS;
+  const result = spawnSync(process.execPath, ["--input-type=module", "-e", code], { encoding: "utf8", timeout, env });
   assert.equal(result.status, 0, result.stderr || String(result.error ?? ""));
 }
 
@@ -122,6 +127,9 @@ test("registered recovery tool fails closed on unavailable hosts, recovery error
       runtime.recoveryError=undefined;
       runtime.store={snapshot:()=>manifest,assertCustody:()=>{throw Error('writer custody lost')}};
       result=await report();assert.equal(result.isError,true);assert.match(result.content[0].text,/custody lost/);assert.doesNotMatch(result.content[0].text,/private-task/);
+      runtime.store={snapshot:()=>manifest,assertCustody:()=>{throw Object.assign(Error('manifest busy'),{code:'EBUSY'})}};
+      result=await report();assert.equal(result.isError,true);assert.match(result.content[0].text,/last verified evidence.*manifest busy/);assert.match(result.content[0].text,/private-task/);
+      branch.pop();result=await report();assert.equal(result.isError,true);assert.doesNotMatch(result.content[0].text,/private-task/);
       runtime.store=undefined;fs.writeFileSync(file,'broken');
       result=await report();assert.equal(result.isError,true);assert.doesNotMatch(result.content[0].text,/private-task/);`);
   } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -237,7 +245,7 @@ test("fresh parent resumes an exited recovered session only after fresh process 
         inspections.push(args[2]);return {stdout:JSON.stringify({result:{pane:{pane_id:'new',agent_status:'idle'}}})};
       }});syncBuiltinESMExports();
       process.env.HERDR_ENV='1';process.env.HERDR_WORKSPACE_ID='restart-test';process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS='0';
-      for(const key of ['HC_TERMINAL_ID','HC_TERMINAL_SOCKET','PI_DENY_TOOLS','PI_SUBAGENT_ID','PI_SUBAGENT_LAYOUT'])delete process.env[key];
+      for(const key of ['HC_TERMINAL_ID','HC_TERMINAL_SOCKET','PI_SUBAGENT_LAYOUT'])delete process.env[key];
       process.env.PI_CODING_AGENT_DIR=${JSON.stringify(dir)};
       const {default:extension}=await import(${JSON.stringify(moduleURL("index"))});
       const {canonicalSessionPath,sessionOwners}=await import(${JSON.stringify(moduleURL("ownership"))});
@@ -344,6 +352,7 @@ test("real child process answers fresh generation challenges; stale nonce/PID an
     atomicRuntimeWrite(`${base}.identity.json`, identity);
     const store = new RuntimeStore(join(dir, "runtime"), { sessionFile: "parent", headerId: "parent", branchToken: "branch", checkpoint: "checkpoint" });
     store.prepare({ id: "run", sessionFile: session, cli: "pi", surface: "reused-pane", name: "child", task: "task", startTime: 1 });
+    store.phase("run", "dispatch-intent");
     const onEvidence = (run: any, event: any) => {
       const id = `subagent:${run.id}:completion:${event.eventId}`;
       store.enqueue(id, run.id, { message: { customType: "subagent_result", content: event.summary!, details: { eventId: id } },
@@ -354,6 +363,9 @@ test("real child process answers fresh generation challenges; stale nonce/PID an
     assert.equal(sessionOwners.get(session)?.surface, undefined);
     const stop = await recovering;
     assert.match(store.snapshot().runs.run.reconciliation!, /verified-live: artifact-only/);
+    assert.equal(store.getRun("run")?.dispatchVerified, true, "fresh child challenge supplies historical dispatch proof");
+    store.reconcileRun("run", "unverified: later observation unavailable");
+    assert.equal(store.getRun("run")?.dispatchVerified, true, "saved proof is distinct from current liveness");
     mkdirSync(`${base}.events`, { recursive: true });
     for (const eventId of ["one", "two"]) {
       writeFileSync(`${base}.events/${eventId}.json`, JSON.stringify({ type: "done", runId: "run", eventId, summary: eventId, keepOpen: true }));

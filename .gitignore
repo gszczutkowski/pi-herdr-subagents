@@ -6,3 +6,6 @@ config.json
 !.pi/agents/
 .pi/agents/*
 !.pi/agents/test-agent.md
+!.pi/agents/coordinator.md
+!.pi/agents/worker.md
+!.pi/agents/reviewer.md

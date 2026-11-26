@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { SubagentLaunchContext } from "./harness/types.ts";
@@ -9,11 +9,14 @@ import { contractTask, isAssignmentContract, type AssignmentContract } from "./c
 import type { ResolvedRuntimePlan } from "./runtime-routing.ts";
 import { isLineage, type Lineage } from "./lineage.ts";
 import type { DefinitionSource } from "./project-trust.ts";
+import { assertQueueProfile, launchProfilePath, queueChildMarkerPath, readPersistedQueueProfile, type QueueChildAllocation } from "./queue-child-allocation.ts";
+export { launchProfilePath } from "./queue-child-allocation.ts";
 
 /** Resolved, noncredential launch inputs only; never snapshot process.env or auth/config contents. */
 export interface LaunchProfile {
   version: 1;
   planTask?: PlanTaskBinding;
+  readonly queueAllocation?: QueueChildAllocation;
   assignmentContract?: AssignmentContract;
   harness: string;
   sessionFile: string;
@@ -37,8 +40,6 @@ export interface LaunchProfile {
   interactive: boolean;
   lineage?: Lineage;
 }
-
-export const launchProfilePath = (sessionFile: string): string => `${sessionFile}.launch-profile.json`;
 
 export function resolveLaunchProfile(context: SubagentLaunchContext, harness: string, tools: string | null): LaunchProfile {
   const plan = context.runtimePlan;
@@ -68,21 +69,31 @@ export function resolveLaunchProfile(context: SubagentLaunchContext, harness: st
 
 export function persistLaunchProfile(profile: LaunchProfile): void {
   const path = launchProfilePath(profile.sessionFile);
+  assertQueueProfile(profile);
   mkdirSync(dirname(path), { recursive: true });
+  // Publish the independent fail-closed marker first. An incomplete preparation
+  // must not later be mistaken for an unallocated launch.
+  if (profile.queueAllocation) {
+    if (lstatSync(path, { throwIfNoEntry: false })) throw new Error("Cannot add queue allocation to an existing launch profile");
+    writeFileSync(queueChildMarkerPath(profile.sessionFile), "1\n", { flag: "wx", mode: 0o600 });
+  }
   writeFileSync(path, JSON.stringify(profile, null, 2), { encoding: "utf8", flag: "wx", mode: 0o600 });
 }
 
-export function readPiLaunchProfile(sessionFile: string): LaunchProfile {
+export function readPiLaunchProfile(sessionFile: string, options?: { exactPath: true }): LaunchProfile {
   const guidance = "Start a new subagent with explicit restrictions instead; legacy sessions cannot be safely resumed.";
   let p: any;
-  try { p = JSON.parse(readFileSync(launchProfilePath(sessionFile), "utf8")); }
-  catch { throw new Error(`Missing or unreadable launch profile. ${guidance}`); }
+  const file = options?.exactPath ? sessionFile : canonicalSessionPath(sessionFile);
+  try {
+    p = readPersistedQueueProfile(file);
+    if (p === undefined) throw new Error("missing");
+  } catch { throw new Error(`Missing or unreadable launch profile. ${guidance}`); }
   if (p?.harness && p.harness !== "pi") {
     throw new Error(`Closed-session resume for harness "${p.harness}" is unsupported. Use that harness's native resume or start a new subagent.`);
   }
   const nullableString = (value: unknown) => value === null || typeof value === "string";
   const plan = p?.runtimePlan;
-  if ((p?.lineage !== undefined && (!isLineage(p.lineage) || p.lineage.child.sessionFile !== p.sessionFile)) || p?.version !== 1 || p.harness !== "pi" || p.sessionFile !== canonicalSessionPath(sessionFile) ||
+  if ((p?.lineage !== undefined && (!isLineage(p.lineage) || p.lineage.child.sessionFile !== p.sessionFile)) || p?.version !== 1 || p.harness !== "pi" || p.sessionFile !== file ||
     (p.planTask !== undefined && !isPlanTaskBinding(p.planTask)) ||
     (p.assignmentContract !== undefined && !isAssignmentContract(p.assignmentContract)) ||
     (p.projectTrust !== undefined && p.projectTrust !== false) ||
@@ -103,12 +114,14 @@ export function readPiLaunchProfile(sessionFile: string): LaunchProfile {
     !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(plan.thinking)) {
     throw new Error(`Invalid or unsupported launch profile. ${guidance}`);
   }
+  assertQueueProfile(p);
   return p;
 }
 
 /** Persist an optional first binding; an existing original authority is immutable. */
 export function persistProfileBinding(sessionFile: string, binding: PlanTaskBinding, assignmentContract?: AssignmentContract): void {
   const profile = readPiLaunchProfile(sessionFile);
+  if (profile.queueAllocation) throw new Error("Queue launch profile binding is immutable");
   if (profile.planTask && JSON.stringify(profile.planTask) !== JSON.stringify(binding)) throw new Error("Launch profile task binding conflict");
   if (assignmentContract && !isAssignmentContract(assignmentContract)) throw new Error("Invalid assignment contract");
   if (!profile.planTask || assignmentContract) atomicRuntimeWrite(launchProfilePath(sessionFile), { ...profile, planTask: binding, ...(assignmentContract ? { assignmentContract } : {}) });

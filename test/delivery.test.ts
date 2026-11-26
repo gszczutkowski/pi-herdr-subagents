@@ -71,6 +71,40 @@ describe("extension delivery readiness", () => {
   });
 });
 
+describe("completed child shutdown guidance", () => {
+  it("delivers the exact close target for a keep-open child even when its result is truncated", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-delivery-close-guidance-"));
+    const delivered: any[] = [];
+    const parent = install((payload) => delivered.push(payload));
+    const open = { ...child("kept-open-run"), cli: "pi", sessionFile: join(dir, "child.jsonl") };
+    const closed = child("closed-run");
+    try {
+      parent.start();
+      runtime.runningSubagents.set(open.id, open);
+      runtime.runningSubagents.set(closed.id, closed);
+      const budget = getSubagentConfig().contextProtection.maxReportBytes;
+      enqueueSubagentCompletion(open, { ...result, sessionFile: open.sessionFile, keepOpen: true,
+        summary: "work finished ".repeat(budget), eventId: "settled" });
+      enqueueSubagentCompletion(closed, result);
+      assert.equal(delivered.length, 2);
+      const [openMessage, closedMessage] = delivered;
+      assert.equal(openMessage.customType, "subagent_result");
+      assert.equal(openMessage.details.keepOpen, true);
+      assert.equal(openMessage.details.runId, open.id);
+      assert.match(openMessage.content, /Report truncated/);
+      assert.match(openMessage.content, /no follow-up is needed.*subagent_close\(\{"id":"kept-open-run"\}\)/);
+      assert.doesNotMatch(openMessage.content, /pi --session/);
+      assert.equal(runtime.runningSubagents.get(open.id), open, "notification does not close the child");
+      assert.doesNotMatch(closedMessage.content, /subagent_close/);
+      assert.match(closedMessage.content, /Resume: pi --session/);
+      assert.equal(runtime.runningSubagents.has(closed.id), false);
+    } finally {
+      parent.shutdown("quit");
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("spawn/resume watcher dispatch regressions", () => {
   for (const resumed of [false, true]) {
     for (const kind of ["result", "ping", "provider-error", "watcher-error"]) {
@@ -367,15 +401,16 @@ describe("explicit recovery of proven-unsent results", () => {
       import {enqueueDelivery} from './pi-extension/subagents/delivery.ts';
       import {createLifecycle} from './pi-extension/subagents/lifecycle.ts';
       const dir=fs.mkdtempSync(path.join(os.tmpdir(),'public-unsent-'));
-      const commands=new Map(),tools=new Map(),sent=[];
-      extension({on(){},registerTool(t){tools.set(t.name,t)},registerCommand(n,c){commands.set(n,c)},
-        registerShortcut(){},registerMessageRenderer(){},getAllTools(){return []},sendMessage(m){sent.push(m)}});
+      const commands=new Map(),tools=new Map(),sent=[],notices=[];
+      const api={on(){},registerTool(t){tools.set(t.name,t)},registerCommand(n,c){commands.set(n,c)},
+        registerShortcut(){},registerMessageRenderer(){},getAllTools(){return []},sendMessage(m){sent.push(m)}};
+      extension(api);
       const runtime=globalThis[Symbol.for('pi-subagents/runtime')];
       const parent={sessionFile:canonicalSessionPath(path.join(dir,'parent.jsonl')),headerId:'parent',branchToken:'branch',checkpoint:'checkpoint'};
       const store=new RuntimeStore(path.join(dir,'runtime'),parent);
       const branch=[{id:'checkpoint',type:'custom',customType:'subagent-custody',data:{branchToken:'branch'}}];
-      const ctx={hasUI:false,sessionManager:{getHeader:()=>({id:'parent'}),getSessionFile:()=>parent.sessionFile,getBranch:()=>branch}};
-      runtime.latestCtx=ctx;runtime.store=store;runtime.delivery.store=store;
+      const ctx={hasUI:true,ui:{notify(m){notices.push(m)}},sessionManager:{getHeader:()=>({id:'parent'}),getSessionFile:()=>parent.sessionFile,getBranch:()=>branch}};
+      runtime.pi=api;runtime.latestCtx=ctx;runtime.store=store;runtime.delivery.store=store;
       runtime.stopRecovery=Object.assign(()=>{}, {reconcile(){},status(){return {errors:[]}}});
       store.isCurrent=()=>branch.length===1;
       store.prepare({id:'run',sessionFile:path.join(dir,'child.jsonl'),name:'child',task:'work',startTime:1});
@@ -389,7 +424,7 @@ describe("explicit recovery of proven-unsent results", () => {
         const report=await tools.get('subagents_recovery').execute('report',{},undefined,undefined,ctx);
         assert.match(report.content[0].text,/before-send.*TEST_EIO/);
         const reconcile=()=>commands.get('subagents-reconcile').handler('',ctx);
-        branch.length=0;await assert.rejects(reconcile(),/branch custody/);assert.equal(sent.length,0);
+        branch.length=0;await reconcile();assert.match(notices.at(-1),/still-blocked.*branch custody/s);assert.equal(sent.length,0);
         branch.push({id:'checkpoint',type:'custom',customType:'subagent-custody',data:{branchToken:'branch'}});
         await reconcile();await reconcile();
         assert.equal(sent.length,1);assert.equal(sent[0].content,'immutable result');

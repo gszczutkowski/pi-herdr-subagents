@@ -174,6 +174,69 @@ test("unchanged custody checks avoid payload rereads but ctime detects same-size
   assert.equal(result.status, 0, result.stderr);
 }));
 
+test("manifest replacement retries only the same closed temp, with bounded Windows backoff and fresh custody", () => fixture((dir) => {
+  const result = spawnSync(process.execPath, ["--input-type=module", "-e", `
+    import fs from 'node:fs';import {syncBuiltinESMExports} from 'node:module';import assert from 'node:assert/strict';
+    const {RuntimeStore}=await import(${JSON.stringify(pathToFileURL(resolve("pi-extension/subagents/runtime-store.ts")).href)});
+    const root=${JSON.stringify(dir)},parent=${JSON.stringify(parent)},run=${JSON.stringify(run)};
+    const rename=fs.renameSync,open=fs.openSync,close=fs.closeSync,remove=fs.rmSync;
+    let fault,paths=[],waits=[],opened=0,closed=0,hook=()=>{},cleanupFails=false;
+    fs.openSync=(...args)=>{if(String(args[0]).endsWith('.tmp'))opened++;return open(...args)};
+    fs.closeSync=(...args)=>{closed++;return close(...args)};
+    fs.rmSync=(path,...args)=>{if(cleanupFails&&String(path).endsWith('.tmp'))throw new Error('cleanup failure');return remove(path,...args)};
+    fs.renameSync=(from,to)=>{
+      if(fault&&String(to).endsWith('manifest.json')){
+        assert.equal(opened,1);assert.equal(closed,1,'temp must be closed before rename');
+        paths.push(String(from));assert.ok(fs.existsSync(from));
+        if(paths.length<=fault.count)throw Object.assign(new Error('rename blocked'),{code:fault.code});
+      }
+      return rename(from,to);
+    };syncBuiltinESMExports();
+    Atomics.wait=(_a,_i,_v,ms)=>{waits.push(ms);hook();return 'timed-out'};
+    let serial=0;const platform=process.platform;
+    for(const mode of ['prepare','failure'])for(const scenario of ['transient','busy','permanent','linux','darwin','denied','space','branch','writer','revision','generation','changed','missing','corrupt','cleanup']){
+      Object.defineProperty(process,'platform',{value:platform,configurable:true});
+      // Construct using the real platform; only the replacement policy is simulated.
+      fault=undefined;const dir=root+'/'+serial++;const s=new RuntimeStore(dir,parent);
+      const file=dir+'/manifest.json',before=fs.readFileSync(file,'utf8'),snapshot=s.snapshot();
+      const owner=dir+'/writer/owner.json',ownerBefore=fs.readFileSync(owner,'utf8');
+      paths=[];waits=[];opened=0;closed=0;hook=()=>{};
+      Object.defineProperty(process,'platform',{value:scenario==='linux'?'linux':scenario==='darwin'?'darwin':'win32',configurable:true});
+      fault={count:['transient','busy'].includes(scenario)?2:99,code:scenario==='busy'?'EBUSY':scenario==='denied'?'EACCES':scenario==='space'?'ENOSPC':'EPERM'};
+      if(scenario==='branch')hook=()=>{s.isCurrent=()=>false};
+      if(scenario==='writer')hook=()=>fs.writeFileSync(owner,JSON.stringify({generation:'other'}));
+      if(['revision','generation','changed','missing','corrupt'].includes(scenario))hook=()=>{
+        const disk=JSON.parse(before);
+        if(scenario==='revision')disk.revision++;
+        if(scenario==='generation')disk.generation='other';
+        if(scenario==='changed')disk.custodyPaused='external';
+        if(scenario==='missing')fs.rmSync(file);else fs.writeFileSync(file,scenario==='corrupt'?'{':JSON.stringify(disk));
+      };
+      cleanupFails=scenario==='cleanup';
+      const operation=()=>mode==='prepare'?s.prepare(run):s.recordDispatchFailure(run,{message:{customType:'subagent_result',content:'failed',details:{eventId:'failure'}},options:{triggerTurn:true,deliverAs:'steer'}});
+      const succeeds=['transient','busy'].includes(scenario)||(scenario==='branch'&&mode==='failure');
+      // Failure evidence deliberately uses writer custody, not active-branch custody.
+      if(scenario==='branch'&&mode==='failure')fault.count=2;
+      if(succeeds){operation();assert.equal(s.snapshot().revision,snapshot.revision+1);assert.equal(paths.length,3);assert.deepEqual(waits,[10,30]);}
+      else {
+        assert.throws(operation,scenario==='cleanup'?/rename blocked/:undefined);
+        assert.deepEqual(s.snapshot(),snapshot,'failed publication cannot update memory');assert.deepEqual(s.outboxIds(),[]);
+        if(!['revision','generation','changed','missing','corrupt'].includes(scenario))assert.equal(fs.readFileSync(file,'utf8'),before);
+        const immediate=['linux','darwin','denied','space'].includes(scenario);
+        const fenced=['branch','writer','revision','generation','changed','missing','corrupt'].includes(scenario);
+        assert.equal(paths.length,immediate||fenced?1:4);assert.deepEqual(waits,immediate?[]:fenced?[10]:[10,30,60]);
+      }
+      assert.equal(new Set(paths).size,1,'must retry identical temporary file');
+      cleanupFails=false;fault=undefined;hook=()=>{};s.isCurrent=undefined;
+      fs.writeFileSync(owner,ownerBefore);
+      if(!succeeds)fs.writeFileSync(file,before);
+      s.close();
+      if(scenario!=='cleanup')assert.equal(fs.readdirSync(dir).filter(f=>f.endsWith('.tmp')).length,0);
+    }
+  `], { encoding: "utf8", timeout: 90000 });
+  assert.equal(result.status, 0, result.stderr);
+}));
+
 test("lease, stale revisions, corruption and future schemas fail closed", () => fixture((dir) => {
   const store = new RuntimeStore(dir, parent);
   assert.throws(() => new RuntimeStore(dir, parent));
